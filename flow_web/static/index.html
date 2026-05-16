@@ -95,7 +95,13 @@
               <button type="button" class="scenario-node" data-scenario-step="source">
                 <span class="node-icon node-icon-trello">T</span>
                 <strong id="nodeTitleSource">Prompt Source</strong>
-                <small id="nodeDetailSource">Trello / Sheet / nhập tay</small>
+                <small id="nodeDetailSource">Google Sheet / file / nhập tay</small>
+              </button>
+              <span class="scenario-link" aria-hidden="true"></span>
+              <button type="button" class="scenario-node" data-scenario-step="trello_source">
+                <span class="node-icon node-icon-trello">TS</span>
+                <strong id="nodeTitleTrelloSource">Trello Image Source</strong>
+                <small id="nodeDetailTrelloSource">Lấy ảnh gốc từ card</small>
               </button>
               <span class="scenario-link" aria-hidden="true"></span>
               <button type="button" class="scenario-node" data-scenario-step="normalize">
@@ -250,6 +256,7 @@
                 <span>Loại module</span>
                 <select id="automationModuleTypeInput">
                   <option value="source">Prompt source</option>
+                  <option value="trello_source">Trello source</option>
                   <option value="normalize">Normalize</option>
                   <option value="flow">Google Flow</option>
                   <option value="telegram">Telegram</option>

@@ -18,7 +18,7 @@ const REFERENCE_ROLE_OPTIONS = [
 ];
 const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
 const AUTOMATION_CONFIG_VERSION = 1;
-const AUTOMATION_STEP_ORDER = ["source", "normalize", "flow", "telegram", "log", "review_hold"];
+const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "telegram", "review_hold", "log"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
 const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
@@ -28,6 +28,13 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
     title: "Prompt Source",
     detail: "Google Sheet / file / nhập tay",
     icon: "T",
+    iconClass: "node-icon-trello",
+  },
+  trello_source: {
+    label: "Trello source",
+    title: "Trello Image Source",
+    detail: "Lấy ảnh gốc từ đúng card Trello",
+    icon: "TS",
     iconClass: "node-icon-trello",
   },
   normalize: {
@@ -77,6 +84,10 @@ const AUTOMATION_STEP_DEFAULTS = {
   source: {
     title: "Prompt Source",
     detail: "Google Sheet / file / nhập tay",
+  },
+  trello_source: {
+    title: "Trello Image Source",
+    detail: "Lấy ảnh sản phẩm gốc từ card Trello",
   },
   normalize: {
     title: "Normalize Prompt",
@@ -319,6 +330,9 @@ function moduleTypeForLegacyKey(key) {
   }
   if (key === "review_hold") {
     return "approval";
+  }
+  if (key === "trello_source") {
+    return "trello_source";
   }
   return AUTOMATION_MODULE_TYPE_CONFIG[key] ? key : "custom";
 }
@@ -1652,6 +1666,12 @@ function automationStepTone(module, stats) {
   if (stepKey === "source") {
     return state.automation.prompt.trim() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
   }
+  if (stepKey === "trello_source") {
+    if (!state.trello?.credentials_saved) {
+      return "blocked";
+    }
+    return module.settings?.trelloCard || state.automation.trelloCardId || state.trello?.card_id ? "ready" : "pending";
+  }
   if (stepKey === "normalize") {
     return state.automation.prompt.trim() ? "done" : "pending";
   }
@@ -1863,20 +1883,22 @@ function renderModuleSettings(module) {
     return;
   }
   const type = module.type || "custom";
+  const settings = module.settings || {};
   if (type === "source") {
+    const sourceType = settings.sourceType || state.automation.sourceType || "manual";
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Nguồn của cục này</span>
         <select data-module-setting="sourceType">
-          <option value="manual"${state.automation.sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
-          <option value="trello"${state.automation.sourceType === "trello" ? " selected" : ""}>Trello list</option>
-          <option value="sheets"${state.automation.sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
-          <option value="folder"${state.automation.sourceType === "folder" ? " selected" : ""}>Folder / CSV nội bộ</option>
+          <option value="manual"${sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
+          <option value="trello"${sourceType === "trello" ? " selected" : ""}>Trello list</option>
+          <option value="sheets"${sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
+          <option value="folder"${sourceType === "folder" ? " selected" : ""}>Folder / CSV nội bộ</option>
         </select>
       </label>
       <label class="field">
         <span>Sheet / CSV link</span>
-        <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(state.automation.sourceLocation || "")}" placeholder="Dán link Google Sheet hoặc CSV" />
+        <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(settings.sourceLocation || state.automation.sourceLocation || "")}" placeholder="Dán link Google Sheet hoặc CSV" />
       </label>
       <div class="customize-actions source-actions">
         <button type="button" class="ghost-button card-button" data-module-action="preview-source">Lấy prompt</button>
@@ -1886,27 +1908,44 @@ function renderModuleSettings(module) {
     return;
   }
   if (type === "flow") {
+    const imageModel = settings.imageModel || state.drafts.image.model;
+    const imageAspect = settings.imageAspect || state.drafts.image.aspect;
+    const imageCount = settings.imageCount || state.drafts.image.count || 1;
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Model ảnh Flow</span>
         <select data-module-setting="imageModel">
-          ${state.modelOptions.image.map((item) => `<option value="${escapeHtml(item.value)}"${state.drafts.image.model === item.value ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
+          ${state.modelOptions.image.map((item) => `<option value="${escapeHtml(item.value)}"${imageModel === item.value ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
         </select>
       </label>
       <div class="detail-grid sidebar-detail-grid">
         <label class="field">
           <span>Tỷ lệ ảnh</span>
           <select data-module-setting="imageAspect">
-            <option value="square"${state.drafts.image.aspect === "square" ? " selected" : ""}>Vuông 1:1</option>
-            <option value="landscape"${state.drafts.image.aspect === "landscape" ? " selected" : ""}>Ngang 16:9</option>
-            <option value="portrait"${state.drafts.image.aspect === "portrait" ? " selected" : ""}>Dọc 9:16</option>
+            <option value="square"${imageAspect === "square" ? " selected" : ""}>Vuông 1:1</option>
+            <option value="landscape"${imageAspect === "landscape" ? " selected" : ""}>Ngang 16:9</option>
+            <option value="portrait"${imageAspect === "portrait" ? " selected" : ""}>Dọc 9:16</option>
           </select>
         </label>
         <label class="field">
           <span>Số ảnh</span>
-          <input type="number" min="1" max="4" step="1" data-module-setting="imageCount" value="${escapeHtml(state.drafts.image.count || 1)}" />
+          <input type="number" min="1" max="4" step="1" data-module-setting="imageCount" value="${escapeHtml(imageCount)}" />
         </label>
       </div>
+    `;
+    return;
+  }
+  if (type === "trello_source") {
+    elements.automationModuleSettings.innerHTML = `
+      <label class="field">
+        <span>Card lấy ảnh gốc</span>
+        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello chứa ảnh gốc" />
+      </label>
+      <label class="field">
+        <span>Số ảnh lấy tối đa</span>
+        <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 4)}" />
+      </label>
+      <small>Cục này tải ảnh attachment từ card Trello để làm ảnh tham chiếu cho Google Flow. Trello Archive phía sau sẽ lưu ảnh duyệt về đúng card này.</small>
     `;
     return;
   }
@@ -1914,7 +1953,7 @@ function renderModuleSettings(module) {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Chat duyệt của cục này</span>
-        <input type="text" data-module-setting="telegramChat" value="${escapeHtml(state.automation.telegramChat || state.integrations?.telegram?.chat_id || "")}" placeholder="@review_channel hoặc chat id" />
+        <input type="text" data-module-setting="telegramChat" value="${escapeHtml(settings.telegramChat || state.automation.telegramChat || state.integrations?.telegram?.chat_id || "")}" placeholder="@review_channel hoặc chat id" />
       </label>
       <label class="field">
         <span>Bot token tuỳ chọn</span>
@@ -1931,17 +1970,17 @@ function renderModuleSettings(module) {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Card lưu ảnh</span>
-        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello" />
+        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello" />
       </label>
       <label class="field">
         <span>List tạo card mới</span>
-        <input type="text" data-module-setting="trelloList" value="${escapeHtml(state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu muốn mỗi job tạo card mới" />
+        <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu muốn mỗi job tạo card mới" />
       </label>
       <label class="field">
         <span>Cách lưu ảnh</span>
         <select data-module-setting="trelloUploadMode">
-          <option value="file"${(state.trello?.upload_mode || "file") === "file" ? " selected" : ""}>Upload file thật</option>
-          <option value="url"${state.trello?.upload_mode === "url" ? " selected" : ""}>Chỉ attach link</option>
+          <option value="file"${(settings.trelloUploadMode || state.trello?.upload_mode || "file") === "file" ? " selected" : ""}>Upload file thật</option>
+          <option value="url"${(settings.trelloUploadMode || state.trello?.upload_mode) === "url" ? " selected" : ""}>Chỉ attach link</option>
         </select>
       </label>
       <div class="customize-actions source-actions">
@@ -1956,9 +1995,9 @@ function renderModuleSettings(module) {
       <label class="field">
         <span>Trạng thái duyệt</span>
         <select data-module-setting="approvalMode">
-          <option value="manual"${(module.settings?.approvalMode || "manual") === "manual" ? " selected" : ""}>Duyệt tay</option>
-          <option value="telegram"${module.settings?.approvalMode === "telegram" ? " selected" : ""}>Duyệt bằng nút Telegram</option>
-          <option value="auto"${module.settings?.approvalMode === "auto" ? " selected" : ""}>Tự ghi log sau khi tạo</option>
+          <option value="manual"${(settings.approvalMode || "manual") === "manual" ? " selected" : ""}>Duyệt tay</option>
+          <option value="telegram"${settings.approvalMode === "telegram" ? " selected" : ""}>Duyệt bằng nút Telegram</option>
+          <option value="auto"${settings.approvalMode === "auto" ? " selected" : ""}>Tự ghi log sau khi tạo</option>
         </select>
       </label>
       <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ duyệt Telegram</button>
@@ -1968,31 +2007,31 @@ function renderModuleSettings(module) {
   elements.automationModuleSettings.innerHTML = `
     <label class="field">
       <span>Ghi chú riêng của cục custom</span>
-      <textarea rows="3" data-module-setting="customNote" placeholder="Ghi lại cục này dùng để làm gì">${escapeHtml(module.settings?.customNote || "")}</textarea>
+      <textarea rows="3" data-module-setting="customNote" placeholder="Ghi lại cục này dùng để làm gì">${escapeHtml(settings.customNote || "")}</textarea>
     </label>
     <label class="field">
       <span>Webhook/API URL</span>
-      <input type="url" data-module-setting="customWebhookUrl" value="${escapeHtml(module.settings?.customWebhookUrl || "")}" placeholder="https://example.com/webhook" />
+      <input type="url" data-module-setting="customWebhookUrl" value="${escapeHtml(settings.customWebhookUrl || "")}" placeholder="https://example.com/webhook" />
     </label>
     <div class="detail-grid sidebar-detail-grid">
       <label class="field">
         <span>Method</span>
         <select data-module-setting="customWebhookMethod">
-          ${["POST", "PUT", "PATCH", "GET", "DELETE"].map((method) => `<option value="${method}"${(module.settings?.customWebhookMethod || "POST") === method ? " selected" : ""}>${method}</option>`).join("")}
+          ${["POST", "PUT", "PATCH", "GET", "DELETE"].map((method) => `<option value="${method}"${(settings.customWebhookMethod || "POST") === method ? " selected" : ""}>${method}</option>`).join("")}
         </select>
       </label>
       <label class="field">
         <span>Timeout giây</span>
-        <input type="number" min="3" max="120" step="1" data-module-setting="customWebhookTimeout" value="${escapeHtml(module.settings?.customWebhookTimeout || 20)}" />
+        <input type="number" min="3" max="120" step="1" data-module-setting="customWebhookTimeout" value="${escapeHtml(settings.customWebhookTimeout || 20)}" />
       </label>
     </div>
     <label class="field">
       <span>Headers JSON hoặc từng dòng Key: Value</span>
-      <textarea rows="3" data-module-setting="customWebhookHeaders" placeholder='{"Authorization":"Bearer ..."}'>${escapeHtml(module.settings?.customWebhookHeaders || "")}</textarea>
+      <textarea rows="3" data-module-setting="customWebhookHeaders" placeholder='{"Authorization":"Bearer ..."}'>${escapeHtml(settings.customWebhookHeaders || "")}</textarea>
     </label>
     <label class="field">
       <span>Body template</span>
-      <textarea rows="6" data-module-setting="customWebhookBody" placeholder='Để trống để app tự gửi job/prompt/artifacts. Có thể dùng {{job_id}}, {{prompt}}, {{first_artifact_url}}, {{artifacts}}.'>${escapeHtml(module.settings?.customWebhookBody || "")}</textarea>
+      <textarea rows="6" data-module-setting="customWebhookBody" placeholder='Để trống để app tự gửi job/prompt/artifacts. Có thể dùng {{job_id}}, {{prompt}}, {{first_artifact_url}}, {{artifacts}}.'>${escapeHtml(settings.customWebhookBody || "")}</textarea>
     </label>
     <small>Cục custom sẽ chạy thật nếu có URL. Dữ liệu ảnh/prompt/job tự được gắn vào payload.</small>
   `;
@@ -2121,10 +2160,12 @@ function activePromptSourceItems() {
   const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
   return items
     .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
+    .filter((item) => item?.used !== true)
     .slice(0, 40)
     .map((item) => ({
       row: Number(item.row || 0),
       active: true,
+      used: false,
       prompt: String(item.prompt || "").trim(),
       product: String(item.product || "").trim(),
       index: String(item.index || "").trim(),
@@ -3558,6 +3599,7 @@ function syncModuleSettingFromControl(control) {
   const setting = control.dataset.moduleSetting;
   const value = control.type === "checkbox" ? Boolean(control.checked) : control.value;
   module.settings = module.settings || {};
+  module.settings[setting] = value;
   if (setting === "sourceType") {
     state.automation.sourceType = value || "manual";
     if (elements.automationSourceType) {
@@ -3573,7 +3615,9 @@ function syncModuleSettingFromControl(control) {
   } else if (setting === "imageAspect") {
     state.drafts.image.aspect = value || "square";
   } else if (setting === "imageCount") {
-    state.drafts.image.count = Math.max(1, Math.min(4, Number(value || 1)));
+    const count = Math.max(1, Math.min(4, Number(value || 1)));
+    state.drafts.image.count = count;
+    module.settings[setting] = count;
   } else if (setting === "telegramChat") {
     state.automation.telegramChat = String(value || "").trim();
     if (elements.automationTelegramInput) {
@@ -3594,8 +3638,6 @@ function syncModuleSettingFromControl(control) {
     if (elements.automationTrelloUploadMode) {
       elements.automationTrelloUploadMode.value = state.trello.upload_mode;
     }
-  } else {
-    module.settings[setting] = value;
   }
   persistAutomationModules();
 }
@@ -3670,20 +3712,23 @@ async function syncTelegramApprovals() {
 
 function automationImageJobPayload(prompt) {
   const imageDraft = state.drafts.image;
+  const graph = automationExecutionGraphPayload();
+  const flowModule = graph.modules.find((module) => module.enabled && module.type === "flow") || {};
+  const flowSettings = flowModule.settings || {};
   const telegramEnabled = automationModuleEnabled("telegram");
   const trelloEnabled = automationModuleEnabled("trello");
   return {
     type: "image",
     title: "Automation image from prompt",
     prompt: String(prompt || "").trim(),
-    model: imageDraft.model || defaultModelForMode("image"),
-    aspect: imageDraft.aspect || "square",
-    count: Math.max(1, Math.min(4, Number(imageDraft.count || 1))),
+    model: flowSettings.imageModel || imageDraft.model || defaultModelForMode("image"),
+    aspect: flowSettings.imageAspect || imageDraft.aspect || "square",
+    count: Math.max(1, Math.min(4, Number(flowSettings.imageCount || imageDraft.count || 1))),
     timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
     telegram_enabled: telegramEnabled,
     telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
     trello_enabled: trelloEnabled,
-    automation_graph: automationExecutionGraphPayload(),
+    automation_graph: graph,
     trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
     trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
     trello_set_cover: state.automation.trelloSetCover !== false,

@@ -337,6 +337,7 @@ class CreateJobRequest(BaseModel):
 class PromptBatchItemRequest(BaseModel):
     row: int = 0
     active: bool = True
+    used: bool = False
     prompt: str = ""
     product: str = ""
     index: str = ""

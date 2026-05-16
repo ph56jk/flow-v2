@@ -593,6 +593,10 @@ class FlowWebService:
         columns = list(rows[0].keys()) if rows else []
         prompt_column = self._find_prompt_source_column(columns, {"promptcontent", "prompt", "content"})
         active_column = self._find_prompt_source_column(columns, {"active", "enabled", "use", "run"})
+        used_column = self._find_prompt_source_column(
+            columns,
+            {"used", "done", "completed", "generated", "processed", "dadung", "dungroi", "xong"},
+        )
         product_column = self._find_prompt_source_column(columns, {"productname"}) or self._find_prompt_source_column(
             columns,
             {"productkey", "product"},
@@ -612,10 +616,12 @@ class FlowWebService:
             if not prompt:
                 continue
             active = True if not active_column else self._truthy_sheet_value(row.get(active_column, ""))
+            used = False if not used_column else self._truthy_sheet_value(row.get(used_column, ""))
             prompts.append(
                 {
                     "row": row_number,
-                    "active": active,
+                    "active": active and not used,
+                    "used": used,
                     "prompt": prompt,
                     "product": str(row.get(product_column) or "").strip() if product_column else "",
                     "index": str(row.get(index_column) or "").strip() if index_column else "",
@@ -645,6 +651,7 @@ class FlowWebService:
             "row_count": len(rows),
             "prompt_count": len(prompts),
             "active_count": len(active_prompts),
+            "used_count": sum(1 for item in prompts if item.get("used")),
             "prompt": prompt,
             "selected": selected,
             "items": active_prompts or prompts,
@@ -1654,12 +1661,13 @@ class FlowWebService:
         normalized: List[Dict[str, Any]] = []
         for item in items or []:
             prompt = str(item.prompt or "").strip()
-            if not prompt or item.active is False:
+            if not prompt or item.active is False or item.used is True:
                 continue
             normalized.append(
                 {
                     "row": int(item.row or 0),
                     "active": True,
+                    "used": False,
                     "prompt": prompt,
                     "product": str(item.product or "").strip(),
                     "index": str(item.index or "").strip(),
@@ -3462,6 +3470,7 @@ exit 1
     def _automation_module_default_title(self, module_type: str) -> str:
         return {
             "source": "Prompt Source",
+            "trello_source": "Trello Image Source",
             "normalize": "Normalize Prompt",
             "flow": "Google Flow",
             "telegram": "Telegram Review",
@@ -3575,6 +3584,8 @@ exit 1
             module_type = module["type"]
             if module_type == "flow":
                 return
+            if module_type == "trello_source":
+                continue
             if module_type == "source":
                 await self._set_automation_module_status(
                     job_id,
@@ -3625,7 +3636,7 @@ exit 1
         payload = _model_dump(request)
         if module.get("type") == "telegram" and settings.get("telegramChat"):
             payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
-        if module.get("type") == "trello":
+        if module.get("type") in {"trello", "trello_source"}:
             if settings.get("trelloCard"):
                 payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
             if settings.get("trelloList"):
@@ -3653,7 +3664,7 @@ exit 1
             if not module["enabled"]:
                 continue
             module_type = module["type"]
-            if module_type in {"source", "normalize", "flow"}:
+            if module_type in {"source", "trello_source", "normalize", "flow"}:
                 continue
             if skip_finished and self._automation_module_status(job_id, module["id"]) in {"completed", "skipped", "disabled"}:
                 continue
@@ -3986,6 +3997,83 @@ exit 1
                 continue
         return [artifact for index, artifact in enumerate(job.artifacts) if index in approved_indexes]
 
+    async def _request_with_trello_source_images(self, job_id: str, request: CreateJobRequest) -> CreateJobRequest:
+        if request.type != "image":
+            return request
+        graph = self._automation_graph_payload(request)
+        module = next(
+            (
+                item
+                for item in graph["modules"]
+                if item["enabled"] and item["type"] == "trello_source"
+            ),
+            None,
+        )
+        if module is None:
+            return request
+
+        module_request = self._request_with_automation_module_settings(request, module)
+        card_id = self._normalize_trello_card_id(
+            module_request.trello_card_id
+            or request.trello_card_id
+            or self.store.snapshot().trello_config.card_id
+            or os.getenv("TRELLO_CARD_ID", "")
+        )
+        settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+        try:
+            limit = int(settings.get("trelloAttachmentLimit") or 4)
+        except (TypeError, ValueError):
+            limit = 4
+        limit = max(1, min(4, limit))
+
+        await self._set_automation_module_status(
+            job_id,
+            request,
+            module["id"],
+            "running",
+            input_data={"card_id": card_id, "limit": limit},
+        )
+
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise RuntimeError("Trello Source cần API key/token Trello để lấy ảnh gốc từ card.")
+        if not card_id:
+            raise RuntimeError("Trello Source cần Card ID hoặc link card Trello chứa ảnh gốc.")
+
+        paths = await asyncio.to_thread(self._download_trello_card_image_attachments, key, token, card_id, job_id, limit)
+        if not paths:
+            raise RuntimeError("Card Trello này chưa có attachment ảnh nào để làm ảnh tham chiếu.")
+
+        payload = _model_dump(request)
+        existing_paths = [str(item).strip() for item in payload.get("reference_image_paths", []) if str(item).strip()]
+        existing_roles = [str(item).strip() for item in payload.get("reference_image_roles", []) if str(item).strip()]
+        available = max(0, 4 - len(existing_paths))
+        selected_paths = paths[:available]
+        payload["reference_image_paths"] = existing_paths + selected_paths
+        payload["reference_image_roles"] = self._normalize_reference_image_roles(
+            payload["reference_image_paths"],
+            existing_roles
+            + [
+                "base" if not existing_paths and index == 0 else "reference"
+                for index, _ in enumerate(selected_paths)
+            ],
+        )
+        payload["trello_card_id"] = payload.get("trello_card_id") or card_id
+
+        await self._set_automation_module_status(
+            job_id,
+            request,
+            module["id"],
+            "completed",
+            output={
+                "card_id": card_id,
+                "reference_image_count": len(selected_paths),
+                "reference_image_names": [Path(path).name for path in selected_paths],
+            },
+        )
+        await self.store.append_log(job_id, f"Đã lấy {len(selected_paths)} ảnh gốc từ card Trello để đưa vào Flow.")
+        return CreateJobRequest(**payload)
+
     async def _resume_automation_after_approval(self, job_id: str, approval_module_id: str) -> None:
         job = self.store.get_job(job_id)
         if job is None or not approval_module_id:
@@ -4039,21 +4127,36 @@ exit 1
         await self.store.patch_job(job_id, status="running")
         await self._ensure_automation_execution(job_id, request)
         await self._run_automation_pre_modules(job_id, request)
-        await self._set_automation_module_status(
-            job_id,
-            request,
-            "flow",
-            "running",
-            input_data={
-                "type": request.type,
-                "prompt": request.prompt,
-                "model": request.model,
-                "aspect": request.aspect,
-                "count": request.count,
-            },
-        )
-        await self._set_job_progress(job_id, "connecting", "Em đang khởi tạo client và kết nối tới project Flow hiện tại.")
-        await self.store.append_log(job_id, "Đang khởi tạo kết nối tới Flow")
+        try:
+            request = await self._request_with_trello_source_images(job_id, request)
+            await self.store.patch_job(job_id, input=_model_dump(request))
+            await self._set_automation_module_status(
+                job_id,
+                request,
+                "flow",
+                "running",
+                input_data={
+                    "type": request.type,
+                    "prompt": request.prompt,
+                    "model": request.model,
+                    "aspect": request.aspect,
+                    "count": request.count,
+                },
+            )
+            await self._set_job_progress(job_id, "connecting", "Em đang khởi tạo client và kết nối tới project Flow hiện tại.")
+            await self.store.append_log(job_id, "Đang khởi tạo kết nối tới Flow")
+        except HTTPException as exc:
+            detail = self._flow_error_detail(exc)
+            await self._fail_active_automation_module(job_id, request, detail)
+            await self.store.patch_job(job_id, status="failed", error=detail)
+            await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+            return
+        except Exception as exc:
+            detail = self._flow_error_detail(exc)
+            await self._fail_active_automation_module(job_id, request, detail)
+            await self.store.patch_job(job_id, status="failed", error=detail)
+            await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+            return
         artifacts: List[JobArtifact] = []
         result: Dict[str, Any] = {}
 
@@ -4631,9 +4734,98 @@ exit 1
             suffix = ".jpg"
         return f"flow-{job_id[:8]}-{index + 1}{suffix}"
 
-    def _trello_endpoint(self, path: str, key: str, token: str) -> str:
-        auth = urlencode({"key": key, "token": token})
+    def _trello_endpoint(self, path: str, key: str, token: str, fields: Dict[str, Any] | None = None) -> str:
+        auth_fields = {"key": key, "token": token}
+        if fields:
+            auth_fields.update({k: v for k, v in fields.items() if str(v) != ""})
+        auth = urlencode(auth_fields)
         return f"{self.TRELLO_API_BASE_URL}/{path.strip('/')}?{auth}"
+
+    def _trello_get_json(
+        self,
+        path: str,
+        key: str,
+        token: str,
+        *,
+        fields: Dict[str, Any] | None = None,
+    ) -> Any:
+        request = Request(
+            self._trello_endpoint(path, key, token, fields),
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                raw_payload = response.read().decode("utf-8", errors="replace")
+                return json.loads(raw_payload) if raw_payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail or exc.reason}") from exc
+        except URLError as exc:
+            raise RuntimeError(str(exc.reason or exc)) from exc
+
+    def _download_trello_card_image_attachments(
+        self,
+        key: str,
+        token: str,
+        card_id: str,
+        job_id: str,
+        limit: int,
+    ) -> List[str]:
+        payload = self._trello_get_json(
+            f"cards/{quote(card_id, safe='')}/attachments",
+            key,
+            token,
+            fields={"fields": "id,name,url,mimeType,bytes,date"},
+        )
+        attachments = payload if isinstance(payload, list) else []
+        image_attachments = [
+            item
+            for item in attachments
+            if self._trello_attachment_is_image(item)
+        ][: max(1, min(4, int(limit or 4)))]
+        paths: List[str] = []
+        for index, attachment in enumerate(image_attachments):
+            data, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
+            name = str(attachment.get("name") or f"trello-image-{index + 1}.jpg").strip()
+            suffix = Path(name).suffix or mimetypes.guess_extension(mime or "") or ".jpg"
+            if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                suffix = ".jpg"
+            target = UPLOADS_DIR / f"trello-{job_id[:8]}-{index + 1}{suffix}"
+            target.write_bytes(data)
+            paths.append(str(target))
+        return paths
+
+    def _trello_attachment_is_image(self, attachment: Dict[str, Any]) -> bool:
+        name = str(attachment.get("name") or "").lower()
+        mime = str(attachment.get("mimeType") or "").lower()
+        return mime.startswith("image/") or Path(name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+    def _trello_download_attachment_bytes(
+        self,
+        key: str,
+        token: str,
+        card_id: str,
+        attachment: Dict[str, Any],
+    ) -> tuple[bytes, str]:
+        attachment_id = str(attachment.get("id") or "").strip()
+        name = str(attachment.get("name") or "image.jpg").strip() or "image.jpg"
+        mime = str(attachment.get("mimeType") or mimetypes.guess_type(name)[0] or "image/jpeg")
+        if attachment_id:
+            path = (
+                f"cards/{quote(card_id, safe='')}/attachments/"
+                f"{quote(attachment_id, safe='')}/download/{quote(name)}"
+            )
+            request = Request(self._trello_endpoint(path, key, token), method="GET")
+            try:
+                with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                    return response.read(), response.headers.get_content_type() if response.headers else mime
+            except Exception:
+                pass
+        url = str(attachment.get("url") or "").strip()
+        if not url:
+            raise RuntimeError(f"Attachment Trello {name} không có URL để tải.")
+        return self._read_remote_file(url)
 
     def _trello_request_json(
         self,
