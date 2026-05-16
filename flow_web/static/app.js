@@ -1680,6 +1680,9 @@ function automationStepTone(module, stats) {
       return "watch";
     }
     if (status === "failed") {
+      if ((module.type || module.id) === "trello_source" && trelloSourceIsReady(module)) {
+        return "ready";
+      }
       return "blocked";
     }
   }
@@ -1691,17 +1694,7 @@ function automationStepTone(module, stats) {
     return state.automation.prompt.trim() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
   }
   if (stepKey === "trello_source") {
-    if (!state.trello?.credentials_saved) {
-      return "blocked";
-    }
-    return module.settings?.trelloCard ||
-      state.automation.trelloCardId ||
-      state.trello?.card_id ||
-      module.settings?.trelloBoard ||
-      state.automation.trelloBoardId ||
-      state.trello?.board_id
-      ? "ready"
-      : "pending";
+    return trelloSourceIsReady(module) ? "ready" : "blocked";
   }
   if (stepKey === "normalize") {
     return state.automation.prompt.trim() ? "done" : "pending";
@@ -1725,6 +1718,17 @@ function automationStepTone(module, stats) {
     return stats.completed.length ? "ready" : "pending";
   }
   return "pending";
+}
+
+function trelloSourceIsReady(module = {}) {
+  if (!state.trello?.credentials_saved) {
+    return false;
+  }
+  const settings = module.settings || {};
+  const card = settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "";
+  const list = settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "";
+  const board = settings.trelloBoard || state.automation.trelloBoardId || state.trello?.board_id || "";
+  return Boolean(card || (board && list));
 }
 
 function latestAutomationExecutionNode(module) {
