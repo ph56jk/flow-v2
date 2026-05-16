@@ -10096,7 +10096,7 @@ exit 1
                 "Flow API tu choi luot gui truc tiep. Em dang tai lai project va gui lai bang giao dien Flow.",
             )
             await self._reload_flow_project_page(client)
-            return await self._generate_images_via_ui(client, request, reference_media_names)
+            return await self._generate_images_via_ui(client, request, reference_media_names, job_id=job_id)
 
     async def _generate_images_once(
         self,
@@ -10127,6 +10127,8 @@ exit 1
         client: Any,
         request: CreateJobRequest,
         reference_media_names: List[str],
+        *,
+        job_id: str = "",
     ) -> List[Any]:
         if reference_media_names:
             if len(reference_media_names) > 1:
@@ -10141,6 +10143,7 @@ exit 1
                 reference_media_name=reference_media_names[0],
                 count=max(1, min(4, int(request.count or 1))),
                 timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+                job_id=job_id,
             )
         return await client.generate_image(
             request.prompt,
@@ -10160,6 +10163,7 @@ exit 1
         workflow_id: str = "",
         count: int = 1,
         timeout_s: int = 120,
+        job_id: str = "",
     ) -> List[Any]:
         from flow._ui_interceptor import UIInterceptor
 
@@ -10167,19 +10171,26 @@ exit 1
         if not resolved_workflow_id:
             raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
+        ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
         page = await client._bm.page()
-        edit_url = f"{self._project_url(client.project_id).rstrip('/')}/edit/{resolved_workflow_id}"
+        project_url = self._project_url(client.project_id)
+        if job_id:
+            await self.store.append_log(job_id, f"Fallback UI Flow: mở project và chọn ảnh nguồn {resolved_workflow_id}.")
         try:
-            await page.goto(edit_url, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
         except Exception:
-            await page.goto(edit_url, wait_until="commit", timeout=60_000)
+            await page.goto(project_url, wait_until="commit", timeout=60_000)
         await asyncio.sleep(2.5)
+        if job_id:
+            await self.store.append_log(job_id, f"Fallback UI Flow: tab hiện tại {str(getattr(page, 'url', '') or '')[:160]}.")
         selected, selected_detail = await self._select_flow_edit_target_image(page, reference_media_name)
         if not selected:
             raise RuntimeError(
-                "Google Flow chua chon duoc anh goc tren man hinh chinh anh, nen em dung lai de tranh tao anh moi tu prompt. "
+                "Google Flow chua chon duoc anh goc tren project, nen em dung lai de tranh tao anh moi tu prompt. "
                 f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
             )
+        if job_id:
+            await self.store.append_log(job_id, f"Fallback UI Flow: đã chọn ảnh gốc ({selected_detail[:120]}).")
 
         interceptor = UIInterceptor()
         interceptor.attach(page)
@@ -10195,32 +10206,37 @@ exit 1
         filled = await client._ui.fill_prompt(page, prompt)
         if not filled:
             raise RuntimeError("Google Flow chua dien duoc prompt vao man hinh chinh anh.")
+        if job_id:
+            await self.store.append_log(job_id, "Fallback UI Flow: đã điền prompt vào ô tạo ảnh.")
 
         try:
             known_media_before_submit = self._project_media_names(await client._api.get_project_data())
         except Exception:
             known_media_before_submit = set()
 
-        selected, selected_detail = await self._select_flow_edit_target_image(page, reference_media_name)
-        if not selected:
-            raise RuntimeError(
-                "Google Flow bi mat chon anh goc truoc khi bam Create, nen em dung lai de tranh tao anh moi tu prompt. "
-                f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
-            )
-
-        clicked = await client._ui.click_submit(page)
+        clicked, click_detail = await self._click_flow_create_button(page)
         if not clicked:
-            raise RuntimeError("Google Flow chua bam duoc nut tao anh o man hinh chinh anh.")
+            clicked = await client._ui.click_submit(page)
+            click_detail = "fallback FlowUI.click_submit"
+        if not clicked:
+            raise RuntimeError(
+                "Google Flow chua bam duoc nut tao anh o man hinh chinh anh. "
+                f"Chi tiet: {click_detail or 'khong tim thay nut Create/Tao'}"
+            )
+        if job_id:
+            await self.store.append_log(job_id, f"Fallback UI Flow: đã bấm nút tạo ảnh ({click_detail[:120]}), chờ Flow trả ảnh tối đa {int(ui_timeout_s)} giây.")
 
         try:
             result = await interceptor.wait_for(
                 "batchGenerateImages",
-                timeout=max(30.0, min(120.0, float(timeout_s or 120))),
+                timeout=ui_timeout_s,
                 require_success=True,
             )
         except Exception as exc:
             detail = str(exc or "").lower()
             if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
+                if job_id:
+                    await self.store.append_log(job_id, f"Fallback UI Flow timeout/recaptcha: {str(exc)[:300]}")
                 raise RuntimeError(
                     "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
                     "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong."
@@ -10244,13 +10260,59 @@ exit 1
                 known_media_before_submit,
                 prompt=prompt,
                 target_count=max(1, min(4, int(count or 1))),
-                timeout_s=max(30.0, min(120.0, float(timeout_s or 120))),
+                timeout_s=ui_timeout_s,
                 fallback_workflow_id=resolved_workflow_id,
             )
 
         if not images:
             raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
         return images[: max(1, min(4, int(count or 1)))]
+
+    async def _click_flow_create_button(self, page: Any) -> tuple[bool, str]:
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 24 || rect.height < 24) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0' && !el.disabled;
+                  };
+                  const buttons = [...document.querySelectorAll('button')]
+                    .filter(visible)
+                    .map((el) => ({el, rect: el.getBoundingClientRect(), text: (el.textContent || '').trim()}))
+                    .filter(({text}) => /Create|Tạo|Tao|arrow_forward|add_2/i.test(text));
+                  const createButtons = buttons
+                    .filter(({text}) => /Create|Tạo|Tao|arrow_forward/i.test(text))
+                    .sort((a, b) => (b.rect.top - a.rect.top) || (b.rect.right - a.rect.right));
+                  const target = createButtons[0] || buttons.sort((a, b) => (b.rect.top - a.rect.top) || (b.rect.right - a.rect.right))[0];
+                  if (!target) return {ok: false, detail: 'no visible create button'};
+                  const x = target.rect.left + target.rect.width / 2;
+                  const y = target.rect.top + target.rect.height / 2;
+                  target.el.scrollIntoView({block: 'center', inline: 'center'});
+                  return {ok: true, x, y, detail: target.text || target.el.outerHTML?.slice(0, 160) || target.el.tagName};
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        ok = bool((result or {}).get("ok")) if isinstance(result, dict) else False
+        detail = str((result or {}).get("detail") or "").strip() if isinstance(result, dict) else ""
+        if not ok:
+            return False, detail
+        try:
+            x = float((result or {}).get("x"))
+            y = float((result or {}).get("y"))
+            await page.mouse.move(x, y)
+            await asyncio.sleep(0.1)
+            await page.mouse.click(x, y)
+            await asyncio.sleep(0.7)
+            return True, detail
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
 
     async def _select_flow_edit_target_image(self, page: Any, reference_media_name: str) -> tuple[bool, str]:
         media_token = str(reference_media_name or "").strip()
@@ -10265,25 +10327,37 @@ exit 1
                     const style = window.getComputedStyle(el);
                     return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
                   };
-                  const clickable = (el) => el.closest('button, [role="button"], [tabindex], a, [data-index], [data-item-index]') || el;
-                  const clickHard = (el) => {
-                    const target = clickable(el);
+                  const draggable = (el) => (
+                    el.closest('[aria-roledescription*="draggable" i], [draggable="true"], [role="button"], [data-index], [data-item-index]')
+                    || el.closest('a')
+                    || el
+                  );
+                  const rectInfo = (el) => {
+                    const target = draggable(el);
                     target.scrollIntoView({block: 'center', inline: 'center'});
-                    const rect = target.getBoundingClientRect();
-                    const x = rect.left + rect.width / 2;
-                    const y = rect.top + rect.height / 2;
-                    const opts = {
-                      bubbles: true,
-                      cancelable: true,
-                      view: window,
-                      clientX: x,
-                      clientY: y,
+                    const sourceRect = target.getBoundingClientRect();
+                    const editors = [...document.querySelectorAll('[contenteditable="true"], div[role="textbox"], textarea')]
+                      .filter((candidate) => {
+                        const rect = candidate.getBoundingClientRect();
+                        const style = window.getComputedStyle(candidate);
+                        return rect.width > 120
+                          && rect.height > 12
+                          && rect.bottom > window.innerHeight * 0.45
+                          && style.display !== 'none'
+                          && style.visibility !== 'hidden';
+                      })
+                      .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+                    const editor = editors[0];
+                    if (!editor) return {ok: false, detail: 'no visible prompt editor'};
+                    const editorRect = editor.getBoundingClientRect();
+                    return {
+                      ok: true,
+                      sourceX: sourceRect.left + sourceRect.width / 2,
+                      sourceY: sourceRect.top + sourceRect.height / 2,
+                      targetX: editorRect.left + Math.min(editorRect.width - 20, Math.max(20, editorRect.width * 0.15)),
+                      targetY: editorRect.top + editorRect.height / 2,
+                      detail: `drag ${target.tagName.toLowerCase()} ${Math.round(sourceRect.left)},${Math.round(sourceRect.top)} -> prompt ${Math.round(editorRect.left)},${Math.round(editorRect.top)}`,
                     };
-                    ['pointerdown','mousedown','mouseup','click'].forEach((type) => {
-                      target.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, opts) : new MouseEvent(type, opts));
-                    });
-                    target.click?.();
-                    return {ok: true, x, y, detail: target.outerHTML?.slice(0, 180) || target.tagName};
                   };
 
                   const token = String(mediaToken || '').trim();
@@ -10298,23 +10372,17 @@ exit 1
                     ];
                     for (const selector of exact) {
                       for (const el of document.querySelectorAll(selector)) {
-                        if (visible(el)) return clickHard(el);
+                        if (visible(el)) return rectInfo(el);
                       }
                     }
                     for (const el of [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]) {
                       if (!visible(el)) continue;
                       const haystack = `${el.getAttribute('alt') || ''} ${el.getAttribute('src') || ''} ${el.outerHTML || ''}`;
-                      if (haystack.includes(token)) return clickHard(el);
+                      if (haystack.includes(token)) return rectInfo(el);
                     }
                   }
 
-                  const candidates = [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]
-                    .filter(visible)
-                    .map((el) => ({el, rect: el.getBoundingClientRect()}))
-                    .filter(({rect}) => rect.width >= 120 && rect.height >= 120)
-                    .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
-                  if (candidates.length) return clickHard(candidates[0].el);
-                  return {ok: false, detail: 'no visible media candidate'};
+                  return {ok: false, detail: token ? `media token not visible: ${token}` : 'missing media token'};
                 }
                 """,
                 media_token,
@@ -10326,12 +10394,25 @@ exit 1
         detail = str((result or {}).get("detail") or "").strip() if isinstance(result, dict) else ""
         if ok:
             try:
-                x = float((result or {}).get("x"))
-                y = float((result or {}).get("y"))
-                await page.mouse.click(x, y)
-            except Exception:
-                pass
-            await asyncio.sleep(0.4)
+                source_x = float((result or {}).get("sourceX"))
+                source_y = float((result or {}).get("sourceY"))
+                target_x = float((result or {}).get("targetX"))
+                target_y = float((result or {}).get("targetY"))
+                await page.mouse.move(source_x, source_y)
+                await asyncio.sleep(0.15)
+                await page.mouse.down()
+                steps = 12
+                for step in range(1, steps + 1):
+                    x = source_x + (target_x - source_x) * step / steps
+                    y = source_y + (target_y - source_y) * step / steps
+                    await page.mouse.move(x, y)
+                    await asyncio.sleep(0.03)
+                await page.mouse.up()
+                await asyncio.sleep(1.0)
+                await page.mouse.click(target_x, target_y)
+                await asyncio.sleep(0.3)
+            except Exception as exc:
+                return False, humanize_flow_error(str(exc))
         return ok, detail
 
     def _flow_image_call_uses_selected_image(self, call: Any, reference_media_name: str, workflow_id: str) -> bool:

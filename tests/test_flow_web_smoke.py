@@ -2464,7 +2464,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual([fake_image], result)
         self.assertEqual(1, generate_once.await_count)
         reload_project.assert_awaited_once_with(fake_client)
-        generate_via_ui.assert_awaited_once_with(fake_client, request, [])
+        generate_via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
 
     async def test_generate_images_via_ui_uses_single_reference_fallback(self) -> None:
         request = CreateJobRequest(type="image", prompt="them kinh", count=1, aspect="portrait")
@@ -2480,6 +2480,46 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertEqual([fake_image], result)
         single_ref.assert_awaited_once()
+
+    async def test_select_flow_edit_target_image_drags_source_into_prompt(self) -> None:
+        events: list[tuple[str, float | None, float | None]] = []
+
+        class FakeMouse:
+            async def move(self, x: float, y: float) -> None:
+                events.append(("move", x, y))
+
+            async def down(self) -> None:
+                events.append(("down", None, None))
+
+            async def up(self) -> None:
+                events.append(("up", None, None))
+
+            async def click(self, x: float, y: float) -> None:
+                events.append(("click", x, y))
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str, media_token: str) -> dict:
+                self.media_token = media_token
+                return {
+                    "ok": True,
+                    "sourceX": 120,
+                    "sourceY": 140,
+                    "targetX": 420,
+                    "targetY": 820,
+                    "detail": "drag div 84,84 -> prompt 431,798",
+                }
+
+        page = FakePage()
+        ok, detail = await self.service._select_flow_edit_target_image(page, "media-source")
+
+        self.assertTrue(ok)
+        self.assertEqual("media-source", page.media_token)
+        self.assertIn("drag", detail)
+        self.assertIn(("down", None, None), events)
+        self.assertIn(("up", None, None), events)
+        self.assertEqual(("click", 420, 820), events[-1])
 
     async def test_resolve_image_reference_media_uses_robust_upload_helper(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
