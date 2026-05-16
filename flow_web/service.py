@@ -1732,6 +1732,8 @@ class FlowWebService:
         module_request = self._request_with_automation_module_settings(base_request, module)
         source_hint = await asyncio.to_thread(self._trello_source_card_hint, module_request)
         if not source_hint:
+            source_hint = await asyncio.to_thread(self._trello_matching_image_card_hint, module_request, items)
+        if not source_hint:
             return base_request, items, {}
 
         matched = [item for item in items if self._prompt_batch_item_matches_trello_source(item, source_hint)]
@@ -4191,6 +4193,17 @@ exit 1
         if not card_id:
             if not board_id:
                 raise RuntimeError("Trello Source cần Card ID/link card hoặc Board URL Trello có card chứa attachment ảnh.")
+            if request.prompt_source_row:
+                prompt_item = {
+                    "product_key": request.prompt_product_key,
+                    "product": request.prompt_product,
+                    "product_name": request.prompt_product,
+                    "notes": request.prompt_notes,
+                }
+                matched_hint = await asyncio.to_thread(self._trello_matching_image_card_hint, module_request, [prompt_item])
+                if matched_hint.get("card_id"):
+                    card_id = str(matched_hint.get("card_id") or "").strip()
+                    list_id = self._normalize_trello_id(str(matched_hint.get("list_id") or list_id or ""))
             if request.prompt_source_row and not list_id:
                 product_hint = (
                     request.prompt_product
@@ -4201,7 +4214,8 @@ exit 1
                     "Batch sheet chưa có Trello card cụ thể nên app đã dừng để tránh lấy nhầm card đầu tiên trên board. "
                     f"Hãy dán link card ở cục Trello Source, chọn List lọc card, hoặc thêm cột Trello_Card/Card_URL cho {product_hint}."
                 )
-            card_id = await asyncio.to_thread(self._trello_first_image_card_id_on_board, key, token, board_id, list_id)
+            if not card_id:
+                card_id = await asyncio.to_thread(self._trello_first_image_card_id_on_board, key, token, board_id, list_id)
             if not card_id:
                 scope = f" trong list {list_id}" if list_id else ""
                 raise RuntimeError(f"Board Trello này chưa có card nào{scope} chứa attachment ảnh để làm ảnh tham chiếu.")
@@ -4988,6 +5002,48 @@ exit 1
         card = self._trello_first_image_card_on_board(key, token, board_id, list_id)
         return str(card.get("id") or card.get("shortLink") or "").strip() if card else ""
 
+    def _trello_matching_image_card_hint(
+        self,
+        request: CreateJobRequest,
+        items: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token or not items:
+            return {}
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id
+            or trello_config.board_id
+            or os.getenv("TRELLO_BOARD_ID", "")
+        )
+        if not board_id:
+            return {}
+        list_id = self._normalize_trello_id(
+            request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
+        )
+        scopes = [list_id] if list_id else []
+        scopes.append("")
+        checked_scopes: set[str] = set()
+        for scope in scopes:
+            if scope in checked_scopes:
+                continue
+            checked_scopes.add(scope)
+            card = self._trello_matching_image_card_on_board(key, token, board_id, items, scope)
+            if not card:
+                continue
+            card_list_id = self._normalize_trello_id(str(card.get("idList") or scope or ""))
+            return {
+                "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+                "card_name": str(card.get("name") or "").strip(),
+                "card_short_link": str(card.get("shortLink") or "").strip(),
+                "card_url": str(card.get("url") or "").strip(),
+                "list_id": card_list_id,
+                "list_name": self._trello_list_name(key, token, card_list_id),
+            }
+        return {}
+
     def _trello_source_card_hint(self, request: CreateJobRequest) -> Dict[str, Any]:
         key, token = self._trello_credentials()
         if not key or not token:
@@ -5024,9 +5080,12 @@ exit 1
 
         if not isinstance(card, dict):
             return {}
+        resolved_card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+        if not resolved_card_id:
+            return {}
         card_list_id = self._normalize_trello_id(str(card.get("idList") or list_id or ""))
         return {
-            "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+            "card_id": resolved_card_id,
             "card_name": str(card.get("name") or "").strip(),
             "card_short_link": str(card.get("shortLink") or "").strip(),
             "card_url": str(card.get("url") or "").strip(),
@@ -5048,6 +5107,58 @@ exit 1
         except Exception:
             return ""
         return str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+
+    def _trello_matching_image_card_on_board(
+        self,
+        key: str,
+        token: str,
+        board_id: str,
+        items: List[Dict[str, Any]],
+        list_id: str = "",
+    ) -> Dict[str, Any]:
+        board_id = self._normalize_trello_board_id(board_id)
+        list_id = self._normalize_trello_id(list_id)
+        if not board_id or not items:
+            return {}
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/cards",
+            key,
+            token,
+            fields={"fields": "id,name,shortLink,url,idList,closed", "filter": "open"},
+        )
+        cards = [card for card in payload if isinstance(card, dict) and not card.get("closed")] if isinstance(payload, list) else []
+        attachment_cache: Dict[str, bool] = {}
+        for item in items:
+            for card in cards:
+                card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+                if list_id and card_list_id != list_id:
+                    continue
+                hint = {
+                    "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+                    "card_name": str(card.get("name") or "").strip(),
+                    "list_id": card_list_id,
+                }
+                if not self._prompt_batch_item_matches_trello_source(item, hint):
+                    continue
+                card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+                if not card_id:
+                    continue
+                if card_id not in attachment_cache:
+                    attachments_payload = self._trello_get_json(
+                        f"cards/{quote(card_id, safe='')}/attachments",
+                        key,
+                        token,
+                        fields={"fields": "id,name,url,mimeType"},
+                    )
+                    attachments = attachments_payload if isinstance(attachments_payload, list) else []
+                    attachment_cache[card_id] = any(
+                        self._trello_attachment_is_image(attachment)
+                        for attachment in attachments
+                        if isinstance(attachment, dict)
+                    )
+                if attachment_cache[card_id]:
+                    return card
+        return {}
 
     def _trello_first_image_card_on_board(
         self,
