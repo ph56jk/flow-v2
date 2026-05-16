@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -18,11 +19,15 @@ from flow_web.schemas import (
     AppConfig,
     AuthStatus,
     CreateJobRequest,
+    IntegrationConfigUpdateRequest,
+    JobArtifact,
     JobRecord,
+    PromptBatchRequest,
     PromptCreateRequest,
     SkillRecord,
     StateSnapshot,
     StoryboardPlanRequest,
+    TrelloConfigUpdateRequest,
 )
 from flow_web.service import FlowWebService
 from flow_web.store import StateStore
@@ -114,6 +119,392 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         resolved = self.service._resolve_job_request(request, config)
 
         self.assertEqual("NARWHAL", resolved.model)
+
+    def test_project_generated_images_extracts_new_flow_media(self) -> None:
+        project_data = {
+            "projectContents": {
+                "workflows": [
+                    {
+                        "name": "wf-old",
+                        "projectId": "pid",
+                        "metadata": {"displayName": "Old prompt", "createTime": "2026-05-15T08:00:00Z"},
+                        "medias": [
+                            {
+                                "name": "old-media",
+                                "projectId": "pid",
+                                "image": {"generatedImage": {"fifeUrl": "https://example.com/old.jpg"}},
+                            }
+                        ],
+                    },
+                    {
+                        "name": "wf-video",
+                        "projectId": "pid",
+                        "metadata": {"displayName": "Video item", "createTime": "2026-05-15T08:02:00Z"},
+                        "medias": [{"name": "video-media", "video": {"encodedVideo": {"url": "https://example.com/v.mp4"}}}],
+                    },
+                    {
+                        "name": "wf-new",
+                        "projectId": "pid",
+                        "metadata": {"displayName": "New prompt", "createTime": "2026-05-15T08:01:00Z"},
+                        "medias": [
+                            {
+                                "name": "new-media",
+                                "projectId": "pid",
+                                "dimensions": {"width": 1024, "height": 1024},
+                                "image": {
+                                    "generatedImage": {
+                                        "fifeUrl": "https://example.com/new.jpg",
+                                        "prompt": "Generated prompt",
+                                        "seed": 7,
+                                        "modelNameType": "NARWHAL",
+                                    }
+                                },
+                            }
+                        ],
+                    },
+                ]
+            }
+        }
+
+        images = self.service._project_generated_images(project_data, known_media={"old-media"}, prompt="Fallback prompt")
+
+        self.assertEqual(1, len(images))
+        self.assertEqual("new-media", images[0].media_name)
+        self.assertEqual("wf-new", images[0].workflow_id)
+        self.assertEqual("https://example.com/new.jpg", images[0].fife_url)
+        self.assertEqual("Generated prompt", images[0].prompt)
+        self.assertEqual({"width": 1024, "height": 1024}, images[0].dimensions)
+
+    def test_trello_archive_skips_without_credentials(self) -> None:
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(os.environ, {"TRELLO_API_KEY": "", "TRELLO_TOKEN": ""}, clear=False):
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        self.assertEqual({"configured": False}, result)
+
+    def test_trello_archive_attaches_image_to_configured_card(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_card_id="https://trello.com/c/abc123/demo-card",
+        )
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRELLO_API_KEY": "key",
+                "TRELLO_TOKEN": "token",
+                "TRELLO_CARD_ID": "",
+                "TRELLO_LIST_ID": "",
+                "TRELLO_UPLOAD_MODE": "url",
+            },
+            clear=False,
+        ), patch.object(
+            self.service,
+            "_trello_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        attach_url.assert_called_once()
+        self.assertEqual("abc123", attach_url.call_args.args[2])
+        self.assertTrue(attach_url.call_args.args[5])
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+        self.assertEqual("abc123", result["card_id"])
+
+    def test_update_trello_config_saves_without_exposing_credentials(self) -> None:
+        result = asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="url",
+                )
+            )
+        )
+
+        self.assertTrue(result["configured"])
+        self.assertTrue(result["credentials_saved"])
+        self.assertNotIn("api_key", result)
+        self.assertNotIn("token", result)
+        self.assertEqual("abc123", result["card_id"])
+        self.assertEqual("url", result["upload_mode"])
+
+        saved = self.store.snapshot().trello_config
+        self.assertEqual("key", saved.api_key)
+        self.assertEqual("token", saved.token)
+        self.assertEqual("abc123", saved.card_id)
+
+    def test_trello_archive_uses_app_saved_config(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="url",
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRELLO_API_KEY": "",
+                "TRELLO_TOKEN": "",
+                "TRELLO_CARD_ID": "",
+                "TRELLO_LIST_ID": "",
+                "TRELLO_UPLOAD_MODE": "file",
+            },
+            clear=False,
+        ), patch.object(
+            self.service,
+            "_trello_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        attach_url.assert_called_once()
+        self.assertEqual("abc123", attach_url.call_args.args[2])
+        self.assertEqual("https://example.com/cat.jpg", attach_url.call_args.args[3])
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["sent"])
+
+    def test_update_integration_config_saves_without_exposing_credentials(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            result = asyncio.run(
+                self.service.update_integration_config(
+                    IntegrationConfigUpdateRequest(
+                        gemini_api_key="gem-key",
+                        gemini_model="gemini-2.5-flash",
+                        telegram_bot_token="telegram-token",
+                        telegram_chat_id="@review_channel",
+                        playwright_browsers_path="/tmp/pw-browsers",
+                    )
+                )
+            )
+
+            self.assertTrue(result["gemini"]["configured"])
+            self.assertTrue(result["telegram"]["configured"])
+            self.assertTrue(result["runtime"]["playwright_browsers_path_set"])
+            self.assertNotIn("gemini_api_key", result["gemini"])
+            self.assertNotIn("telegram_bot_token", result["telegram"])
+            self.assertEqual("gemini-2.5-flash", result["gemini"]["model"])
+            self.assertEqual("@review_channel", result["telegram"]["chat_id"])
+            self.assertEqual("/tmp/pw-browsers", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
+
+        saved = self.store.snapshot().integration_config
+        self.assertEqual("gem-key", saved.gemini_api_key)
+        self.assertEqual("telegram-token", saved.telegram_bot_token)
+        self.assertEqual("/tmp/pw-browsers", saved.playwright_browsers_path)
+
+    def test_prompt_assistant_uses_app_saved_gemini_settings(self) -> None:
+        asyncio.run(
+            self.service.update_integration_config(
+                IntegrationConfigUpdateRequest(
+                    gemini_api_key="gem-key",
+                    gemini_model="gemini-2.5-pro",
+                )
+            )
+        )
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GEMINI_MODEL": ""}, clear=False):
+            engine = self.service._prompt_ai_engine()
+
+        self.assertTrue(engine["configured"])
+        self.assertEqual("gemini", engine["engine"])
+        self.assertEqual("gemini-2.5-pro", engine["model"])
+
+    def test_telegram_review_pack_uses_app_saved_config(self) -> None:
+        asyncio.run(
+            self.service.update_integration_config(
+                IntegrationConfigUpdateRequest(
+                    telegram_bot_token="telegram-token",
+                    telegram_chat_id="@review_channel",
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}, clear=False), patch.object(
+            self.service,
+            "_send_telegram_photo",
+        ) as send_photo:
+            result = asyncio.run(self.service._send_telegram_review_pack(job.id, request, [artifact]))
+
+        send_photo.assert_called_once()
+        self.assertEqual("telegram-token", send_photo.call_args.args[0])
+        self.assertEqual("@review_channel", send_photo.call_args.args[1])
+        reply_markup = send_photo.call_args.args[4]
+        callback_values = [
+            button["callback_data"]
+            for row in reply_markup["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn(f"fw:approve:{job.id}:0", callback_values)
+        self.assertIn(f"fw:reject:{job.id}:0", callback_values)
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(1, result["pending_approvals"])
+
+    def test_sync_telegram_approvals_updates_job_and_approval_node(self) -> None:
+        asyncio.run(
+            self.service.update_integration_config(
+                IntegrationConfigUpdateRequest(
+                    telegram_bot_token="telegram-token",
+                    telegram_chat_id="@review_channel",
+                )
+            )
+        )
+        job = JobRecord(
+            type="image",
+            status="completed",
+            title="test",
+            result={
+                "automation_execution": {
+                    "mode": "graph",
+                    "nodes": [
+                        {"id": "flow-1", "type": "flow", "status": "completed", "output": {}},
+                        {"id": "approval-1", "type": "approval", "status": "running", "output": {}},
+                    ],
+                    "edges": [],
+                    "current_module_id": "approval-1",
+                    "completed": False,
+                }
+            },
+            artifacts=[JobArtifact(label="Ảnh 1", url="https://example.com/cat.jpg", mime_type="image/jpeg")],
+        )
+        asyncio.run(self.store.add_job(job))
+        updates = [
+            {
+                "update_id": 100,
+                "callback_query": {
+                    "id": "callback-1",
+                    "from": {"id": 7, "first_name": "Ellyn", "username": "ellyn"},
+                    "message": {"message_id": 42, "chat": {"id": -100}},
+                    "data": f"fw:approve:{job.id}:0",
+                },
+            }
+        ]
+
+        with patch.object(self.service, "_telegram_get_updates", side_effect=[updates, []]) as get_updates, patch.object(
+            self.service,
+            "_telegram_answer_callback_query",
+        ) as answer:
+            result = asyncio.run(self.service.sync_telegram_approvals())
+
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["processed"])
+        get_updates.assert_any_call("telegram-token")
+        get_updates.assert_any_call("telegram-token", 101)
+        answer.assert_called_once()
+        saved = self.store.get_job(job.id)
+        self.assertEqual("approved", saved.result["telegram_approvals"]["0"]["status"])
+        self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
+        approval_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["type"] == "approval")
+        self.assertEqual("completed", approval_node["status"])
+        self.assertTrue(saved.result["automation_execution"]["completed"])
+
+    def test_telegram_approval_sync_loop_polls_until_cancelled(self) -> None:
+        calls = 0
+
+        async def fake_sync() -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {"configured": True, "processed": 0, "approvals": []}
+
+        async def run_loop() -> None:
+            task = asyncio.create_task(self.service.run_telegram_approval_sync_loop(interval_s=0.01))
+            with patch.object(self.service, "sync_telegram_approvals", side_effect=fake_sync):
+                while calls < 2:
+                    await asyncio.sleep(0.02)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(run_loop())
+        self.assertGreaterEqual(calls, 2)
+
+    def test_prompt_source_preview_reads_pasted_google_sheet_rows(self) -> None:
+        table = "\n".join(
+            [
+                "Product_Key\tProduct_Name\tPrompt_Index\tPrompt_Content\tActive\tNotes",
+                "wedding_hoop\tWedding Hoop\t1\tinactive prompt\tFALSE\told",
+                "hoops_with_photos\tHoops With Photos\t1\tThe product image showcases a personalized embroidery frame.\tTRUE\tNursery shelf decor",
+            ]
+        )
+
+        result = asyncio.run(self.service.preview_prompt_source(text=table))
+
+        self.assertEqual(2, result["prompt_count"])
+        self.assertEqual(1, result["active_count"])
+        self.assertIn("personalized embroidery frame", result["prompt"])
+        self.assertEqual("Hoops With Photos", result["selected"]["product"])
+        self.assertEqual(1, len(result["items"]))
+        self.assertIn("personalized embroidery frame", result["items"][0]["prompt"])
+
+    def test_prompt_source_preview_reads_xlsx_upload(self) -> None:
+        workbook = io.BytesIO()
+        with zipfile.ZipFile(workbook, "w") as archive:
+            archive.writestr(
+                "xl/workbook.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+                <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+                  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+                </workbook>""",
+            )
+            archive.writestr(
+                "xl/_rels/workbook.xml.rels",
+                """<?xml version="1.0" encoding="UTF-8"?>
+                <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                  <Relationship Id="rId1" Target="worksheets/sheet1.xml"
+                    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>
+                </Relationships>""",
+            )
+            archive.writestr(
+                "xl/worksheets/sheet1.xml",
+                """<?xml version="1.0" encoding="UTF-8"?>
+                <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+                  <sheetData>
+                    <row r="1">
+                      <c r="A1" t="inlineStr"><is><t>Product_Key</t></is></c>
+                      <c r="B1" t="inlineStr"><is><t>Prompt_Content</t></is></c>
+                      <c r="C1" t="inlineStr"><is><t>Active</t></is></c>
+                    </row>
+                    <row r="2">
+                      <c r="A2" t="inlineStr"><is><t>hoops_with_photos</t></is></c>
+                      <c r="B2" t="inlineStr"><is><t>Flow should create the product photo from this prompt.</t></is></c>
+                      <c r="C2" t="inlineStr"><is><t>TRUE</t></is></c>
+                    </row>
+                  </sheetData>
+                </worksheet>""",
+            )
+        upload = UploadFile(filename="prompts.xlsx", file=io.BytesIO(workbook.getvalue()))
+
+        result = asyncio.run(self.service.preview_prompt_source(file=upload))
+
+        self.assertEqual(1, result["prompt_count"])
+        self.assertEqual(1, result["active_count"])
+        self.assertIn("product photo", result["prompt"])
+        self.assertEqual("Flow should create the product photo from this prompt.", result["items"][0]["prompt"])
 
     def test_get_auth_status_uses_network_cookies_fallback(self) -> None:
         with patch.object(self.service, "_flow_modules", return_value=(None, lambda: False, None, None, None)), patch.object(
@@ -539,6 +930,43 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(local_path, saved_job.result.get("auto_start_frame_path"))
         self.assertEqual("/files/uploads/job-start.jpg", saved_job.result.get("auto_start_frame_public_url"))
         self.assertEqual(prompt, saved_job.result.get("auto_start_frame_prompt"))
+
+    async def test_wait_for_new_project_images_polls_project_data(self) -> None:
+        empty_project = {"projectContents": {"workflows": []}}
+        ready_project = {
+            "projectContents": {
+                "workflows": [
+                    {
+                        "name": "wf-new",
+                        "projectId": "pid",
+                        "metadata": {"displayName": "Prompt title", "createTime": "2026-05-15T08:01:00Z"},
+                        "medias": [
+                            {
+                                "name": "media-new",
+                                "projectId": "pid",
+                                "image": {"generatedImage": {"fifeUrl": "https://example.com/new.jpg"}},
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        client = SimpleNamespace(
+            _api=SimpleNamespace(get_project_data=AsyncMock(side_effect=[empty_project, ready_project]))
+        )
+
+        images = await self.service._wait_for_new_project_images(
+            client,
+            {"media-old"},
+            prompt="Prompt fallback",
+            target_count=1,
+            timeout_s=5,
+        )
+
+        self.assertEqual(1, len(images))
+        self.assertEqual("media-new", images[0].media_name)
+        self.assertEqual("https://example.com/new.jpg", images[0].fife_url)
+        self.assertEqual(2, client._api.get_project_data.await_count)
 
     async def test_with_client_keeps_shared_flow_browser_open_in_visible_mode(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
@@ -1300,6 +1728,321 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIsNotNone(saved)
         self.assertEqual("completed", saved.status)
         self.assertEqual(2, len(saved.artifacts))
+
+    async def test_run_flow_job_records_make_style_automation_modules(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            count=1,
+            automation_graph={
+                "modules": [
+                    {"id": "source-1", "type": "source", "title": "Prompt Source", "settings": {"sourceType": "sheets"}},
+                    {"id": "normalize-1", "type": "normalize", "title": "Normalize Prompt"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "card-1"}},
+                    {"id": "telegram-1", "type": "telegram", "title": "Telegram Review", "settings": {"telegramChat": "chat-1"}},
+                    {"id": "approval-1", "type": "approval", "title": "Approval"},
+                ]
+            },
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        fake_images = [
+            SimpleNamespace(
+                media_name="img-1",
+                workflow_id="wf-1",
+                fife_url="https://example.com/img-1.jpg",
+                prompt=request.prompt,
+                dimensions={"width": 1024, "height": 1024},
+            )
+        ]
+        calls: list[str] = []
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(SimpleNamespace())
+
+        async def fake_archive(job_id, module_request, artifacts):
+            calls.append("trello")
+            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+
+        async def fake_telegram(job_id, module_request, artifacts):
+            calls.append("telegram")
+            return {"configured": True, "sent": len(artifacts), "chat_id": module_request.telegram_chat_id}
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
+            self.service,
+            "_generate_images_with_retry",
+            AsyncMock(return_value=fake_images),
+        ), patch.object(
+            self.service,
+            "_archive_trello_artifacts",
+            side_effect=fake_archive,
+        ), patch.object(
+            self.service,
+            "_send_telegram_review_pack",
+            side_effect=fake_telegram,
+        ):
+            await self.service._run_flow_job(job.id, request)
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(["trello", "telegram"], calls)
+        execution = saved.result["automation_execution"]
+        self.assertEqual("graph", execution["mode"])
+        self.assertFalse(execution["completed"])
+        self.assertEqual(
+            ["source", "normalize", "flow", "trello", "telegram", "approval"],
+            [node["type"] for node in execution["nodes"]],
+        )
+        self.assertTrue(all(node["status"] == "completed" for node in execution["nodes"] if node["type"] != "approval"))
+        approval_node = next(node for node in execution["nodes"] if node["type"] == "approval")
+        self.assertEqual("running", approval_node["status"])
+        self.assertTrue(approval_node["output"]["awaiting_user_approval"])
+        flow_node = next(node for node in execution["nodes"] if node["type"] == "flow")
+        self.assertEqual(1, flow_node["output"]["artifact_count"])
+        telegram_node = next(node for node in execution["nodes"] if node["type"] == "telegram")
+        self.assertEqual("chat-1", telegram_node["output"]["chat_id"])
+        trello_node = next(node for node in execution["nodes"] if node["type"] == "trello")
+        self.assertEqual("card-1", trello_node["output"]["card_id"])
+
+    async def test_approval_module_pauses_and_resumes_downstream_modules(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            count=1,
+            telegram_enabled=True,
+            trello_enabled=True,
+            automation_graph={
+                "modules": [
+                    {"id": "source-1", "type": "source", "title": "Prompt Source"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "telegram-1", "type": "telegram", "title": "Telegram Review", "settings": {"telegramChat": "chat-1"}},
+                    {"id": "approval-1", "type": "approval", "title": "Approval"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "card-1"}},
+                ]
+            },
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        fake_images = [
+            SimpleNamespace(
+                media_name="img-1",
+                workflow_id="wf-1",
+                fife_url="https://example.com/img-1.jpg",
+                prompt=request.prompt,
+                dimensions={"width": 1024, "height": 1024},
+            )
+        ]
+        calls: list[str] = []
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(SimpleNamespace())
+
+        async def fake_archive(job_id, module_request, artifacts):
+            calls.append("trello")
+            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+
+        async def fake_telegram(job_id, module_request, artifacts):
+            calls.append("telegram")
+            return {"configured": True, "sent": len(artifacts), "chat_id": module_request.telegram_chat_id}
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
+            self.service,
+            "_generate_images_with_retry",
+            AsyncMock(return_value=fake_images),
+        ), patch.object(
+            self.service,
+            "_archive_trello_artifacts",
+            side_effect=fake_archive,
+        ), patch.object(
+            self.service,
+            "_send_telegram_review_pack",
+            side_effect=fake_telegram,
+        ):
+            await self.service._run_flow_job(job.id, request)
+
+            saved = self.store.get_job(job.id)
+            self.assertIsNotNone(saved)
+            self.assertEqual(["telegram"], calls)
+            execution = saved.result["automation_execution"]
+            approval_node = next(node for node in execution["nodes"] if node["id"] == "approval-1")
+            trello_node = next(node for node in execution["nodes"] if node["id"] == "trello-1")
+            self.assertEqual("running", approval_node["status"])
+            self.assertEqual("pending", trello_node["status"])
+            self.assertFalse(execution["completed"])
+
+            await self.service._apply_telegram_approval(
+                job.id,
+                0,
+                "approved",
+                {
+                    "id": "callback-1",
+                    "from": {"first_name": "Reviewer"},
+                    "message": {"message_id": 42, "chat": {"id": "chat-1"}},
+                },
+            )
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual(["telegram", "trello"], calls)
+        execution = saved.result["automation_execution"]
+        approval_node = next(node for node in execution["nodes"] if node["id"] == "approval-1")
+        trello_node = next(node for node in execution["nodes"] if node["id"] == "trello-1")
+        self.assertEqual("completed", approval_node["status"])
+        self.assertEqual("completed", trello_node["status"])
+        self.assertTrue(execution["completed"])
+        self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
+        self.assertEqual("card-1", saved.result["trello"]["card_id"])
+
+    async def test_custom_module_runs_user_configured_webhook(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="custom prompt",
+            title="Webhook demo",
+            count=1,
+            automation_graph={
+                "modules": [
+                    {"id": "source-1", "type": "source", "title": "Prompt Source"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {
+                        "id": "custom-1",
+                        "type": "custom",
+                        "title": "Webhook Custom",
+                        "settings": {
+                            "customWebhookUrl": "https://hooks.example/run?api_key=secret&job={{job_id}}",
+                            "customWebhookMethod": "POST",
+                            "customWebhookHeaders": "X-Flow-Job: {{job_id}}\nAuthorization: Bearer demo",
+                            "customWebhookBody": '{"id":"{{job_id}}","prompt":"{{prompt}}","url":"{{first_artifact_url}}","artifacts":{{artifacts}}}',
+                        },
+                    },
+                ]
+            },
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+        fake_images = [
+            SimpleNamespace(
+                media_name="img-1",
+                workflow_id="wf-1",
+                fife_url="https://example.com/img-1.jpg",
+                prompt=request.prompt,
+                dimensions={"width": 1024, "height": 1024},
+            )
+        ]
+        captured: dict[str, object] = {}
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(SimpleNamespace())
+
+        def fake_webhook(method, url, headers, body, timeout_s):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["body"] = body
+            captured["timeout_s"] = timeout_s
+            return {"status_code": 200, "body": {"ok": True}}
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
+            self.service,
+            "_generate_images_with_retry",
+            AsyncMock(return_value=fake_images),
+        ), patch.object(
+            self.service,
+            "_custom_webhook_request",
+            side_effect=fake_webhook,
+        ):
+            await self.service._run_flow_job(job.id, request)
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual("POST", captured["method"])
+        self.assertIn(f"job={job.id}", captured["url"])
+        self.assertEqual(job.id, captured["headers"]["X-Flow-Job"])
+        body_payload = json.loads(captured["body"].decode("utf-8"))
+        self.assertEqual(job.id, body_payload["id"])
+        self.assertEqual("custom prompt", body_payload["prompt"])
+        self.assertEqual("https://example.com/img-1.jpg", body_payload["url"])
+        self.assertEqual("img-1", body_payload["artifacts"][0]["media_name"])
+        custom_result = saved.result["custom_modules"]["custom-1"]
+        self.assertTrue(custom_result["configured"])
+        self.assertEqual(200, custom_result["status_code"])
+        self.assertIn("api_key=***", custom_result["url"])
+        custom_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["id"] == "custom-1")
+        self.assertEqual("completed", custom_node["status"])
+
+    async def test_prompt_batch_runs_active_sheet_prompts_sequentially(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                telegram_enabled=True,
+                telegram_chat_id="1234567890",
+                automation_graph={
+                    "modules": [
+                        {"id": "source-1", "type": "source", "title": "Prompt Source", "settings": {"sourceType": "sheets"}},
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                        {"id": "telegram-1", "type": "telegram", "title": "Telegram Review"},
+                        {"id": "approval-1", "type": "approval", "title": "Approval"},
+                    ]
+                },
+            ),
+            items=[
+                {"row": 2, "prompt": "first product prompt", "product": "Hoop", "index": "1", "active": True},
+                {"row": 3, "prompt": "inactive prompt", "product": "Hoop", "index": "2", "active": False},
+                {"row": 4, "prompt": "second product prompt", "product": "Blanket", "index": "1", "active": True},
+            ],
+        )
+        seen_prompts: list[str] = []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_prompts.append(child_request.prompt)
+            await self.store.replace_artifacts(
+                job_id,
+                [JobArtifact(label="Ảnh 1", url="https://example.com/image.jpg", mime_type="image/jpeg", prompt=child_request.prompt)],
+            )
+            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(["first product prompt", "second product prompt"], seen_prompts)
+        self.assertEqual(2, saved.result["total"])
+        self.assertEqual(2, saved.result["completed"])
+        self.assertEqual(0, saved.result["failed"])
+        child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
+        self.assertEqual(["Sheet 1/2 · Hoop #1", "Sheet 2/2 · Blanket #1"], [job.title for job in child_jobs])
 
     async def test_generate_images_with_retry_reloads_project_after_recaptcha_error(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

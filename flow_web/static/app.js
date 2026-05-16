@@ -16,6 +16,89 @@ const REFERENCE_ROLE_OPTIONS = [
   { value: "product", label: "Sản phẩm", detail: "Ảnh sản phẩm, quần áo, phụ kiện, vật thể chính." },
   { value: "reference", label: "Tham chiếu", detail: "Ảnh phụ để lấy màu, chất liệu, bố cục hoặc vibe." },
 ];
+const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
+const AUTOMATION_CONFIG_VERSION = 1;
+const AUTOMATION_STEP_ORDER = ["source", "normalize", "flow", "telegram", "log", "review_hold"];
+const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
+const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
+const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
+const AUTOMATION_MODULE_TYPE_CONFIG = {
+  source: {
+    label: "Prompt source",
+    title: "Prompt Source",
+    detail: "Google Sheet / file / nhập tay",
+    icon: "T",
+    iconClass: "node-icon-trello",
+  },
+  normalize: {
+    label: "Normalize",
+    title: "Normalize Prompt",
+    detail: "Lọc dòng mới, lấy prompt sạch",
+    icon: "S",
+    iconClass: "node-icon-sheet",
+  },
+  flow: {
+    label: "Google Flow",
+    title: "Google Flow",
+    detail: "Tạo ảnh bằng Flow account",
+    icon: "F",
+    iconClass: "node-icon-flow",
+  },
+  telegram: {
+    label: "Telegram",
+    title: "Telegram Review",
+    detail: "Gửi ảnh để duyệt",
+    icon: "TG",
+    iconClass: "node-icon-telegram",
+  },
+  trello: {
+    label: "Trello",
+    title: "Trello Archive",
+    detail: "Lưu ảnh vào card/list Trello",
+    icon: "L",
+    iconClass: "node-icon-log",
+  },
+  approval: {
+    label: "Approval",
+    title: "Approval Log",
+    detail: "Ghi trạng thái sau duyệt",
+    icon: "A",
+    iconClass: "node-icon-log",
+  },
+  custom: {
+    label: "Custom",
+    title: "Custom Module",
+    detail: "Cục tự định nghĩa",
+    icon: "C",
+    iconClass: "node-icon-custom",
+  },
+};
+const AUTOMATION_STEP_DEFAULTS = {
+  source: {
+    title: "Prompt Source",
+    detail: "Google Sheet / file / nhập tay",
+  },
+  normalize: {
+    title: "Normalize Prompt",
+    detail: "Lọc dòng mới, lấy prompt sạch",
+  },
+  flow: {
+    title: "Google Flow",
+    detail: "Tạo ảnh bằng Flow account",
+  },
+  telegram: {
+    title: "Telegram Review",
+    detail: "Gửi ảnh để duyệt",
+  },
+  log: {
+    title: "Trello Archive",
+    detail: "Lưu ảnh vào card/list Trello",
+  },
+  review_hold: {
+    title: "Pause for approval",
+    detail: "Dừng để chủ nhân duyệt trước khi ghi log",
+  },
+};
 const ASPECT_DETAILS = {
   landscape: { title: "Ngang 16:9", detail: "YouTube, cảnh ngang, widescreen" },
   portrait: { title: "Dọc 9:16", detail: "Reels, Shorts, TikTok" },
@@ -230,6 +313,252 @@ const EDIT_ACTION_CONFIG = {
   },
 };
 
+function moduleTypeForLegacyKey(key) {
+  if (key === "log") {
+    return "trello";
+  }
+  if (key === "review_hold") {
+    return "approval";
+  }
+  return AUTOMATION_MODULE_TYPE_CONFIG[key] ? key : "custom";
+}
+
+function moduleTypeConfig(type) {
+  return AUTOMATION_MODULE_TYPE_CONFIG[type] || AUTOMATION_MODULE_TYPE_CONFIG.custom;
+}
+
+function createAutomationModule(type = "custom", seed = {}) {
+  const safeType = moduleTypeConfig(type) === AUTOMATION_MODULE_TYPE_CONFIG.custom ? (type === "custom" ? "custom" : moduleTypeForLegacyKey(type)) : type;
+  const config = moduleTypeConfig(safeType);
+  const id = String(seed.id || `${safeType}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`);
+  return {
+    id,
+    type: safeType,
+    title: String(seed.title || config.title),
+    detail: String(seed.detail || config.detail),
+    icon: String(seed.icon || config.icon),
+    enabled: seed.enabled !== false,
+    settings: {
+      ...(seed.settings || {}),
+    },
+  };
+}
+
+function defaultAutomationModules() {
+  return AUTOMATION_STEP_ORDER.map((key) => {
+    const legacy = AUTOMATION_STEP_DEFAULTS[key] || {};
+    return createAutomationModule(moduleTypeForLegacyKey(key), {
+      id: key,
+      title: legacy.title,
+      detail: legacy.detail,
+    });
+  });
+}
+
+function normalizeAutomationModule(value = {}, index = 0) {
+  const fallbackType = moduleTypeForLegacyKey(value.id || value.type || "custom");
+  const type = moduleTypeConfig(value.type) === AUTOMATION_MODULE_TYPE_CONFIG.custom && value.type !== "custom"
+    ? fallbackType
+    : (value.type || fallbackType);
+  const fallback = createAutomationModule(type, {
+    id: value.id || `module_${index + 1}`,
+  });
+  return createAutomationModule(type, {
+    ...fallback,
+    ...value,
+    id: String(value.id || fallback.id),
+    title: String(value.title || fallback.title),
+    detail: String(value.detail || fallback.detail),
+    icon: String(value.icon || fallback.icon),
+    enabled: value.enabled !== false,
+    settings: value.settings && typeof value.settings === "object" ? value.settings : {},
+  });
+}
+
+function normalizeAutomationModules(parsed = {}) {
+  if (Array.isArray(parsed.modules) && parsed.modules.length) {
+    return parsed.modules.map(normalizeAutomationModule);
+  }
+  const modules = [];
+  const steps = parsed.steps && typeof parsed.steps === "object" ? parsed.steps : {};
+  for (const key of AUTOMATION_STEP_ORDER) {
+    const legacy = {
+      ...(AUTOMATION_STEP_DEFAULTS[key] || {}),
+      ...(steps[key] || {}),
+      id: key,
+      type: moduleTypeForLegacyKey(key),
+    };
+    modules.push(normalizeAutomationModule(legacy, modules.length));
+  }
+  return modules.length ? modules : defaultAutomationModules();
+}
+
+function automationStepsFromModules(modules = []) {
+  return Object.fromEntries((modules || []).map((module) => [module.id, module]));
+}
+
+function defaultAutomationConfig() {
+  const modules = defaultAutomationModules();
+  return {
+    version: AUTOMATION_CONFIG_VERSION,
+    enabled: false,
+    view: "diagram",
+    selectedStep: "flow",
+    sourceType: "manual",
+    sourceLocation: "",
+    telegramChat: "",
+    sheetLog: "",
+    trelloCardId: "",
+    trelloListId: "",
+    trelloSetCover: true,
+    prompt: "",
+    appEyebrow: "Flow v2",
+    appTitle: "Flow v2",
+    appSubtitle: "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.",
+    accentColor: "#7c2ee6",
+    canvasZoom: 1,
+    modules,
+    steps: automationStepsFromModules(modules),
+  };
+}
+
+function normalizeAutomationConfig(value = {}) {
+  const fallback = defaultAutomationConfig();
+  const parsed = value && typeof value === "object" ? value : {};
+  const modules = normalizeAutomationModules(parsed);
+  const hasSelected = modules.some((module) => module.id === parsed?.selectedStep);
+  const selectedStep = hasSelected ? parsed.selectedStep : (modules.find((module) => module.type === "flow") || modules[0])?.id || "flow";
+  return {
+    ...fallback,
+    ...parsed,
+    version: AUTOMATION_CONFIG_VERSION,
+    view: ["diagram", "history", "incomplete"].includes(parsed?.view) ? parsed.view : fallback.view,
+    selectedStep,
+    sourceType: String(parsed?.sourceType || fallback.sourceType),
+    sourceLocation: String(parsed?.sourceLocation || ""),
+    telegramChat: String(parsed?.telegramChat || ""),
+    sheetLog: String(parsed?.sheetLog || ""),
+    trelloCardId: String(parsed?.trelloCardId || ""),
+    trelloListId: String(parsed?.trelloListId || ""),
+    trelloSetCover: parsed?.trelloSetCover !== false,
+    prompt: String(parsed?.prompt || ""),
+    appEyebrow: String(parsed?.appEyebrow || fallback.appEyebrow),
+    appTitle: String(parsed?.appTitle || fallback.appTitle),
+    appSubtitle: String(parsed?.appSubtitle || fallback.appSubtitle),
+    accentColor: normalizeHexColor(parsed?.accentColor || fallback.accentColor, fallback.accentColor),
+    canvasZoom: clampAutomationCanvasZoom(parsed?.canvasZoom ?? fallback.canvasZoom),
+    modules,
+    steps: automationStepsFromModules(modules),
+  };
+}
+
+function loadAutomationConfig() {
+  try {
+    const raw = window.localStorage?.getItem(AUTOMATION_STORAGE_KEY);
+    if (!raw) {
+      return defaultAutomationConfig();
+    }
+    return normalizeAutomationConfig(JSON.parse(raw));
+  } catch (error) {
+    return defaultAutomationConfig();
+  }
+}
+
+function saveAutomationConfig(config) {
+  try {
+    window.localStorage?.setItem(AUTOMATION_STORAGE_KEY, JSON.stringify(config));
+  } catch (error) {
+    // Local storage is optional; the workflow still works for this session.
+  }
+}
+
+function clampAutomationCanvasZoom(value) {
+  const zoom = Number(value);
+  if (!Number.isFinite(zoom)) {
+    return 1;
+  }
+  return Math.min(AUTOMATION_CANVAS_ZOOM_MAX, Math.max(AUTOMATION_CANVAS_ZOOM_MIN, zoom));
+}
+
+function defaultTrelloState() {
+  return {
+    configured: false,
+    credentials_saved: false,
+    api_key_saved: false,
+    token_saved: false,
+    card_id: "",
+    list_id: "",
+    upload_mode: "file",
+    set_cover: true,
+    updated_at: "",
+  };
+}
+
+function normalizeTrelloState(value = {}) {
+  const payload = value && typeof value === "object" ? value : {};
+  const uploadMode = ["file", "url"].includes(payload.upload_mode) ? payload.upload_mode : "file";
+  return {
+    ...defaultTrelloState(),
+    configured: Boolean(payload.configured),
+    credentials_saved: Boolean(payload.credentials_saved),
+    api_key_saved: Boolean(payload.api_key_saved),
+    token_saved: Boolean(payload.token_saved),
+    card_id: String(payload.card_id || ""),
+    list_id: String(payload.list_id || ""),
+    upload_mode: uploadMode,
+    set_cover: payload.set_cover !== false,
+    updated_at: String(payload.updated_at || ""),
+  };
+}
+
+function defaultIntegrationState() {
+  return {
+    gemini: {
+      configured: false,
+      api_key_saved: false,
+      model: "gemini-2.5-flash",
+    },
+    telegram: {
+      configured: false,
+      bot_token_saved: false,
+      chat_id: "",
+    },
+    runtime: {
+      playwright_browsers_path: "",
+      playwright_browsers_path_set: false,
+    },
+    updated_at: "",
+  };
+}
+
+function normalizeIntegrationState(value = {}) {
+  const payload = value && typeof value === "object" ? value : {};
+  const fallback = defaultIntegrationState();
+  return {
+    gemini: {
+      ...fallback.gemini,
+      ...(payload.gemini || {}),
+      configured: Boolean(payload.gemini?.configured),
+      api_key_saved: Boolean(payload.gemini?.api_key_saved),
+      model: String(payload.gemini?.model || fallback.gemini.model),
+    },
+    telegram: {
+      ...fallback.telegram,
+      ...(payload.telegram || {}),
+      configured: Boolean(payload.telegram?.configured),
+      bot_token_saved: Boolean(payload.telegram?.bot_token_saved),
+      chat_id: String(payload.telegram?.chat_id || ""),
+    },
+    runtime: {
+      ...fallback.runtime,
+      ...(payload.runtime || {}),
+      playwright_browsers_path: String(payload.runtime?.playwright_browsers_path || ""),
+      playwright_browsers_path_set: Boolean(payload.runtime?.playwright_browsers_path_set),
+    },
+    updated_at: String(payload.updated_at || ""),
+  };
+}
+
 const state = {
   mode: "video",
   editAction: "extend",
@@ -257,6 +586,9 @@ const state = {
   position: "center",
   resolution: "1080p",
   promptAssistant: null,
+  promptSourcePreview: null,
+  integrations: defaultIntegrationState(),
+  trello: defaultTrelloState(),
   promptAiResults: {
     video: null,
     image: null,
@@ -279,7 +611,11 @@ const state = {
   },
   storyboardPlan: null,
   storyboardBusy: false,
+  automation: loadAutomationConfig(),
 };
+
+let automationCanvasPan = null;
+let automationDraggedStepId = "";
 
 const elements = {
   projectStatus: document.querySelector("#projectStatus"),
@@ -297,6 +633,92 @@ const elements = {
   openLoginButton: document.querySelector("#openLoginButton"),
   openProjectButton: document.querySelector("#openProjectButton"),
   focusProjectButton: document.querySelector("#focusProjectButton"),
+  automationEnabled: document.querySelector("#automationEnabled"),
+  automationEasyPanel: document.querySelector("#automationEasyPanel"),
+  easyPromptButton: document.querySelector("#easyPromptButton"),
+  easyFlowButton: document.querySelector("#easyFlowButton"),
+  easyReviewButton: document.querySelector("#easyReviewButton"),
+  easyRunButton: document.querySelector("#easyRunButton"),
+  easyPromptStatus: document.querySelector("#easyPromptStatus"),
+  easyFlowStatus: document.querySelector("#easyFlowStatus"),
+  easyReviewStatus: document.querySelector("#easyReviewStatus"),
+  scenarioCanvas: document.querySelector("#scenarioCanvas"),
+  scenarioNodeRow: document.querySelector(".scenario-node-row"),
+  automationZoomOut: document.querySelector("#automationZoomOut"),
+  automationZoomReset: document.querySelector("#automationZoomReset"),
+  automationZoomIn: document.querySelector("#automationZoomIn"),
+  automationFitButton: document.querySelector("#automationFitButton"),
+  breakRoute: document.querySelector(".break-route"),
+  automationViewButtons: Array.from(document.querySelectorAll("[data-automation-view]")),
+  scenarioHistoryPanel: document.querySelector("#scenarioHistoryPanel"),
+  scenarioIncompletePanel: document.querySelector("#scenarioIncompletePanel"),
+  automationHistoryPanelList: document.querySelector("#automationHistoryPanelList"),
+  automationIncompletePanelList: document.querySelector("#automationIncompletePanelList"),
+  automationHistoryRefreshButton: document.querySelector("#automationHistoryRefreshButton"),
+  automationIncompleteRefreshButton: document.querySelector("#automationIncompleteRefreshButton"),
+  automationUseStudioButton: document.querySelector("#automationUseStudioButton"),
+  automationOpenFlowButton: document.querySelector("#automationOpenFlowButton"),
+  automationRunButton: document.querySelector("#automationRunButton"),
+  automationRunImageButton: document.querySelector("#automationRunImageButton"),
+  automationRefreshButton: document.querySelector("#automationRefreshButton"),
+  automationBrandEyebrow: document.querySelector("#automationBrandEyebrow"),
+  automationBrandTitle: document.querySelector("#automationBrandTitle"),
+  automationPromptInput: document.querySelector("#automationPromptInput"),
+  automationSourceType: document.querySelector("#automationSourceType"),
+  automationStepNameInput: document.querySelector("#automationStepNameInput"),
+  automationStepDetailInput: document.querySelector("#automationStepDetailInput"),
+  automationStepIconInput: document.querySelector("#automationStepIconInput"),
+  automationModuleTypeInput: document.querySelector("#automationModuleTypeInput"),
+  automationModuleEnabledInput: document.querySelector("#automationModuleEnabledInput"),
+  automationModuleStatus: document.querySelector("#automationModuleStatus"),
+  automationModuleAddButton: document.querySelector("#automationModuleAddButton"),
+  automationModuleDuplicateButton: document.querySelector("#automationModuleDuplicateButton"),
+  automationModuleMoveLeftButton: document.querySelector("#automationModuleMoveLeftButton"),
+  automationModuleMoveRightButton: document.querySelector("#automationModuleMoveRightButton"),
+  automationModuleDeleteButton: document.querySelector("#automationModuleDeleteButton"),
+  automationModuleSettings: document.querySelector("#automationModuleSettings"),
+  automationPromptSourceSection: document.querySelector("#automationPromptSourceSection"),
+  automationTelegramInput: document.querySelector("#automationTelegramInput"),
+  automationSheetInput: document.querySelector("#automationSheetInput"),
+  automationSheetStatus: document.querySelector("#automationSheetStatus"),
+  automationSheetPasteInput: document.querySelector("#automationSheetPasteInput"),
+  automationSheetFileInput: document.querySelector("#automationSheetFileInput"),
+  automationSheetFileButton: document.querySelector("#automationSheetFileButton"),
+  automationSheetPreviewButton: document.querySelector("#automationSheetPreviewButton"),
+  automationSheetPreviewList: document.querySelector("#automationSheetPreviewList"),
+  automationTrelloCardInput: document.querySelector("#automationTrelloCardInput"),
+  automationTrelloListInput: document.querySelector("#automationTrelloListInput"),
+  automationTrelloKeyInput: document.querySelector("#automationTrelloKeyInput"),
+  automationTrelloTokenInput: document.querySelector("#automationTrelloTokenInput"),
+  automationTrelloUploadMode: document.querySelector("#automationTrelloUploadMode"),
+  automationTrelloStatus: document.querySelector("#automationTrelloStatus"),
+  automationTrelloSaveButton: document.querySelector("#automationTrelloSaveButton"),
+  automationTrelloClearButton: document.querySelector("#automationTrelloClearButton"),
+  automationTrelloSection: document.querySelector("#automationTrelloSection"),
+  automationEnvStatus: document.querySelector("#automationEnvStatus"),
+  automationGeminiKeyInput: document.querySelector("#automationGeminiKeyInput"),
+  automationGeminiModelInput: document.querySelector("#automationGeminiModelInput"),
+  automationTelegramTokenInput: document.querySelector("#automationTelegramTokenInput"),
+  automationPlaywrightPathInput: document.querySelector("#automationPlaywrightPathInput"),
+  automationEnvSaveButton: document.querySelector("#automationEnvSaveButton"),
+  automationEnvClearButton: document.querySelector("#automationEnvClearButton"),
+  automationAppIntegrationsSection: document.querySelector("#automationAppIntegrationsSection"),
+  automationAppEyebrowInput: document.querySelector("#automationAppEyebrowInput"),
+  automationAppTitleInput: document.querySelector("#automationAppTitleInput"),
+  automationAppSubtitleInput: document.querySelector("#automationAppSubtitleInput"),
+  automationSourceLocationInput: document.querySelector("#automationSourceLocationInput"),
+  automationAccentInput: document.querySelector("#automationAccentInput"),
+  automationExportButton: document.querySelector("#automationExportButton"),
+  automationImportButton: document.querySelector("#automationImportButton"),
+  automationResetButton: document.querySelector("#automationResetButton"),
+  automationImportFile: document.querySelector("#automationImportFile"),
+  automationImageTotalCount: document.querySelector("#automationImageTotalCount"),
+  automationActiveCount: document.querySelector("#automationActiveCount"),
+  automationFailureCount: document.querySelector("#automationFailureCount"),
+  automationCompletedCount: document.querySelector("#automationCompletedCount"),
+  automationTransferHint: document.querySelector("#automationTransferHint"),
+  automationRunningStatus: document.querySelector("#automationRunningStatus"),
+  automationHistory: document.querySelector("#automationHistory"),
   messageBar: document.querySelector("#messageBar"),
   composerTitle: document.querySelector("#composerTitle"),
   composerHint: document.querySelector("#composerHint"),
@@ -402,6 +824,49 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function normalizeHexColor(value, fallback = "#7c2ee6") {
+  const raw = String(value || "").trim();
+  const longMatch = raw.match(/^#?([0-9a-f]{6})$/i);
+  if (longMatch) {
+    return `#${longMatch[1].toLowerCase()}`;
+  }
+  const shortMatch = raw.match(/^#?([0-9a-f]{3})$/i);
+  if (shortMatch) {
+    return `#${shortMatch[1]
+      .split("")
+      .map((part) => `${part}${part}`)
+      .join("")
+      .toLowerCase()}`;
+  }
+  return fallback;
+}
+
+function hexToRgb(value) {
+  const hex = normalizeHexColor(value).replace("#", "");
+  const number = Number.parseInt(hex, 16);
+  return {
+    r: (number >> 16) & 255,
+    g: (number >> 8) & 255,
+    b: number & 255,
+  };
+}
+
+function rgbToHex({ r, g, b }) {
+  return `#${[r, g, b]
+    .map((channel) => Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
+function mixHexColor(left, right, ratio = 0.22) {
+  const a = hexToRgb(left);
+  const b = hexToRgb(right);
+  return rgbToHex({
+    r: a.r * (1 - ratio) + b.r * ratio,
+    g: a.g * (1 - ratio) + b.g * ratio,
+    b: a.b * (1 - ratio) + b.b * ratio,
+  });
 }
 
 function normalizeProjectInput(value) {
@@ -896,7 +1361,30 @@ function isReady() {
   return Boolean(state.config?.project_id) && Boolean(state.auth?.authenticated);
 }
 
+function applyAutomationBranding() {
+  const automation = normalizeAutomationConfig(state.automation);
+  state.automation = automation;
+  const eyebrow = automation.appEyebrow || "Flow v2";
+  const title = automation.appTitle || "Flow v2";
+  const accent = normalizeHexColor(automation.accentColor);
+  const accentStrong = mixHexColor(accent, "#000000", 0.22);
+  const accentSoft = mixHexColor(accent, "#ffffff", 0.9);
+  const accentRing = mixHexColor(accent, "#ffffff", 0.74);
+  document.documentElement.style.setProperty("--accent", accent);
+  document.documentElement.style.setProperty("--accent-strong", accentStrong);
+  document.documentElement.style.setProperty("--accent-soft", accentSoft);
+  document.documentElement.style.setProperty("--accent-ring", accentRing);
+  if (elements.automationBrandEyebrow) {
+    elements.automationBrandEyebrow.textContent = eyebrow;
+  }
+  if (elements.automationBrandTitle) {
+    elements.automationBrandTitle.textContent = title;
+  }
+  document.title = title ? `${title} | Flow v2` : "Flow v2";
+}
+
 function renderTopbar() {
+  applyAutomationBranding();
   const projectId = state.config?.project_id || "";
   const projectName = String(state.config?.project_name || "").trim();
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
@@ -910,6 +1398,12 @@ function renderTopbar() {
   elements.logoutButton.title = activeJobs > 0 ? "Hãy chờ các tác vụ đang chạy hoàn tất rồi đăng xuất." : "";
   elements.setupToggle.textContent = state.setupOpen ? "Ẩn thiết lập" : "Thiết lập";
   elements.setupPanel.hidden = !state.setupOpen;
+  if (elements.automationEnabled) {
+    elements.automationEnabled.checked = Boolean(state.automation?.enabled);
+    elements.automationEnabled.closest(".scenario-toggle")?.querySelector("span")?.replaceChildren(
+      document.createTextNode(state.automation?.enabled ? "Active" : "Inactive")
+    );
+  }
 
   if (!projectId) {
     elements.topbarHint.textContent = "Lưu project một lần rồi chỉ việc nhập prompt.";
@@ -918,7 +1412,8 @@ function renderTopbar() {
   } else if (activeJobs) {
     elements.topbarHint.textContent = `Đang có ${activeJobs} lượt chạy. Tab Google Flow vẫn được giữ mở để bạn theo dõi trực tiếp.`;
   } else {
-    elements.topbarHint.textContent = "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
+    elements.topbarHint.textContent =
+      state.automation.appSubtitle || "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
   }
 
   if (document.activeElement !== elements.projectId) {
@@ -930,6 +1425,766 @@ function renderTopbar() {
   if (document.activeElement !== elements.generationTimeout) {
     elements.generationTimeout.value = String(state.config?.generation_timeout_s || 300);
   }
+}
+
+function automationStepConfig(stepKey) {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  let module = state.automation.modules.find((item) => item.id === stepKey);
+  if (!module) {
+    module = state.automation.modules.find((item) => item.type === "flow") || state.automation.modules[0] || createAutomationModule("custom", { id: "module_1" });
+    state.automation.selectedStep = module.id;
+  }
+  state.automation.steps = automationStepsFromModules(state.automation.modules);
+  return module;
+}
+
+function selectedAutomationModule() {
+  return automationStepConfig(state.automation.selectedStep);
+}
+
+function selectedAutomationModuleIndex() {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  return Math.max(0, state.automation.modules.findIndex((module) => module.id === state.automation.selectedStep));
+}
+
+function persistAutomationModules() {
+  state.automation.steps = automationStepsFromModules(state.automation.modules);
+  saveAutomationConfig(state.automation);
+}
+
+function renderAutomationCanvasControls() {
+  const zoom = clampAutomationCanvasZoom(state.automation.canvasZoom);
+  state.automation.canvasZoom = zoom;
+  if (elements.scenarioNodeRow) {
+    elements.scenarioNodeRow.style.zoom = String(zoom);
+  }
+  if (elements.automationZoomReset) {
+    elements.automationZoomReset.textContent = `${Math.round(zoom * 100)}%`;
+  }
+  if (elements.automationZoomOut) {
+    elements.automationZoomOut.disabled = zoom <= AUTOMATION_CANVAS_ZOOM_MIN + 0.01;
+  }
+  if (elements.automationZoomIn) {
+    elements.automationZoomIn.disabled = zoom >= AUTOMATION_CANVAS_ZOOM_MAX - 0.01;
+  }
+}
+
+function setAutomationCanvasZoom(value, { keepCenter = true } = {}) {
+  const canvas = elements.scenarioCanvas;
+  const previousZoom = clampAutomationCanvasZoom(state.automation.canvasZoom);
+  const nextZoom = clampAutomationCanvasZoom(value);
+  if (Math.abs(previousZoom - nextZoom) < 0.005) {
+    renderAutomationCanvasControls();
+    return;
+  }
+  const centerX = canvas ? canvas.scrollLeft + canvas.clientWidth / 2 : 0;
+  const centerY = canvas ? canvas.scrollTop + canvas.clientHeight / 2 : 0;
+  state.automation.canvasZoom = nextZoom;
+  saveAutomationConfig(state.automation);
+  renderAutomationCanvasControls();
+  if (canvas && keepCenter) {
+    const ratio = nextZoom / previousZoom;
+    canvas.scrollTo({
+      left: Math.max(0, centerX * ratio - canvas.clientWidth / 2),
+      top: Math.max(0, centerY * ratio - canvas.clientHeight / 2),
+      behavior: "smooth",
+    });
+  }
+}
+
+function fitAutomationCanvas() {
+  if (!elements.scenarioCanvas || !elements.scenarioNodeRow) {
+    return;
+  }
+  const currentZoom = clampAutomationCanvasZoom(state.automation.canvasZoom);
+  const baseWidth = Math.max(1, (elements.scenarioNodeRow.scrollWidth || 820) / currentZoom);
+  const availableWidth = Math.max(320, elements.scenarioCanvas.clientWidth - 96);
+  const nextZoom = clampAutomationCanvasZoom(Math.min(1, availableWidth / baseWidth));
+  setAutomationCanvasZoom(nextZoom, { keepCenter: false });
+  window.setTimeout(() => {
+    elements.scenarioCanvas.scrollTo({
+      left: Math.max(0, (elements.scenarioNodeRow.scrollWidth - elements.scenarioCanvas.clientWidth) / 2),
+      top: 0,
+      behavior: "smooth",
+    });
+  }, 0);
+}
+
+function scrollAutomationNodeIntoView(stepId = state.automation.selectedStep) {
+  const safeStepId = window.CSS?.escape
+    ? CSS.escape(String(stepId))
+    : String(stepId).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const selector = `[data-scenario-step="${safeStepId}"]`;
+  const node = elements.scenarioNodeRow?.querySelector(selector);
+  node?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+}
+
+function automationModuleEnabled(type) {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  return state.automation.modules.some((module) => module.type === type && module.enabled !== false);
+}
+
+function selectAutomationModuleByType(type, { create = false } = {}) {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  let module = state.automation.modules.find((item) => item.type === type);
+  if (!module && create) {
+    module = createAutomationModule(type);
+    state.automation.modules.push(module);
+  }
+  if (!module) {
+    return null;
+  }
+  state.automation.selectedStep = module.id;
+  persistAutomationModules();
+  renderAutomationDashboard();
+  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
+  return module;
+}
+
+function addAutomationModule({ duplicate = false } = {}) {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  const index = selectedAutomationModuleIndex();
+  const selected = state.automation.modules[index] || createAutomationModule("custom");
+  const seed = duplicate
+    ? {
+        ...selected,
+        id: "",
+        title: `${selected.title || moduleTypeConfig(selected.type).title} copy`,
+        settings: { ...(selected.settings || {}) },
+      }
+    : {};
+  const module = createAutomationModule(duplicate ? selected.type : "custom", seed);
+  state.automation.modules.splice(index + 1, 0, module);
+  state.automation.selectedStep = module.id;
+  persistAutomationModules();
+  renderAutomationDashboard();
+  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
+  showMessage(duplicate ? "Đã nhân bản cục đang chọn." : "Đã thêm một cục mới sau module đang chọn.", "success");
+}
+
+function deleteSelectedAutomationModule() {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  if (state.automation.modules.length <= 1) {
+    showMessage("Cần giữ lại ít nhất một cục trong luồng.", "error");
+    return;
+  }
+  const index = selectedAutomationModuleIndex();
+  state.automation.modules.splice(index, 1);
+  const next = state.automation.modules[Math.max(0, index - 1)] || state.automation.modules[0];
+  state.automation.selectedStep = next.id;
+  persistAutomationModules();
+  renderAutomationDashboard();
+  showMessage("Đã xóa cục khỏi luồng.", "success");
+}
+
+function moveSelectedAutomationModule(direction) {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  const index = selectedAutomationModuleIndex();
+  const nextIndex = index + direction;
+  if (nextIndex < 0 || nextIndex >= state.automation.modules.length) {
+    return;
+  }
+  const [module] = state.automation.modules.splice(index, 1);
+  state.automation.modules.splice(nextIndex, 0, module);
+  persistAutomationModules();
+  renderAutomationDashboard();
+  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
+}
+
+function syncAutomationFromForm() {
+  if (!elements.automationPromptInput) {
+    return;
+  }
+  state.automation.enabled = Boolean(elements.automationEnabled?.checked);
+  state.automation.prompt = elements.automationPromptInput.value;
+  state.automation.sourceType = elements.automationSourceType.value || "manual";
+  state.automation.sourceLocation = elements.automationSourceLocationInput.value.trim();
+  state.automation.telegramChat = elements.automationTelegramInput.value.trim();
+  state.automation.sheetLog = elements.automationSheetInput?.value?.trim() || state.automation.sheetLog || "";
+  state.automation.trelloCardId = elements.automationTrelloCardInput.value.trim();
+  state.automation.trelloListId = elements.automationTrelloListInput.value.trim();
+  state.automation.appEyebrow = elements.automationAppEyebrowInput.value.trim() || "Flow v2";
+  state.automation.appTitle = elements.automationAppTitleInput.value.trim() || "Flow v2";
+  state.automation.appSubtitle =
+    elements.automationAppSubtitleInput.value.trim() ||
+    "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
+  state.automation.accentColor = normalizeHexColor(elements.automationAccentInput.value, "#7c2ee6");
+
+  const selected = state.automation.selectedStep || "flow";
+  const current = automationStepConfig(selected);
+  const selectedType = elements.automationModuleTypeInput?.value || current.type || "custom";
+  const typeChanged = selectedType !== current.type;
+  current.type = selectedType;
+  const typeDefaults = moduleTypeConfig(selectedType);
+  current.title = typeChanged ? typeDefaults.title : elements.automationStepNameInput.value.trim() || current.title || typeDefaults.title;
+  current.detail = typeChanged ? typeDefaults.detail : elements.automationStepDetailInput.value.trim() || current.detail || typeDefaults.detail;
+  current.icon = typeChanged ? typeDefaults.icon : (elements.automationStepIconInput?.value || "").trim() || current.icon || typeDefaults.icon;
+  current.enabled = elements.automationModuleEnabledInput ? Boolean(elements.automationModuleEnabledInput.checked) : current.enabled !== false;
+  state.automation.steps = automationStepsFromModules(state.automation.modules);
+  saveAutomationConfig(state.automation);
+}
+
+function automationJobs() {
+  return (state.jobs || []).filter((job) => job.type === "image");
+}
+
+function automationStepTone(module, stats) {
+  const executionNode = latestAutomationExecutionNode(module);
+  if (executionNode) {
+    const status = String(executionNode.status || "").toLowerCase();
+    if (status === "running") {
+      return "active";
+    }
+    if (status === "completed") {
+      return "done";
+    }
+    if (status === "skipped") {
+      return "watch";
+    }
+    if (status === "failed") {
+      return "blocked";
+    }
+  }
+  if (module.enabled === false) {
+    return "disabled";
+  }
+  const stepKey = module.type || module.id;
+  if (stepKey === "source") {
+    return state.automation.prompt.trim() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
+  }
+  if (stepKey === "normalize") {
+    return state.automation.prompt.trim() ? "done" : "pending";
+  }
+  if (stepKey === "flow") {
+    if (!state.config?.project_id || !state.auth?.authenticated) {
+      return "blocked";
+    }
+    if (stats.active.length) {
+      return "active";
+    }
+    return stats.completed.length ? "done" : "ready";
+  }
+  if (stepKey === "telegram" || stepKey === "approval") {
+    if (stats.active.length) {
+      return "pending";
+    }
+    return stats.completed.length ? "watch" : "pending";
+  }
+  if (stepKey === "trello") {
+    return stats.completed.length ? "ready" : "pending";
+  }
+  return "pending";
+}
+
+function latestAutomationExecutionNode(module) {
+  const jobs = automationJobs()
+    .slice()
+    .sort((left, right) => new Date(right.updated_at || right.created_at || 0).getTime() - new Date(left.updated_at || left.created_at || 0).getTime());
+  for (const job of jobs) {
+    const execution = job.result?.automation_execution;
+    const nodes = Array.isArray(execution?.nodes) ? execution.nodes : [];
+    const matched = nodes.find((node) => node.id === module.id) || nodes.find((node) => node.type === module.type);
+    if (matched) {
+      return matched;
+    }
+  }
+  return null;
+}
+
+function automationNodeStatusLabel(status) {
+  const labels = {
+    active: "Đang chạy",
+    blocked: "Cần thiết lập",
+    disabled: "Đang tắt",
+    done: "Xong",
+    pending: "Chưa chạy",
+    ready: "Sẵn sàng",
+    watch: "Chờ duyệt",
+  };
+  return labels[status] || "Chưa chạy";
+}
+
+function renderAutomationNodes(stats) {
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  if (elements.breakRoute) {
+    elements.breakRoute.hidden = true;
+  }
+  if (!elements.scenarioNodeRow) {
+    return;
+  }
+  elements.scenarioNodeRow.innerHTML = state.automation.modules
+    .map((module, index) => {
+      const typeConfig = moduleTypeConfig(module.type);
+      const iconClass = typeConfig.iconClass || "node-icon-custom";
+      const status = automationStepTone(module, stats);
+      const active = state.automation.selectedStep === module.id ? " active" : "";
+      const disabled = module.enabled === false ? " module-disabled" : "";
+      const link = index > 0 ? `<span class="scenario-link" aria-hidden="true"></span>` : "";
+      return `
+        ${link}
+        <button type="button" class="scenario-node${active}${disabled}" data-scenario-step="${escapeHtml(module.id)}" data-status="${escapeHtml(status)}" aria-pressed="${state.automation.selectedStep === module.id ? "true" : "false"}" draggable="true" title="Bấm để chỉnh, kéo để đổi vị trí">
+          <span class="node-order">${index + 1}</span>
+          <span class="node-icon ${escapeHtml(iconClass)}">${escapeHtml(module.icon || typeConfig.icon)}</span>
+          <strong>${escapeHtml(module.title || typeConfig.title)}</strong>
+          <small>${escapeHtml(module.detail || typeConfig.detail)}</small>
+          <span class="node-state">${escapeHtml(automationNodeStatusLabel(status))}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+function renderAutomationInspector(stats) {
+  const selected = state.automation.selectedStep || "flow";
+  const selectedConfig = automationStepConfig(selected);
+  const selectedType = selectedConfig.type || "custom";
+  const typeDefaults = moduleTypeConfig(selectedType);
+  if (document.activeElement !== elements.automationStepNameInput) {
+    elements.automationStepNameInput.value = selectedConfig.title || "";
+  }
+  if (document.activeElement !== elements.automationStepDetailInput) {
+    elements.automationStepDetailInput.value = selectedConfig.detail || "";
+  }
+  if (elements.automationModuleTypeInput && document.activeElement !== elements.automationModuleTypeInput) {
+    elements.automationModuleTypeInput.value = selectedType;
+  }
+  if (elements.automationStepIconInput && document.activeElement !== elements.automationStepIconInput) {
+    elements.automationStepIconInput.value = selectedConfig.icon || typeDefaults.icon || "";
+  }
+  if (elements.automationModuleEnabledInput && document.activeElement !== elements.automationModuleEnabledInput) {
+    elements.automationModuleEnabledInput.checked = selectedConfig.enabled !== false;
+  }
+  if (elements.automationModuleStatus) {
+    elements.automationModuleStatus.textContent = `${typeDefaults.label}${selectedConfig.enabled === false ? " tắt" : ""}`;
+    elements.automationModuleStatus.dataset.state = selectedConfig.enabled === false ? "pending" : "ready";
+  }
+  if (elements.automationPromptSourceSection) {
+    elements.automationPromptSourceSection.hidden = selectedType !== "source";
+  }
+  if (elements.automationTrelloSection) {
+    elements.automationTrelloSection.hidden = selectedType !== "trello";
+  }
+  if (elements.automationAppIntegrationsSection) {
+    elements.automationAppIntegrationsSection.hidden = !["telegram", "flow"].includes(selectedType);
+  }
+  renderModuleSettings(selectedConfig);
+  if (document.activeElement !== elements.automationTelegramInput) {
+    elements.automationTelegramInput.value = state.automation.telegramChat || state.integrations?.telegram?.chat_id || "";
+  }
+  if (document.activeElement !== elements.automationSheetInput) {
+    if (elements.automationSheetInput) {
+      elements.automationSheetInput.value = state.automation.sheetLog || "";
+    }
+  }
+  if (document.activeElement !== elements.automationTrelloCardInput) {
+    elements.automationTrelloCardInput.value = state.automation.trelloCardId || state.trello?.card_id || "";
+  }
+  if (document.activeElement !== elements.automationTrelloListInput) {
+    elements.automationTrelloListInput.value = state.automation.trelloListId || state.trello?.list_id || "";
+  }
+  if (document.activeElement !== elements.automationTrelloUploadMode) {
+    elements.automationTrelloUploadMode.value = state.trello?.upload_mode || "file";
+  }
+  if (elements.automationGeminiModelInput && document.activeElement !== elements.automationGeminiModelInput) {
+    elements.automationGeminiModelInput.value = state.integrations?.gemini?.model || "gemini-2.5-flash";
+  }
+  if (elements.automationPlaywrightPathInput && document.activeElement !== elements.automationPlaywrightPathInput) {
+    elements.automationPlaywrightPathInput.value = state.integrations?.runtime?.playwright_browsers_path || "";
+  }
+  if (document.activeElement !== elements.automationPromptInput) {
+    elements.automationPromptInput.value = state.automation.prompt || "";
+  }
+  if (document.activeElement !== elements.automationSourceType) {
+    elements.automationSourceType.value = state.automation.sourceType || "manual";
+  }
+  if (document.activeElement !== elements.automationSourceLocationInput) {
+    elements.automationSourceLocationInput.value = state.automation.sourceLocation || "";
+  }
+  if (document.activeElement !== elements.automationAppEyebrowInput) {
+    elements.automationAppEyebrowInput.value = state.automation.appEyebrow || "Flow v2";
+  }
+  if (document.activeElement !== elements.automationAppTitleInput) {
+    elements.automationAppTitleInput.value = state.automation.appTitle || "Flow v2";
+  }
+  if (document.activeElement !== elements.automationAppSubtitleInput) {
+    elements.automationAppSubtitleInput.value =
+      state.automation.appSubtitle || "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
+  }
+  if (document.activeElement !== elements.automationAccentInput) {
+    elements.automationAccentInput.value = normalizeHexColor(state.automation.accentColor, "#7c2ee6");
+  }
+
+  elements.automationImageTotalCount.textContent = String(stats.completed.length);
+  elements.automationActiveCount.textContent = String(stats.active.length);
+  elements.automationFailureCount.textContent = String(stats.failed.length);
+  elements.automationCompletedCount.textContent = String(stats.completed.length);
+  elements.automationTransferHint.textContent = modelLabelForMode("image", state.drafts.image.model || defaultModelForMode("image")) || "Flow";
+  elements.automationRunningStatus.textContent = stats.active.length ? `${stats.active.length} execution running` : "No execution";
+  elements.automationRunningStatus.dataset.state = stats.active.length ? "ready" : "pending";
+
+  if (elements.automationTrelloStatus) {
+    if (state.trello?.configured) {
+      elements.automationTrelloStatus.textContent = "Đã sẵn sàng";
+      elements.automationTrelloStatus.dataset.state = "ready";
+    } else if (state.trello?.credentials_saved) {
+      elements.automationTrelloStatus.textContent = "Thiếu card/list";
+      elements.automationTrelloStatus.dataset.state = "pending";
+    } else if (state.trello?.card_id || state.trello?.list_id) {
+      elements.automationTrelloStatus.textContent = "Thiếu key/token";
+      elements.automationTrelloStatus.dataset.state = "pending";
+    } else {
+      elements.automationTrelloStatus.textContent = "Chưa lưu";
+      elements.automationTrelloStatus.dataset.state = "pending";
+    }
+  }
+
+  if (elements.automationEnvStatus) {
+    const configuredCount = [
+      state.integrations?.gemini?.configured,
+      state.integrations?.telegram?.configured,
+      state.integrations?.runtime?.playwright_browsers_path_set,
+    ].filter(Boolean).length;
+    if (configuredCount >= 2) {
+      elements.automationEnvStatus.textContent = `${configuredCount}/3 đã lưu`;
+      elements.automationEnvStatus.dataset.state = "ready";
+    } else if (configuredCount === 1) {
+      elements.automationEnvStatus.textContent = "1/3 đã lưu";
+      elements.automationEnvStatus.dataset.state = "pending";
+    } else {
+      elements.automationEnvStatus.textContent = "Chưa lưu";
+      elements.automationEnvStatus.dataset.state = "pending";
+    }
+  }
+  renderPromptSourcePreview();
+}
+
+function renderModuleSettings(module) {
+  if (!elements.automationModuleSettings) {
+    return;
+  }
+  const type = module.type || "custom";
+  if (type === "source") {
+    elements.automationModuleSettings.innerHTML = `
+      <label class="field">
+        <span>Nguồn của cục này</span>
+        <select data-module-setting="sourceType">
+          <option value="manual"${state.automation.sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
+          <option value="trello"${state.automation.sourceType === "trello" ? " selected" : ""}>Trello list</option>
+          <option value="sheets"${state.automation.sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
+          <option value="folder"${state.automation.sourceType === "folder" ? " selected" : ""}>Folder / CSV nội bộ</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Sheet / CSV link</span>
+        <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(state.automation.sourceLocation || "")}" placeholder="Dán link Google Sheet hoặc CSV" />
+      </label>
+      <div class="customize-actions source-actions">
+        <button type="button" class="ghost-button card-button" data-module-action="preview-source">Lấy prompt</button>
+        <button type="button" class="ghost-button card-button" data-module-action="upload-source">Upload file</button>
+      </div>
+    `;
+    return;
+  }
+  if (type === "flow") {
+    elements.automationModuleSettings.innerHTML = `
+      <label class="field">
+        <span>Model ảnh Flow</span>
+        <select data-module-setting="imageModel">
+          ${state.modelOptions.image.map((item) => `<option value="${escapeHtml(item.value)}"${state.drafts.image.model === item.value ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
+        </select>
+      </label>
+      <div class="detail-grid sidebar-detail-grid">
+        <label class="field">
+          <span>Tỷ lệ ảnh</span>
+          <select data-module-setting="imageAspect">
+            <option value="square"${state.drafts.image.aspect === "square" ? " selected" : ""}>Vuông 1:1</option>
+            <option value="landscape"${state.drafts.image.aspect === "landscape" ? " selected" : ""}>Ngang 16:9</option>
+            <option value="portrait"${state.drafts.image.aspect === "portrait" ? " selected" : ""}>Dọc 9:16</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Số ảnh</span>
+          <input type="number" min="1" max="4" step="1" data-module-setting="imageCount" value="${escapeHtml(state.drafts.image.count || 1)}" />
+        </label>
+      </div>
+    `;
+    return;
+  }
+  if (type === "telegram") {
+    elements.automationModuleSettings.innerHTML = `
+      <label class="field">
+        <span>Chat duyệt của cục này</span>
+        <input type="text" data-module-setting="telegramChat" value="${escapeHtml(state.automation.telegramChat || state.integrations?.telegram?.chat_id || "")}" placeholder="@review_channel hoặc chat id" />
+      </label>
+      <label class="field">
+        <span>Bot token tuỳ chọn</span>
+        <input type="password" data-module-secret="telegramToken" placeholder="${state.integrations?.telegram?.bot_token_saved ? "Đã lưu token, nhập mới nếu muốn đổi" : "Dán token bot Telegram"}" />
+      </label>
+      <div class="customize-actions source-actions">
+        <button type="button" class="ghost-button card-button" data-module-action="save-integrations">Lưu Telegram</button>
+        <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ duyệt</button>
+      </div>
+    `;
+    return;
+  }
+  if (type === "trello") {
+    elements.automationModuleSettings.innerHTML = `
+      <label class="field">
+        <span>Card lưu ảnh</span>
+        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello" />
+      </label>
+      <label class="field">
+        <span>List tạo card mới</span>
+        <input type="text" data-module-setting="trelloList" value="${escapeHtml(state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu muốn mỗi job tạo card mới" />
+      </label>
+      <label class="field">
+        <span>Cách lưu ảnh</span>
+        <select data-module-setting="trelloUploadMode">
+          <option value="file"${(state.trello?.upload_mode || "file") === "file" ? " selected" : ""}>Upload file thật</option>
+          <option value="url"${state.trello?.upload_mode === "url" ? " selected" : ""}>Chỉ attach link</option>
+        </select>
+      </label>
+      <div class="customize-actions source-actions">
+        <button type="button" class="ghost-button card-button" data-module-action="save-trello">Lưu Trello</button>
+        <button type="button" class="ghost-button card-button" data-module-action="clear-trello">Xóa key/token</button>
+      </div>
+    `;
+    return;
+  }
+  if (type === "approval") {
+    elements.automationModuleSettings.innerHTML = `
+      <label class="field">
+        <span>Trạng thái duyệt</span>
+        <select data-module-setting="approvalMode">
+          <option value="manual"${(module.settings?.approvalMode || "manual") === "manual" ? " selected" : ""}>Duyệt tay</option>
+          <option value="telegram"${module.settings?.approvalMode === "telegram" ? " selected" : ""}>Duyệt bằng nút Telegram</option>
+          <option value="auto"${module.settings?.approvalMode === "auto" ? " selected" : ""}>Tự ghi log sau khi tạo</option>
+        </select>
+      </label>
+      <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ duyệt Telegram</button>
+    `;
+    return;
+  }
+  elements.automationModuleSettings.innerHTML = `
+    <label class="field">
+      <span>Ghi chú riêng của cục custom</span>
+      <textarea rows="3" data-module-setting="customNote" placeholder="Ghi lại cục này dùng để làm gì">${escapeHtml(module.settings?.customNote || "")}</textarea>
+    </label>
+    <label class="field">
+      <span>Webhook/API URL</span>
+      <input type="url" data-module-setting="customWebhookUrl" value="${escapeHtml(module.settings?.customWebhookUrl || "")}" placeholder="https://example.com/webhook" />
+    </label>
+    <div class="detail-grid sidebar-detail-grid">
+      <label class="field">
+        <span>Method</span>
+        <select data-module-setting="customWebhookMethod">
+          ${["POST", "PUT", "PATCH", "GET", "DELETE"].map((method) => `<option value="${method}"${(module.settings?.customWebhookMethod || "POST") === method ? " selected" : ""}>${method}</option>`).join("")}
+        </select>
+      </label>
+      <label class="field">
+        <span>Timeout giây</span>
+        <input type="number" min="3" max="120" step="1" data-module-setting="customWebhookTimeout" value="${escapeHtml(module.settings?.customWebhookTimeout || 20)}" />
+      </label>
+    </div>
+    <label class="field">
+      <span>Headers JSON hoặc từng dòng Key: Value</span>
+      <textarea rows="3" data-module-setting="customWebhookHeaders" placeholder='{"Authorization":"Bearer ..."}'>${escapeHtml(module.settings?.customWebhookHeaders || "")}</textarea>
+    </label>
+    <label class="field">
+      <span>Body template</span>
+      <textarea rows="6" data-module-setting="customWebhookBody" placeholder='Để trống để app tự gửi job/prompt/artifacts. Có thể dùng {{job_id}}, {{prompt}}, {{first_artifact_url}}, {{artifacts}}.'>${escapeHtml(module.settings?.customWebhookBody || "")}</textarea>
+    </label>
+    <small>Cục custom sẽ chạy thật nếu có URL. Dữ liệu ảnh/prompt/job tự được gắn vào payload.</small>
+  `;
+}
+
+function renderPromptSourcePreview() {
+  const preview = state.promptSourcePreview;
+  if (elements.automationSheetStatus) {
+    if (preview?.prompt_count) {
+      elements.automationSheetStatus.textContent = `${preview.active_count || preview.prompt_count} prompt`;
+      elements.automationSheetStatus.dataset.state = "ready";
+    } else if (state.automation.prompt?.trim()) {
+      elements.automationSheetStatus.textContent = "Đã có prompt";
+      elements.automationSheetStatus.dataset.state = "ready";
+    } else {
+      elements.automationSheetStatus.textContent = "Chưa lấy";
+      elements.automationSheetStatus.dataset.state = "pending";
+    }
+  }
+  if (!elements.automationSheetPreviewList) {
+    return;
+  }
+  const items = preview?.preview || [];
+  if (!items.length) {
+    elements.automationSheetPreviewList.innerHTML = `<p class="empty-automation-history">Dán link, upload file hoặc paste bảng rồi bấm lấy prompt.</p>`;
+    return;
+  }
+  const totalActive = Number(preview?.active_count || items.length || 0);
+  const extraCount = Math.max(0, totalActive - items.length);
+  elements.automationSheetPreviewList.innerHTML = items
+    .map((item) => {
+      const label = [item.product, item.index ? `#${item.index}` : "", item.notes].filter(Boolean).join(" · ");
+      return `
+        <article class="automation-history-item">
+          <strong>${escapeHtml(label || `Row ${item.row}`)}</strong>
+          <small>${escapeHtml(item.prompt)}</small>
+        </article>
+      `;
+    })
+    .join("") + (extraCount ? `<p class="empty-automation-history">Còn ${extraCount} prompt active nữa sẽ được chạy trong vòng lặp.</p>` : "");
+}
+
+function renderAutomationHistory(stats) {
+  const items = automationJobs()
+    .slice()
+    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
+    .slice(0, 5);
+
+  if (!items.length) {
+    elements.automationHistory.className = "automation-history empty-automation-history";
+    elements.automationHistory.textContent = "Chưa có lượt chạy ảnh nào.";
+    return;
+  }
+
+  elements.automationHistory.className = "automation-history";
+  elements.automationHistory.innerHTML = items
+    .map((job) => {
+      const prompt = truncate(job.input?.prompt || "", 96) || "Không có prompt";
+      return `
+        <article class="automation-history-item">
+          <div>
+            <strong>${escapeHtml(job.title || "Flow image")}</strong>
+            <small>${escapeHtml(formatTime(job.created_at))} · ${escapeHtml(statusLabel(job.status))}</small>
+          </div>
+          <p>${escapeHtml(prompt)}</p>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function automationPanelItem(job) {
+  const prompt = truncate(job.input?.prompt || "", 132) || "Không có prompt";
+  const status = statusLabel(job.status);
+  const model = modelLabelForMode("image", job.input?.model || defaultModelForMode("image")) || "Flow";
+  return `
+    <article class="scenario-table-row">
+      <div>
+        <strong>${escapeHtml(job.title || "Flow image")}</strong>
+        <small>${escapeHtml(formatTime(job.created_at))} · ${escapeHtml(status)} · ${escapeHtml(model)}</small>
+      </div>
+      <p>${escapeHtml(prompt)}</p>
+    </article>
+  `;
+}
+
+function renderAutomationViewPanels(stats) {
+  const selectedView = state.automation.view || "diagram";
+  for (const button of elements.automationViewButtons) {
+    button.classList.toggle("active", button.dataset.automationView === selectedView);
+  }
+
+  elements.scenarioCanvas.hidden = selectedView !== "diagram";
+  if (elements.automationEasyPanel) {
+    elements.automationEasyPanel.hidden = selectedView !== "diagram";
+  }
+  elements.scenarioHistoryPanel.hidden = selectedView !== "history";
+  elements.scenarioIncompletePanel.hidden = selectedView !== "incomplete";
+
+  const command = document.querySelector(".automation-command");
+  const usage = document.querySelector(".scenario-usage");
+  if (command) {
+    command.hidden = selectedView !== "diagram";
+  }
+  if (usage) {
+    usage.hidden = selectedView !== "diagram";
+  }
+
+  const allJobs = automationJobs()
+    .slice()
+    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime());
+  const incomplete = allJobs.filter((job) => job.status === "failed" || job.status === "interrupted");
+
+  elements.automationHistoryPanelList.innerHTML = allJobs.length
+    ? allJobs.slice(0, 16).map(automationPanelItem).join("")
+    : `<div class="scenario-panel-empty">Chưa có lượt chạy ảnh nào.</div>`;
+  elements.automationIncompletePanelList.innerHTML = incomplete.length
+    ? incomplete.slice(0, 16).map(automationPanelItem).join("")
+    : `<div class="scenario-panel-empty">Không có execution nào cần xử lý.</div>`;
+}
+
+function activePromptSourceItems() {
+  if (state.automation.sourceType !== "sheets") {
+    return [];
+  }
+  const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
+  return items
+    .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
+    .slice(0, 40)
+    .map((item) => ({
+      row: Number(item.row || 0),
+      active: true,
+      prompt: String(item.prompt || "").trim(),
+      product: String(item.product || "").trim(),
+      index: String(item.index || "").trim(),
+      notes: String(item.notes || "").trim(),
+    }));
+}
+
+function renderEasyPanel(stats) {
+  const batchItems = activePromptSourceItems();
+  const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0;
+  const projectReady = Boolean(state.config?.project_id);
+  const flowModuleReady = automationModuleEnabled("flow");
+  const flowReady = flowModuleReady && projectReady && Boolean(state.auth?.authenticated);
+  const telegramReady = automationModuleEnabled("telegram") && Boolean(state.integrations?.telegram?.configured || state.automation.telegramChat);
+  const trelloReady = automationModuleEnabled("trello") && Boolean(state.trello?.configured || state.automation.trelloCardId || state.automation.trelloListId);
+
+  if (elements.easyPromptStatus) {
+    elements.easyPromptStatus.textContent = batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Dán sheet hoặc nhập tay";
+  }
+  if (elements.easyFlowStatus) {
+    elements.easyFlowStatus.textContent = flowReady ? "Đã sẵn sàng" : !flowModuleReady ? "Thiếu cục Flow" : projectReady ? "Cần đăng nhập" : "Cần project";
+  }
+  if (elements.easyReviewStatus) {
+    elements.easyReviewStatus.textContent = telegramReady || trelloReady ? "Đã có nơi nhận" : "Có thể bỏ qua";
+  }
+  const runHint = elements.easyRunButton?.querySelector("small");
+  if (runHint) {
+    runHint.textContent = stats.active.length ? "Đang tạo ảnh" : batchItems.length > 1 && flowReady ? "Chạy vòng lặp sheet" : promptReady && flowReady ? "Sẵn sàng chạy" : "Bấm để chạy";
+  }
+  if (elements.automationRunImageButton) {
+    elements.automationRunImageButton.textContent = batchItems.length > 1 ? `Tạo ${batchItems.length} prompt` : "Tạo ảnh bằng Flow";
+  }
+  if (elements.automationRunButton) {
+    elements.automationRunButton.textContent = batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
+  }
+  elements.easyPromptButton?.classList.toggle("ready", promptReady);
+  elements.easyFlowButton?.classList.toggle("ready", flowReady);
+  elements.easyReviewButton?.classList.toggle("ready", telegramReady || trelloReady);
+  elements.easyRunButton?.classList.toggle("ready", promptReady && flowReady && !stats.active.length);
+  if (elements.easyRunButton) {
+    elements.easyRunButton.disabled = stats.active.length > 0;
+  }
+}
+
+function renderAutomationDashboard() {
+  if (!elements.scenarioCanvas) {
+    return;
+  }
+  const jobs = automationJobs();
+  const stats = {
+    active: jobs.filter((job) => ACTIVE_STATUSES.has(job.status)),
+    completed: jobs.filter((job) => job.status === "completed"),
+    failed: jobs.filter((job) => job.status === "failed" || job.status === "interrupted"),
+  };
+  renderAutomationNodes(stats);
+  renderAutomationCanvasControls();
+  renderAutomationInspector(stats);
+  renderAutomationHistory(stats);
+  renderAutomationViewPanels(stats);
+  renderEasyPanel(stats);
 }
 
 function renderComposer() {
@@ -1811,6 +3066,7 @@ function renderLatestStatus() {
 
 function renderAll() {
   renderTopbar();
+  renderAutomationDashboard();
   renderComposer();
   renderLatestStatus();
 }
@@ -1823,6 +3079,8 @@ async function loadState({ silent = false } = {}) {
     state.jobs = (payload.jobs || []).filter((job) => job.type !== "login");
     state.outputShelf = payload.output_shelf || { items: [] };
     state.promptAssistant = payload.prompt_assistant || null;
+    state.integrations = normalizeIntegrationState(payload.integrations || {});
+    state.trello = normalizeTrelloState(payload.trello || {});
     state.skillLibraryCount = Array.isArray(payload.skills) ? payload.skills.length : 0;
 
     if (state.setupOpen == null) {
@@ -1916,7 +3174,7 @@ async function openFlowProjectSurface() {
 function formatFlowWindowError(message) {
   const text = String(message || "").trim();
   if (/session 0|session nền của windows/i.test(text)) {
-    return `${text} Nếu đang dùng Windows, hãy chạy Flow Web UI ngay trên màn hình desktop rồi đăng nhập lại trong cửa sổ đó.`;
+    return `${text} Nếu đang dùng Windows, hãy chạy Flow v2 ngay trên màn hình desktop rồi đăng nhập lại trong cửa sổ đó.`;
   }
   return text;
 }
@@ -2090,6 +3348,423 @@ function promoteReferenceImage(indexValue) {
     return;
   }
   setReferenceImageRole(index, primaryReferenceRoleForMode(state.mode));
+}
+
+function useAutomationPromptInStudio() {
+  syncAutomationFromForm();
+  renderAutomationDashboard();
+  document.querySelector(".scenario-sidebar")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  elements.automationStepNameInput?.focus();
+  elements.automationStepNameInput?.select();
+  showMessage("Đang chỉnh module ngay trong dashboard. Logic Flow vẫn chạy ngầm khi bấm Run once.", "success");
+}
+
+function exportAutomationConfig() {
+  syncAutomationFromForm();
+  const payload = normalizeAutomationConfig(state.automation);
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "flow-automation-config.json";
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  showMessage("Đã export cấu hình custom. File JSON này có thể import lại trên Windows hoặc MacBook.", "success");
+}
+
+async function importAutomationConfig(event) {
+  const file = event.target.files?.[0];
+  if (!file) {
+    return;
+  }
+  try {
+    const imported = JSON.parse(await file.text());
+    state.automation = normalizeAutomationConfig(imported);
+    saveAutomationConfig(state.automation);
+    renderAll();
+    showMessage("Đã import cấu hình custom cho automation.", "success");
+  } catch (error) {
+    showMessage("File cấu hình không hợp lệ. Hãy chọn file JSON đã export từ Flow v2.", "error");
+  } finally {
+    event.target.value = "";
+  }
+}
+
+function resetAutomationConfig() {
+  state.automation = defaultAutomationConfig();
+  saveAutomationConfig(state.automation);
+  renderAll();
+  showMessage("Đã reset phần custom về mặc định.", "success");
+}
+
+async function saveTrelloConfig({ clearCredentials = false } = {}) {
+  syncAutomationFromForm();
+  const payload = {
+    api_key: clearCredentials ? "" : elements.automationTrelloKeyInput?.value?.trim() || "",
+    token: clearCredentials ? "" : elements.automationTrelloTokenInput?.value?.trim() || "",
+    card_id: elements.automationTrelloCardInput?.value?.trim() || "",
+    list_id: elements.automationTrelloListInput?.value?.trim() || "",
+    upload_mode: elements.automationTrelloUploadMode?.value || state.trello?.upload_mode || "file",
+    set_cover: state.automation.trelloSetCover !== false,
+    clear_credentials: clearCredentials,
+  };
+
+  if (elements.automationTrelloSaveButton) {
+    elements.automationTrelloSaveButton.disabled = true;
+  }
+  if (elements.automationTrelloClearButton) {
+    elements.automationTrelloClearButton.disabled = true;
+  }
+
+  try {
+    const response = await api("/api/integrations/trello", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    state.trello = normalizeTrelloState(response.trello || {});
+    state.automation.trelloCardId = state.trello.card_id || payload.card_id;
+    state.automation.trelloListId = state.trello.list_id || payload.list_id;
+    saveAutomationConfig(state.automation);
+
+    if (elements.automationTrelloKeyInput) {
+      elements.automationTrelloKeyInput.value = "";
+    }
+    if (elements.automationTrelloTokenInput) {
+      elements.automationTrelloTokenInput.value = "";
+    }
+
+    renderAutomationDashboard();
+    if (clearCredentials) {
+      showMessage("Đã xóa key/token Trello trong app. Card/list vẫn giữ để cấu hình lại nhanh.", "success");
+    } else if (state.trello.configured) {
+      showMessage("Đã lưu Trello. Ảnh Flow tạo xong sẽ tự đẩy lên nơi lưu này.", "success");
+    } else if (state.trello.credentials_saved) {
+      showMessage("Đã lưu key/token Trello. Hãy thêm card hoặc list để app biết lưu ảnh vào đâu.", "success");
+    } else {
+      showMessage("Đã lưu card/list Trello. Hãy thêm API key và token để bật lưu trữ tự động.", "success");
+    }
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    if (elements.automationTrelloSaveButton) {
+      elements.automationTrelloSaveButton.disabled = false;
+    }
+    if (elements.automationTrelloClearButton) {
+      elements.automationTrelloClearButton.disabled = false;
+    }
+  }
+}
+
+async function saveIntegrationConfig({ clearSecrets = false } = {}) {
+  syncAutomationFromForm();
+  const payload = {
+    gemini_api_key: clearSecrets ? "" : elements.automationGeminiKeyInput?.value?.trim() || "",
+    gemini_model: elements.automationGeminiModelInput?.value?.trim() || state.integrations?.gemini?.model || "gemini-2.5-flash",
+    telegram_bot_token: clearSecrets ? "" : elements.automationTelegramTokenInput?.value?.trim() || "",
+    telegram_chat_id: elements.automationTelegramInput?.value?.trim() || "",
+    playwright_browsers_path: elements.automationPlaywrightPathInput?.value?.trim() || "",
+    clear_gemini_api_key: clearSecrets,
+    clear_telegram_bot_token: clearSecrets,
+  };
+
+  if (elements.automationEnvSaveButton) {
+    elements.automationEnvSaveButton.disabled = true;
+  }
+  if (elements.automationEnvClearButton) {
+    elements.automationEnvClearButton.disabled = true;
+  }
+
+  try {
+    const response = await api("/api/integrations/settings", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+    state.integrations = normalizeIntegrationState(response.integrations || {});
+    state.automation.telegramChat = state.integrations.telegram.chat_id || payload.telegram_chat_id;
+    saveAutomationConfig(state.automation);
+
+    if (elements.automationGeminiKeyInput) {
+      elements.automationGeminiKeyInput.value = "";
+    }
+    if (elements.automationTelegramTokenInput) {
+      elements.automationTelegramTokenInput.value = "";
+    }
+
+    renderAutomationDashboard();
+    if (clearSecrets) {
+      showMessage("Đã xóa Gemini key và Telegram bot token trong app. Các field không nhạy cảm vẫn giữ lại.", "success");
+    } else {
+      showMessage("Đã lưu cấu hình app. Từ giờ không cần sửa file .env cho Gemini, Telegram hoặc Playwright path.", "success");
+    }
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    if (elements.automationEnvSaveButton) {
+      elements.automationEnvSaveButton.disabled = false;
+    }
+    if (elements.automationEnvClearButton) {
+      elements.automationEnvClearButton.disabled = false;
+    }
+  }
+}
+
+async function previewPromptSource(file = null) {
+  syncAutomationFromForm();
+  const data = new FormData();
+  data.append("source_url", state.automation.sourceLocation || "");
+  data.append("text", elements.automationSheetPasteInput?.value || "");
+  if (file) {
+    data.append("file", file);
+  }
+
+  if (elements.automationSheetPreviewButton) {
+    elements.automationSheetPreviewButton.disabled = true;
+  }
+  if (elements.automationSheetFileButton) {
+    elements.automationSheetFileButton.disabled = true;
+  }
+
+  try {
+    const payload = await api("/api/prompt-sources/preview", {
+      method: "POST",
+      body: data,
+    });
+    state.promptSourcePreview = payload;
+    state.automation.sourceType = "sheets";
+    state.automation.prompt = payload.prompt || state.automation.prompt || "";
+    saveAutomationConfig(state.automation);
+    renderAll();
+    const count = Number(payload.active_count || payload.prompt_count || 0);
+    showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi gửi Telegram duyệt.`, "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    if (elements.automationSheetPreviewButton) {
+      elements.automationSheetPreviewButton.disabled = false;
+    }
+    if (elements.automationSheetFileButton) {
+      elements.automationSheetFileButton.disabled = false;
+    }
+    if (elements.automationSheetFileInput) {
+      elements.automationSheetFileInput.value = "";
+    }
+  }
+}
+
+function syncModuleSettingFromControl(control) {
+  const module = selectedAutomationModule();
+  const setting = control.dataset.moduleSetting;
+  const value = control.type === "checkbox" ? Boolean(control.checked) : control.value;
+  module.settings = module.settings || {};
+  if (setting === "sourceType") {
+    state.automation.sourceType = value || "manual";
+    if (elements.automationSourceType) {
+      elements.automationSourceType.value = state.automation.sourceType;
+    }
+  } else if (setting === "sourceLocation") {
+    state.automation.sourceLocation = String(value || "").trim();
+    if (elements.automationSourceLocationInput) {
+      elements.automationSourceLocationInput.value = state.automation.sourceLocation;
+    }
+  } else if (setting === "imageModel") {
+    state.drafts.image.model = value || defaultModelForMode("image");
+  } else if (setting === "imageAspect") {
+    state.drafts.image.aspect = value || "square";
+  } else if (setting === "imageCount") {
+    state.drafts.image.count = Math.max(1, Math.min(4, Number(value || 1)));
+  } else if (setting === "telegramChat") {
+    state.automation.telegramChat = String(value || "").trim();
+    if (elements.automationTelegramInput) {
+      elements.automationTelegramInput.value = state.automation.telegramChat;
+    }
+  } else if (setting === "trelloCard") {
+    state.automation.trelloCardId = String(value || "").trim();
+    if (elements.automationTrelloCardInput) {
+      elements.automationTrelloCardInput.value = state.automation.trelloCardId;
+    }
+  } else if (setting === "trelloList") {
+    state.automation.trelloListId = String(value || "").trim();
+    if (elements.automationTrelloListInput) {
+      elements.automationTrelloListInput.value = state.automation.trelloListId;
+    }
+  } else if (setting === "trelloUploadMode") {
+    state.trello.upload_mode = value || "file";
+    if (elements.automationTrelloUploadMode) {
+      elements.automationTrelloUploadMode.value = state.trello.upload_mode;
+    }
+  } else {
+    module.settings[setting] = value;
+  }
+  persistAutomationModules();
+}
+
+function automationExecutionGraphPayload() {
+  const modules = normalizeAutomationModules(state.automation)
+    .map((module) => ({
+      id: module.id,
+      type: module.type || "custom",
+      title: module.title || moduleTypeConfig(module.type).title,
+      detail: module.detail || moduleTypeConfig(module.type).detail,
+      enabled: module.enabled !== false,
+      settings: {
+        ...(module.settings || {}),
+      },
+    }));
+  const enabledModules = modules.filter((module) => module.enabled);
+  const edges = enabledModules.slice(1).map((module, index) => ({
+    source: enabledModules[index].id,
+    target: module.id,
+    condition: "success",
+  }));
+  return {
+    version: AUTOMATION_CONFIG_VERSION,
+    selected_module_id: state.automation.selectedStep || "",
+    modules,
+    edges,
+  };
+}
+
+async function handleModuleSettingsAction(action) {
+  if (action === "preview-source") {
+    await previewPromptSource();
+  } else if (action === "upload-source") {
+    elements.automationSheetFileInput?.click();
+  } else if (action === "save-integrations") {
+    const tokenInput = elements.automationModuleSettings?.querySelector("[data-module-secret='telegramToken']");
+    if (tokenInput && elements.automationTelegramTokenInput) {
+      elements.automationTelegramTokenInput.value = tokenInput.value;
+    }
+    await saveIntegrationConfig();
+  } else if (action === "save-trello") {
+    await saveTrelloConfig();
+  } else if (action === "clear-trello") {
+    await saveTrelloConfig({ clearCredentials: true });
+  } else if (action === "sync-telegram-approvals") {
+    await syncTelegramApprovals();
+  }
+}
+
+async function syncTelegramApprovals() {
+  try {
+    const payload = await api("/api/telegram/approvals/sync", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadState({ silent: true });
+    const result = payload.telegram_approvals || {};
+    const count = Number(result.processed || 0);
+    showMessage(
+      count
+        ? `Đã đồng bộ ${count} lượt duyệt từ Telegram.`
+        : result.configured === false
+          ? "Chưa lưu Telegram bot token nên chưa đồng bộ được lượt duyệt."
+          : "Chưa có lượt duyệt Telegram mới.",
+      count ? "success" : "error"
+    );
+  } catch (error) {
+    showMessage(error.message, "error");
+  }
+}
+
+function automationImageJobPayload(prompt) {
+  const imageDraft = state.drafts.image;
+  const telegramEnabled = automationModuleEnabled("telegram");
+  const trelloEnabled = automationModuleEnabled("trello");
+  return {
+    type: "image",
+    title: "Automation image from prompt",
+    prompt: String(prompt || "").trim(),
+    model: imageDraft.model || defaultModelForMode("image"),
+    aspect: imageDraft.aspect || "square",
+    count: Math.max(1, Math.min(4, Number(imageDraft.count || 1))),
+    timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
+    telegram_enabled: telegramEnabled,
+    telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
+    trello_enabled: trelloEnabled,
+    automation_graph: automationExecutionGraphPayload(),
+    trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
+    trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
+    trello_set_cover: state.automation.trelloSetCover !== false,
+  };
+}
+
+async function submitAutomationImage() {
+  syncAutomationFromForm();
+  const batchItems = activePromptSourceItems();
+  const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
+  if (!state.config?.project_id) {
+    state.setupOpen = true;
+    renderTopbar();
+    showMessage("Hãy lưu project Flow trước khi chạy automation.", "error");
+    return;
+  }
+  if (!state.auth?.authenticated) {
+    state.setupOpen = true;
+    renderTopbar();
+    showMessage("Hãy đăng nhập Google Flow trước khi automation tạo ảnh.", "error");
+    return;
+  }
+  if (!prompt) {
+    showMessage("Hãy dán prompt hoặc để nguồn prompt lấy được dữ liệu trước khi chạy.", "error");
+    elements.automationPromptInput.focus();
+    return;
+  }
+  if (!automationModuleEnabled("flow")) {
+    showMessage("Luồng cần có một cục Google Flow đang bật để tạo ảnh.", "error");
+    selectAutomationModuleByType("flow", { create: true });
+    return;
+  }
+
+  const payload = automationImageJobPayload(prompt);
+
+  elements.automationRunButton.disabled = true;
+  elements.automationRunImageButton.disabled = true;
+  if (elements.easyRunButton) {
+    elements.easyRunButton.disabled = true;
+  }
+  try {
+    if (batchItems.length > 1) {
+      await api("/api/jobs/batch", {
+        method: "POST",
+        body: JSON.stringify({
+          title: `Chạy ${batchItems.length} prompt từ sheet`,
+          limit: 40,
+          job: {
+            ...payload,
+            title: "Automation image from sheet row",
+          },
+          items: batchItems,
+        }),
+      });
+    } else {
+      await api("/api/jobs", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+    }
+    state.mode = "image";
+    state.setupOpen = false;
+    state.automation.enabled = true;
+    saveAutomationConfig(state.automation);
+    showMessage(
+      batchItems.length > 1
+        ? `Đã xếp hàng ${batchItems.length} prompt active. App sẽ chạy lần lượt, tạo ảnh bằng Flow rồi gửi Telegram để duyệt.`
+        : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, luồng sẽ dừng ở bước duyệt Telegram/log để chủ nhân xử lý.",
+      "success"
+    );
+    await loadState({ silent: true });
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    elements.automationRunButton.disabled = false;
+    elements.automationRunImageButton.disabled = false;
+    if (elements.easyRunButton) {
+      elements.easyRunButton.disabled = false;
+    }
+    renderAutomationDashboard();
+  }
 }
 
 async function submitCreate(event) {
@@ -2499,6 +4174,97 @@ function setupPolling() {
   }, 5000);
 }
 
+function isAutomationCanvasControl(target) {
+  return Boolean(target.closest(".scenario-canvas-tools, button, a, input, textarea, select, [contenteditable='true']"));
+}
+
+function handleAutomationCanvasPointerDown(event) {
+  if (event.button !== 0 || !elements.scenarioCanvas || isAutomationCanvasControl(event.target)) {
+    return;
+  }
+  event.preventDefault();
+  automationCanvasPan = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    scrollLeft: elements.scenarioCanvas.scrollLeft,
+    scrollTop: elements.scenarioCanvas.scrollTop,
+  };
+  elements.scenarioCanvas.classList.add("is-panning");
+  elements.scenarioCanvas.setPointerCapture?.(event.pointerId);
+}
+
+function handleAutomationCanvasPointerMove(event) {
+  if (!automationCanvasPan || automationCanvasPan.pointerId !== event.pointerId || !elements.scenarioCanvas) {
+    return;
+  }
+  event.preventDefault();
+  const dx = event.clientX - automationCanvasPan.startX;
+  const dy = event.clientY - automationCanvasPan.startY;
+  elements.scenarioCanvas.scrollLeft = automationCanvasPan.scrollLeft - dx;
+  elements.scenarioCanvas.scrollTop = automationCanvasPan.scrollTop - dy;
+}
+
+function stopAutomationCanvasPan(event) {
+  if (!automationCanvasPan || (event?.pointerId && automationCanvasPan.pointerId !== event.pointerId)) {
+    return;
+  }
+  if (event?.pointerId) {
+    elements.scenarioCanvas?.releasePointerCapture?.(event.pointerId);
+  }
+  elements.scenarioCanvas?.classList.remove("is-panning");
+  automationCanvasPan = null;
+}
+
+function clearAutomationDragState() {
+  automationDraggedStepId = "";
+  elements.scenarioNodeRow?.querySelectorAll(".is-dragging, .is-drop-target").forEach((node) => {
+    node.classList.remove("is-dragging", "is-drop-target");
+  });
+}
+
+function reorderAutomationModules(dragStepId, targetStepId) {
+  if (!dragStepId || !targetStepId || dragStepId === targetStepId) {
+    clearAutomationDragState();
+    return;
+  }
+  syncAutomationFromForm();
+  state.automation.modules = normalizeAutomationModules(state.automation);
+  const fromIndex = state.automation.modules.findIndex((module) => module.id === dragStepId);
+  const toIndex = state.automation.modules.findIndex((module) => module.id === targetStepId);
+  if (fromIndex < 0 || toIndex < 0) {
+    clearAutomationDragState();
+    return;
+  }
+  const [module] = state.automation.modules.splice(fromIndex, 1);
+  state.automation.modules.splice(toIndex, 0, module);
+  state.automation.selectedStep = module.id;
+  persistAutomationModules();
+  renderAutomationDashboard();
+  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
+  showMessage("Đã đổi vị trí module trên sơ đồ.", "success");
+}
+
+function handleAutomationKeyboard(event) {
+  if (state.automation.view !== "diagram" || event.metaKey || event.ctrlKey || event.altKey) {
+    return;
+  }
+  const active = document.activeElement;
+  if (active?.matches?.("input, textarea, select, [contenteditable='true']")) {
+    return;
+  }
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    setAutomationCanvasZoom(state.automation.canvasZoom + AUTOMATION_CANVAS_ZOOM_STEP);
+  } else if (event.key === "-") {
+    event.preventDefault();
+    setAutomationCanvasZoom(state.automation.canvasZoom - AUTOMATION_CANVAS_ZOOM_STEP);
+  } else if (event.key === "0") {
+    event.preventDefault();
+    setAutomationCanvasZoom(1);
+  }
+}
+
 elements.modeButtons.forEach((button) => {
   button.addEventListener("click", () => changeMode(button.dataset.mode));
 });
@@ -2531,6 +4297,211 @@ elements.openFlowButton.addEventListener("click", openFlowProjectSurface);
 elements.openLoginButton.addEventListener("click", openFlowLoginSurface);
 elements.openProjectButton.addEventListener("click", openFlowProjectSurface);
 elements.focusProjectButton.addEventListener("click", openFlowProjectSurface);
+elements.automationEnabled.addEventListener("change", () => {
+  syncAutomationFromForm();
+  renderTopbar();
+  renderAutomationDashboard();
+});
+elements.automationOpenFlowButton.addEventListener("click", openFlowProjectSurface);
+elements.automationRefreshButton.addEventListener("click", () => loadState());
+elements.automationHistoryRefreshButton.addEventListener("click", () => loadState());
+elements.automationIncompleteRefreshButton.addEventListener("click", () => loadState());
+elements.automationRunButton.addEventListener("click", submitAutomationImage);
+elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
+elements.automationUseStudioButton.addEventListener("click", useAutomationPromptInStudio);
+elements.automationExportButton.addEventListener("click", exportAutomationConfig);
+elements.automationImportButton.addEventListener("click", () => elements.automationImportFile.click());
+elements.automationImportFile.addEventListener("change", importAutomationConfig);
+elements.automationResetButton.addEventListener("click", resetAutomationConfig);
+elements.automationZoomOut?.addEventListener("click", () => setAutomationCanvasZoom(state.automation.canvasZoom - AUTOMATION_CANVAS_ZOOM_STEP));
+elements.automationZoomIn?.addEventListener("click", () => setAutomationCanvasZoom(state.automation.canvasZoom + AUTOMATION_CANVAS_ZOOM_STEP));
+elements.automationZoomReset?.addEventListener("click", () => setAutomationCanvasZoom(1));
+elements.automationFitButton?.addEventListener("click", fitAutomationCanvas);
+elements.easyPromptButton?.addEventListener("click", () => {
+  state.automation.view = "diagram";
+  selectAutomationModuleByType("source", { create: true });
+  window.setTimeout(() => {
+    if (!String(state.automation.prompt || "").trim()) {
+      elements.automationSheetPasteInput?.focus();
+    } else {
+      elements.automationPromptInput?.focus();
+    }
+  }, 0);
+});
+elements.easyFlowButton?.addEventListener("click", async () => {
+  state.automation.view = "diagram";
+  selectAutomationModuleByType("flow", { create: true });
+  if (!state.config?.project_id) {
+    state.setupOpen = true;
+    renderTopbar();
+    elements.projectId?.focus();
+    showMessage("Dán link project Flow rồi bấm Lưu project.", "error");
+    return;
+  }
+  if (!state.auth?.authenticated) {
+    await loginFlow();
+    return;
+  }
+  await openFlowProjectSurface();
+});
+elements.easyReviewButton?.addEventListener("click", () => {
+  state.automation.view = "diagram";
+  selectAutomationModuleByType("telegram", { create: true });
+  window.setTimeout(() => {
+    const input = elements.automationModuleSettings?.querySelector("[data-module-setting='telegramChat']");
+    input?.focus();
+  }, 0);
+});
+elements.easyRunButton?.addEventListener("click", submitAutomationImage);
+elements.automationModuleAddButton?.addEventListener("click", () => addAutomationModule());
+elements.automationModuleDuplicateButton?.addEventListener("click", () => addAutomationModule({ duplicate: true }));
+elements.automationModuleDeleteButton?.addEventListener("click", deleteSelectedAutomationModule);
+elements.automationModuleMoveLeftButton?.addEventListener("click", () => moveSelectedAutomationModule(-1));
+elements.automationModuleMoveRightButton?.addEventListener("click", () => moveSelectedAutomationModule(1));
+elements.automationModuleSettings?.addEventListener("input", (event) => {
+  const control = event.target.closest("[data-module-setting]");
+  if (!control) {
+    return;
+  }
+  syncModuleSettingFromControl(control);
+});
+elements.automationModuleSettings?.addEventListener("change", (event) => {
+  const control = event.target.closest("[data-module-setting]");
+  if (!control) {
+    return;
+  }
+  syncModuleSettingFromControl(control);
+  renderAutomationDashboard();
+});
+elements.automationModuleSettings?.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-module-action]")?.dataset.moduleAction;
+  if (!action) {
+    return;
+  }
+  handleModuleSettingsAction(action);
+});
+elements.automationSheetPreviewButton?.addEventListener("click", () => previewPromptSource());
+elements.automationSheetFileButton?.addEventListener("click", () => elements.automationSheetFileInput?.click());
+elements.automationSheetFileInput?.addEventListener("change", (event) => {
+  const file = event.target.files?.[0];
+  if (file) {
+    previewPromptSource(file);
+  }
+});
+elements.automationTrelloSaveButton?.addEventListener("click", () => saveTrelloConfig());
+elements.automationTrelloClearButton?.addEventListener("click", () => saveTrelloConfig({ clearCredentials: true }));
+elements.automationEnvSaveButton?.addEventListener("click", () => saveIntegrationConfig());
+elements.automationEnvClearButton?.addEventListener("click", () => saveIntegrationConfig({ clearSecrets: true }));
+elements.automationViewButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.automation.view = button.dataset.automationView || "diagram";
+    saveAutomationConfig(state.automation);
+    renderAutomationDashboard();
+  });
+});
+elements.scenarioCanvas?.addEventListener("pointerdown", handleAutomationCanvasPointerDown);
+elements.scenarioCanvas?.addEventListener("pointermove", handleAutomationCanvasPointerMove);
+elements.scenarioCanvas?.addEventListener("pointerup", stopAutomationCanvasPan);
+elements.scenarioCanvas?.addEventListener("pointercancel", stopAutomationCanvasPan);
+elements.scenarioCanvas?.addEventListener("wheel", (event) => {
+  if (!event.ctrlKey && !event.metaKey) {
+    return;
+  }
+  event.preventDefault();
+  setAutomationCanvasZoom(state.automation.canvasZoom + (event.deltaY > 0 ? -AUTOMATION_CANVAS_ZOOM_STEP : AUTOMATION_CANVAS_ZOOM_STEP));
+}, { passive: false });
+elements.scenarioNodeRow?.addEventListener("dragstart", (event) => {
+  const node = event.target.closest(".scenario-node");
+  if (!node) {
+    return;
+  }
+  automationDraggedStepId = node.dataset.scenarioStep || "";
+  node.classList.add("is-dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", automationDraggedStepId);
+});
+elements.scenarioNodeRow?.addEventListener("dragover", (event) => {
+  const node = event.target.closest(".scenario-node");
+  if (!node || !automationDraggedStepId || node.dataset.scenarioStep === automationDraggedStepId) {
+    return;
+  }
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  elements.scenarioNodeRow.querySelectorAll(".is-drop-target").forEach((item) => item.classList.remove("is-drop-target"));
+  node.classList.add("is-drop-target");
+});
+elements.scenarioNodeRow?.addEventListener("dragleave", (event) => {
+  event.target.closest(".scenario-node")?.classList.remove("is-drop-target");
+});
+elements.scenarioNodeRow?.addEventListener("drop", (event) => {
+  const node = event.target.closest(".scenario-node");
+  if (!node) {
+    clearAutomationDragState();
+    return;
+  }
+  event.preventDefault();
+  reorderAutomationModules(automationDraggedStepId || event.dataTransfer.getData("text/plain"), node.dataset.scenarioStep || "");
+});
+elements.scenarioNodeRow?.addEventListener("dragend", clearAutomationDragState);
+document.addEventListener("keydown", handleAutomationKeyboard);
+elements.scenarioCanvas.addEventListener("click", (event) => {
+  const target = event.target.closest("[data-scenario-step]");
+  if (!target) {
+    return;
+  }
+  const nextStep = target.dataset.scenarioStep || "flow";
+  if (!state.automation.modules.some((module) => module.id === nextStep)) {
+    return;
+  }
+  syncAutomationFromForm();
+  state.automation.selectedStep = nextStep;
+  saveAutomationConfig(state.automation);
+  renderAutomationDashboard();
+  window.setTimeout(() => scrollAutomationNodeIntoView(nextStep), 0);
+});
+[
+  elements.automationPromptInput,
+  elements.automationSourceType,
+  elements.automationStepNameInput,
+  elements.automationStepDetailInput,
+  elements.automationStepIconInput,
+  elements.automationModuleTypeInput,
+  elements.automationModuleEnabledInput,
+  elements.automationTelegramInput,
+  elements.automationSheetInput,
+  elements.automationTrelloCardInput,
+  elements.automationTrelloListInput,
+  elements.automationAppEyebrowInput,
+  elements.automationAppTitleInput,
+  elements.automationAppSubtitleInput,
+  elements.automationSourceLocationInput,
+  elements.automationAccentInput,
+]
+  .filter(Boolean)
+  .forEach((control) => {
+  const isBrandControl = [
+    elements.automationAppEyebrowInput,
+    elements.automationAppTitleInput,
+    elements.automationAppSubtitleInput,
+    elements.automationAccentInput,
+  ].includes(control);
+  control.addEventListener("input", () => {
+    syncAutomationFromForm();
+    if (isBrandControl) {
+      renderAll();
+    } else {
+      renderAutomationDashboard();
+    }
+  });
+  control.addEventListener("change", () => {
+    syncAutomationFromForm();
+    if (isBrandControl) {
+      renderAll();
+    } else {
+      renderAutomationDashboard();
+    }
+  });
+});
 elements.logoutButton.addEventListener("click", logoutFlow);
 elements.startImageFile.addEventListener("change", uploadStartImage);
 elements.imageReferenceFiles.addEventListener("change", uploadImageReferences);

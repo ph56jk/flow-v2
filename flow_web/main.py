@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -17,9 +17,12 @@ from .schemas import (
     ConfigUpdateRequest,
     CreateJobRequest,
     DownloadRequest,
+    IntegrationConfigUpdateRequest,
+    PromptBatchRequest,
     PromptCreateRequest,
     ReplayCleanupRequest,
     StoryboardPlanRequest,
+    TrelloConfigUpdateRequest,
 )
 from .service import FlowWebService
 from .store import StateStore
@@ -60,17 +63,19 @@ async def lifespan(app: FastAPI):
     store = StateStore()
     app.state.flow_service = FlowWebService(store)
     sync_task = asyncio.create_task(app.state.flow_service.ensure_media_skill_library())
+    telegram_approval_task = asyncio.create_task(app.state.flow_service.run_telegram_approval_sync_loop())
     try:
         yield
     finally:
-        sync_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await sync_task
+        for task in (sync_task, telegram_approval_task):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         await app.state.flow_service.close()
 
 
 app = FastAPI(
-    title="Flow Web UI",
+    title="Flow v2",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -106,6 +111,31 @@ async def update_config(request: Request, payload: ConfigUpdateRequest) -> Dict[
     return {"config": config}
 
 
+@app.put("/api/integrations/trello")
+async def update_trello_config(request: Request, payload: TrelloConfigUpdateRequest) -> Dict[str, Any]:
+    return {"trello": await service(request).update_trello_config(payload)}
+
+
+@app.put("/api/integrations/settings")
+async def update_integration_config(request: Request, payload: IntegrationConfigUpdateRequest) -> Dict[str, Any]:
+    return {"integrations": await service(request).update_integration_config(payload)}
+
+
+@app.post("/api/telegram/approvals/sync")
+async def sync_telegram_approvals(request: Request) -> Dict[str, Any]:
+    return {"telegram_approvals": await service(request).sync_telegram_approvals()}
+
+
+@app.post("/api/prompt-sources/preview")
+async def preview_prompt_source(
+    request: Request,
+    source_url: str = Form(""),
+    text: str = Form(""),
+    file: UploadFile | None = File(None),
+) -> Dict[str, Any]:
+    return await service(request).preview_prompt_source(file=file, text=text, source_url=source_url)
+
+
 @app.post("/api/auth/login")
 async def login(request: Request) -> Dict[str, Any]:
     flow_service = service(request)
@@ -138,6 +168,11 @@ async def workflows(request: Request) -> Dict[str, Any]:
     return {"items": await service(request).get_workflows()}
 
 
+@app.get("/api/flow/project-debug")
+async def flow_project_debug(request: Request) -> Dict[str, Any]:
+    return await service(request).get_project_debug()
+
+
 @app.get("/api/models")
 async def models(request: Request) -> Dict[str, Any]:
     return await service(request).get_model_config()
@@ -151,6 +186,12 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> Dict[st
 @app.post("/api/jobs")
 async def create_job(request: Request, payload: CreateJobRequest) -> Dict[str, Any]:
     job = await service(request).enqueue_job(payload)
+    return {"job": job}
+
+
+@app.post("/api/jobs/batch")
+async def create_prompt_batch(request: Request, payload: PromptBatchRequest) -> Dict[str, Any]:
+    job = await service(request).enqueue_prompt_batch(payload)
     return {"job": job}
 
 

@@ -1587,3 +1587,1094 @@ textarea:focus {
     min-height: 150px;
   }
 }
+
+/* Make-style automation workspace */
+:root {
+  --bg: #f6f4fa;
+  --panel: #ffffff;
+  --panel-soft: #faf9fd;
+  --panel-strong: #f0eef7;
+  --text: #20222a;
+  --muted: #6f7481;
+  --line: #e5e1ec;
+  --line-strong: #cfc7dc;
+  --accent: #7c2ee6;
+  --accent-strong: #5f22c9;
+  --accent-soft: #f2eafe;
+  --accent-ring: #d9c3f7;
+  --blue: #12a8dc;
+  --green: #18b579;
+  --orange: #f5a623;
+  --shadow: 0 18px 48px rgba(36, 28, 58, 0.08);
+  --radius-xl: 8px;
+  --radius-lg: 8px;
+  --radius-md: 8px;
+  --radius-sm: 8px;
+}
+
+* {
+  letter-spacing: 0 !important;
+}
+
+.flow-dashboard {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.flow-dashboard::before,
+.flow-dashboard::after,
+.studio-aura {
+  display: none;
+}
+
+.legacy-studio {
+  display: none !important;
+}
+
+.flow-dashboard .app-shell {
+  width: min(1920px, 100vw);
+  padding: 0 24px 48px;
+}
+
+.flow-dashboard .topbar {
+  margin: 0 -24px 0;
+  padding: 16px 28px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.flow-dashboard .brand h1,
+.flow-dashboard .section-head h2,
+.flow-dashboard .studio-head h2,
+.flow-dashboard .prompt-ai-head h3,
+.flow-dashboard .source-panel-head h3,
+.flow-dashboard .action-summary strong,
+.flow-dashboard .status-summary-card strong,
+.flow-dashboard .run-card strong,
+.flow-dashboard .result-copy strong {
+  font-family: "IBM Plex Sans", sans-serif;
+  color: var(--text);
+}
+
+.flow-dashboard .brand h1 {
+  font-size: 1.18rem;
+  font-weight: 600;
+}
+
+.flow-dashboard .brand-mark {
+  width: 38px;
+  height: 38px;
+  gap: 4px;
+  padding: 7px;
+  border-radius: 8px;
+  border-color: var(--line);
+  background: #f3ebff;
+  box-shadow: none;
+}
+
+.flow-dashboard .brand-mark span {
+  border-radius: 3px;
+  background: var(--accent);
+}
+
+.flow-dashboard .eyebrow {
+  color: var(--muted);
+  opacity: 1;
+  font-size: 0.72rem;
+}
+
+.flow-dashboard .subcopy {
+  margin-top: 4px;
+  font-size: 0.9rem;
+}
+
+.flow-dashboard .status-pill,
+.flow-dashboard .mini-pill,
+.flow-dashboard .status-chip,
+.flow-dashboard .skill-chip,
+.flow-dashboard .reference-role-pill {
+  color: var(--muted);
+  background: #ffffff;
+  border-color: var(--line);
+}
+
+.flow-dashboard .status-pill[data-state="ready"],
+.flow-dashboard .prompt-ai-badge[data-state="ready"] {
+  color: #15714d;
+  border-color: #bfe8d6;
+  background: #f1fbf6;
+}
+
+.flow-dashboard button,
+.flow-dashboard .ghost-button,
+.flow-dashboard .secondary-button,
+.flow-dashboard .action-link {
+  border-radius: 8px;
+}
+
+.flow-dashboard .ghost-button,
+.flow-dashboard .secondary-button {
+  min-height: 40px;
+  color: var(--text);
+  border-color: var(--line);
+  background: #ffffff;
+}
+
+.flow-dashboard .ghost-button:hover,
+.flow-dashboard .secondary-button:hover,
+.flow-dashboard .mode-button:hover,
+.flow-dashboard .task-chip:hover,
+.flow-dashboard .choice-card:hover,
+.flow-dashboard .count-choice:hover {
+  border-color: var(--line-strong);
+  background: #f7f4fc;
+}
+
+.scenario-toggle {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.scenario-toggle input {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  opacity: 0;
+}
+
+.scenario-toggle i {
+  width: 44px;
+  height: 24px;
+  border-radius: 999px;
+  background: #d8d4df;
+  position: relative;
+}
+
+.scenario-toggle i::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(20, 17, 31, 0.18);
+  transition: transform 160ms ease;
+}
+
+.scenario-toggle input:checked + i {
+  background: var(--accent);
+}
+
+.scenario-toggle input:checked + i::after {
+  transform: translateX(20px);
+}
+
+.scenario-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  min-height: 610px;
+  margin: 0 -24px 22px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfaff;
+}
+
+.scenario-primary {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(340px, 1fr) auto auto;
+  border-right: 1px solid var(--line);
+}
+
+.scenario-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 28px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.scenario-tabs,
+.scenario-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.scenario-tab {
+  min-height: 38px;
+  padding: 0 14px;
+  color: var(--muted);
+  border-radius: 0;
+  border-bottom: 3px solid transparent;
+  background: transparent;
+}
+
+.scenario-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.scenario-toolbar #automationRunButton,
+.automation-command #automationRunImageButton,
+.flow-dashboard #submitButton,
+.flow-dashboard .setup-actions button[type="submit"],
+.flow-dashboard .submit-row button[type="submit"] {
+  background: var(--accent);
+  color: #ffffff;
+  border: 1px solid var(--accent);
+  font-weight: 600;
+}
+
+.scenario-toolbar #automationRunButton:hover,
+.automation-command #automationRunImageButton:hover,
+.flow-dashboard #submitButton:hover {
+  background: var(--accent-strong);
+}
+
+.easy-panel {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  padding: 16px 28px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.easy-step {
+  min-width: 0;
+  min-height: 92px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-content: center;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfaff;
+  color: var(--text);
+  text-align: left;
+  transition: transform 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+
+.easy-step:hover {
+  transform: translateY(-1px);
+  border-color: var(--line-strong);
+  box-shadow: 0 10px 24px rgba(39, 31, 57, 0.08);
+}
+
+.easy-step span {
+  width: 34px;
+  height: 34px;
+  grid-row: span 2;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+.easy-step strong,
+.easy-step small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.easy-step small {
+  color: var(--muted);
+}
+
+.easy-step.ready {
+  border-color: var(--accent-ring);
+  background: #ffffff;
+}
+
+.easy-step-run {
+  background: var(--accent);
+  color: #ffffff;
+  border-color: var(--accent);
+}
+
+.easy-step-run span {
+  background: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+
+.easy-step-run small {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.scenario-canvas {
+  position: relative;
+  min-width: 0;
+  padding: 70px 28px 46px;
+  overflow: auto;
+  cursor: grab;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  user-select: none;
+  background:
+    linear-gradient(#efedf5 1px, transparent 1px),
+    linear-gradient(90deg, #efedf5 1px, transparent 1px),
+    #fbfaff;
+  background-size: 64px 64px;
+}
+
+.scenario-canvas.is-panning {
+  cursor: grabbing;
+}
+
+.scenario-canvas-tools {
+  position: sticky;
+  top: 14px;
+  left: 16px;
+  z-index: 5;
+  width: max-content;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 10px 28px rgba(36, 28, 58, 0.08);
+  backdrop-filter: blur(10px);
+}
+
+.canvas-tool-button {
+  min-width: 34px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.canvas-tool-button:hover {
+  border-color: var(--line);
+  background: #f7f4fc;
+}
+
+.canvas-tool-button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.canvas-zoom-label {
+  min-width: 58px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.scenario-view-panel {
+  min-height: 410px;
+  padding: 28px;
+  background: #fbfaff;
+  overflow: auto;
+}
+
+.scenario-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.scenario-panel-head h2 {
+  margin: 2px 0 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+
+.scenario-table-list {
+  display: grid;
+  gap: 10px;
+  padding-top: 16px;
+}
+
+.scenario-table-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.42fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.scenario-table-row strong {
+  display: block;
+  font-size: 0.93rem;
+}
+
+.scenario-table-row small,
+.scenario-table-row p,
+.scenario-panel-empty {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.scenario-panel-empty {
+  padding: 18px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.scenario-node-row {
+  min-width: 820px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center top;
+}
+
+.scenario-node {
+  position: relative;
+  width: 124px;
+  min-height: 150px;
+  display: grid;
+  justify-items: center;
+  align-content: start;
+  gap: 9px;
+  padding: 0;
+  border: 0;
+  color: var(--text);
+  background: transparent;
+  cursor: pointer;
+  text-align: center;
+  transition: transform 170ms ease, opacity 170ms ease, filter 170ms ease;
+}
+
+.scenario-node:hover,
+.scenario-node:focus-visible {
+  transform: translateY(-3px);
+}
+
+.scenario-node.is-dragging {
+  opacity: 0.48;
+  transform: scale(0.96);
+}
+
+.scenario-node.is-drop-target .node-icon {
+  outline: 5px solid var(--accent-ring);
+  box-shadow: 0 16px 34px rgba(95, 34, 201, 0.18);
+}
+
+.node-order {
+  position: absolute;
+  top: -6px;
+  right: 18px;
+  min-width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+  box-shadow: 0 6px 14px rgba(35, 29, 47, 0.08);
+}
+
+.scenario-node strong {
+  font-size: 0.94rem;
+  font-weight: 600;
+}
+
+.scenario-node small {
+  max-width: 112px;
+  color: var(--muted);
+  line-height: 1.35;
+  font-size: 0.78rem;
+}
+
+.node-state {
+  max-width: 112px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.node-icon {
+  width: 76px;
+  height: 76px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  border: 8px solid rgba(255, 255, 255, 0.88);
+  box-shadow: 0 12px 28px rgba(34, 24, 56, 0.15);
+  color: #ffffff;
+  font-size: 1.4rem;
+  font-weight: 700;
+  transition: transform 170ms ease, outline-color 170ms ease, box-shadow 170ms ease, background 170ms ease;
+}
+
+.node-icon-trello {
+  background: #0c82c8;
+}
+
+.node-icon-sheet,
+.node-icon-log {
+  background: var(--green);
+}
+
+.node-icon-flow {
+  background: #4c82f7;
+}
+
+.node-icon-telegram {
+  background: var(--blue);
+}
+
+.node-icon-custom {
+  background: #64748b;
+}
+
+.scenario-node.active .node-icon {
+  outline: 4px solid var(--accent-ring);
+}
+
+.scenario-node[data-status="active"] .node-icon {
+  animation: nodePulse 1.6s ease-in-out infinite;
+}
+
+.scenario-node[data-status="active"] .node-state {
+  color: #0b769c;
+  border-color: #b9e5f2;
+  background: #effbff;
+}
+
+.scenario-node[data-status="blocked"] .node-icon {
+  background: #a4a8b5;
+}
+
+.scenario-node[data-status="blocked"] .node-state,
+.scenario-node[data-status="disabled"] .node-state {
+  color: #8d3c3c;
+  border-color: #ffd2d2;
+  background: #fff4f4;
+}
+
+.scenario-node[data-status="watch"] .node-icon {
+  outline: 4px solid rgba(245, 166, 35, 0.24);
+}
+
+.scenario-node[data-status="watch"] .node-state {
+  color: #8e5d00;
+  border-color: #f3d8a0;
+  background: #fff9ec;
+}
+
+.scenario-node[data-status="done"] .node-state,
+.scenario-node[data-status="ready"] .node-state {
+  color: #15714d;
+  border-color: #bfe8d6;
+  background: #f1fbf6;
+}
+
+.scenario-node[data-status="disabled"] {
+  opacity: 0.46;
+}
+
+.scenario-node[data-status="disabled"] .node-icon {
+  filter: grayscale(1);
+}
+
+@keyframes nodePulse {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+.scenario-link {
+  flex: 0 0 46px;
+  height: 11px;
+  margin: 0 -8px 70px;
+  background: radial-gradient(circle, #9dcad8 0 4px, transparent 5px) left center / 22px 11px repeat-x;
+}
+
+.break-route {
+  width: 240px;
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  margin: -56px 0 0 calc(50% + 204px);
+}
+
+.break-route span {
+  width: 10px;
+  height: 82px;
+  background: radial-gradient(circle, #d7bd78 0 4px, transparent 5px) top center / 10px 18px repeat-y;
+}
+
+.break-node {
+  width: 118px;
+  height: 118px;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  border-radius: 999px !important;
+  border: 2px solid var(--orange);
+  background: #fffdfa;
+  color: #8e5d00;
+  text-align: center;
+  font-weight: 600;
+  box-shadow: 0 12px 28px rgba(145, 91, 0, 0.12);
+}
+
+.break-node.active {
+  outline: 4px solid rgba(245, 166, 35, 0.2);
+}
+
+.automation-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 16px;
+  padding: 18px 28px;
+  border-top: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.automation-command .compact-prompt textarea {
+  min-height: 92px;
+}
+
+.automation-command-side {
+  display: grid;
+  align-content: end;
+  gap: 12px;
+}
+
+.scenario-usage {
+  display: grid;
+  grid-template-columns: repeat(3, 120px) minmax(260px, 1fr);
+  gap: 18px;
+  align-items: center;
+  padding: 14px 28px 18px;
+  border-top: 1px solid var(--line);
+  background: #fbfaff;
+}
+
+.scenario-usage div {
+  display: grid;
+  gap: 2px;
+}
+
+.scenario-usage span {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.scenario-usage small {
+  color: var(--muted);
+}
+
+.scenario-usage svg {
+  width: 100%;
+  height: 96px;
+}
+
+.scenario-usage polyline {
+  fill: none;
+  stroke: #d327df;
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.scenario-usage .usage-line-alt {
+  stroke: #18a9d2;
+}
+
+.scenario-sidebar {
+  display: grid;
+  align-content: start;
+  gap: 0;
+  background: #f7f5fb;
+}
+
+.inspector-section {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.usage-metrics {
+  display: grid;
+  gap: 6px;
+}
+
+.usage-metrics p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.usage-metrics strong {
+  color: var(--accent);
+  font-size: 1.4rem;
+}
+
+.sidebar-detail-grid {
+  grid-template-columns: 1fr;
+  padding: 0;
+}
+
+.color-field input[type="color"] {
+  min-height: 44px;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.customize-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.trello-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.source-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.module-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.module-settings {
+  display: grid;
+  gap: 12px;
+}
+
+.module-toggle-field input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+}
+
+.danger-button {
+  color: #a63a3a;
+}
+
+.customize-actions .card-button {
+  width: 100%;
+  min-width: 0;
+  padding-inline: 10px;
+}
+
+.prompt-source-preview {
+  max-height: 220px;
+  overflow: auto;
+}
+
+.automation-history {
+  display: grid;
+  gap: 10px;
+}
+
+.empty-automation-history {
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.automation-history-item {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.automation-history-item strong {
+  display: block;
+  font-size: 0.9rem;
+}
+
+.automation-history-item small,
+.automation-history-item p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.flow-dashboard .setup-panel,
+.flow-dashboard .studio-card,
+.flow-dashboard .surface-card,
+.flow-dashboard .prompt-ai-card,
+.flow-dashboard .storyboard-card,
+.flow-dashboard .source-panel,
+.flow-dashboard .status-summary-card,
+.flow-dashboard .result-card,
+.flow-dashboard .run-card,
+.flow-dashboard .compact-details,
+.flow-dashboard .setup-helper,
+.flow-dashboard .upload-box,
+.flow-dashboard .composer-summary,
+.flow-dashboard .action-summary,
+.flow-dashboard .prompt-ai-result,
+.flow-dashboard .storyboard-result,
+.flow-dashboard .storyboard-scene-card,
+.flow-dashboard .message-bar,
+.flow-dashboard .empty-state {
+  border-color: var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.flow-dashboard .setup-panel,
+.flow-dashboard .studio-card,
+.flow-dashboard .surface-card {
+  margin-bottom: 18px;
+}
+
+.flow-dashboard .main-stack {
+  grid-template-columns: minmax(0, 1.35fr) minmax(330px, 0.65fr);
+  align-items: start;
+  gap: 18px;
+}
+
+.flow-dashboard .studio-card {
+  padding: 20px;
+}
+
+.flow-dashboard .studio-shell {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.flow-dashboard .studio-head {
+  text-align: left;
+  max-width: none;
+  margin-bottom: 16px;
+}
+
+.flow-dashboard .studio-head h2 {
+  font-size: 1.35rem;
+  font-weight: 600;
+}
+
+.flow-dashboard .studio-hint {
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.flow-dashboard .mode-switch {
+  justify-content: flex-start;
+}
+
+.flow-dashboard .mode-button,
+.flow-dashboard .video-flow-chip,
+.flow-dashboard .task-chip,
+.flow-dashboard .choice-card,
+.flow-dashboard .count-choice {
+  color: var(--text);
+  border-color: var(--line);
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.flow-dashboard .mode-button.active,
+.flow-dashboard .video-flow-chip.active,
+.flow-dashboard .task-chip.active,
+.flow-dashboard .choice-card.active,
+.flow-dashboard .count-choice.active {
+  color: var(--accent);
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+}
+
+.flow-dashboard input,
+.flow-dashboard select,
+.flow-dashboard textarea,
+.flow-dashboard .prompt-ai-text {
+  color: var(--text);
+  border-color: var(--line);
+  background: #ffffff;
+  box-shadow: none;
+}
+
+.flow-dashboard input:focus,
+.flow-dashboard select:focus,
+.flow-dashboard textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.flow-dashboard textarea {
+  min-height: 120px;
+}
+
+.flow-dashboard .prompt-field textarea {
+  min-height: 150px;
+  background: #ffffff;
+}
+
+.flow-dashboard .section-copy,
+.flow-dashboard .composer-summary p,
+.flow-dashboard .compact-details summary,
+.flow-dashboard .field span,
+.flow-dashboard .field small,
+.flow-dashboard .ready-hint,
+.flow-dashboard .run-note,
+.flow-dashboard .result-copy p,
+.flow-dashboard .empty-state,
+.flow-dashboard .source-card-copy small,
+.flow-dashboard .source-card-copy p,
+.flow-dashboard .upload-preview-copy p,
+.flow-dashboard .upload-box-head p {
+  color: var(--muted);
+}
+
+.flow-dashboard .status-card {
+  margin-top: 0;
+}
+
+.flow-dashboard .status-summary-card {
+  background: #ffffff;
+}
+
+.flow-dashboard .job-journey-step,
+.flow-dashboard .job-step-note,
+.flow-dashboard .status-start-frame,
+.flow-dashboard .upload-preview,
+.flow-dashboard .reference-hero,
+.flow-dashboard .source-card,
+.flow-dashboard .source-card-placeholder,
+.flow-dashboard .empty-inline-card {
+  border-color: var(--line);
+  border-radius: 8px;
+  background: #faf9fd;
+}
+
+.flow-dashboard .message-bar[data-tone="success"] {
+  border-color: #bfe8d6;
+  background: #f1fbf6;
+  color: #15714d;
+}
+
+.flow-dashboard .message-bar[data-tone="error"] {
+  border-color: #ffd2d2;
+  background: #fff4f4;
+  color: #a63a3a;
+}
+
+@media (max-width: 1180px) {
+  .scenario-workbench,
+  .flow-dashboard .main-stack {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-primary {
+    border-right: 0;
+  }
+
+  .scenario-sidebar {
+    border-top: 1px solid var(--line);
+  }
+
+	  .automation-command,
+	  .scenario-usage,
+	  .easy-panel {
+	    grid-template-columns: 1fr;
+	  }
+}
+
+@media (max-width: 780px) {
+  .flow-dashboard .app-shell {
+    padding: 0 12px 32px;
+  }
+
+  .flow-dashboard .topbar,
+  .scenario-workbench {
+    margin-left: -12px;
+    margin-right: -12px;
+  }
+
+	  .flow-dashboard .topbar,
+	  .scenario-nav,
+	  .easy-panel,
+	  .automation-command {
+	    padding-left: 16px;
+	    padding-right: 16px;
+  }
+
+  .scenario-canvas {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .scenario-canvas-tools {
+    left: 16px;
+    max-width: calc(100vw - 32px);
+    overflow-x: auto;
+  }
+
+  .scenario-view-panel {
+    padding: 18px 16px;
+  }
+
+  .scenario-panel-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .scenario-table-row {
+    grid-template-columns: 1fr;
+  }
+
+  .scenario-node-row {
+    justify-content: flex-start;
+  }
+
+  .break-route {
+    margin-left: 420px;
+  }
+}

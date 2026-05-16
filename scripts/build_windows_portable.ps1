@@ -168,13 +168,13 @@ $launcherCmd = @'
 setlocal
 powershell -ExecutionPolicy Bypass -File "%~dp0scripts\run_flow_web_portable.ps1"
 '@
-Set-Content -Path (Join-Path $OutputDir "Flow Web UI.cmd") -Value $launcherCmd -Encoding ASCII
+Set-Content -Path (Join-Path $OutputDir "Flow v2.cmd") -Value $launcherCmd -Encoding ASCII
 
 $readme = @"
-Flow Web UI - Windows Portable
+Flow v2 - Windows Portable
 
 1. Giai nen thu muc nay vao o dia con trong.
-2. Double click file 'Flow Web UI.cmd'.
+2. Double click file 'Flow v2.cmd'.
 3. App se mo tai http://127.0.0.1:8000
 
 Ban nay da kem san:

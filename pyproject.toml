@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flow-web-ui"
+name = "flow-v2"
 version = "0.1.0"
-description = "Local web UI for flow-py and Google Flow workflows."
+description = "Flow v2 local automation UI for Google Flow workflows."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

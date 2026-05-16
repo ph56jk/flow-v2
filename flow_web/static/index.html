@@ -3,16 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Flow Studio</title>
+    <title>Flow v2</title>
+    <link rel="icon" href="data:," />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260415a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260514a" />
   </head>
-  <body>
+  <body class="flow-dashboard">
     <div class="app-shell">
       <header class="topbar">
         <div class="brand">
@@ -23,13 +24,18 @@
             <span></span>
           </div>
           <div class="brand-copy">
-            <p class="eyebrow">Flow Studio</p>
-            <h1>Tạo và chỉnh với Flow</h1>
+            <p class="eyebrow" id="automationBrandEyebrow">Flow v2</p>
+            <h1 id="automationBrandTitle">Flow v2</h1>
             <p class="subcopy" id="topbarHint">Lưu project một lần rồi chỉ việc nhập prompt.</p>
           </div>
         </div>
 
         <div class="topbar-actions">
+          <label class="scenario-toggle" title="Bật/tắt luồng tự động trong giao diện">
+            <span>Inactive</span>
+            <input type="checkbox" id="automationEnabled" />
+            <i aria-hidden="true"></i>
+          </label>
           <span class="status-pill" id="projectStatus">Chưa có project</span>
           <span class="status-pill" id="authStatus">Chưa đăng nhập</span>
           <button type="button" class="ghost-button" id="openFlowButton">Mở Flow</button>
@@ -39,6 +45,346 @@
       </header>
 
       <div id="messageBar" class="message-bar global-message" hidden></div>
+
+      <section class="scenario-workbench" aria-label="Flow automation dashboard">
+        <div class="scenario-primary">
+          <div class="scenario-nav">
+            <div class="scenario-tabs" role="tablist" aria-label="Automation views">
+	              <button type="button" class="scenario-tab active" data-automation-view="diagram">Sơ đồ</button>
+	              <button type="button" class="scenario-tab" data-automation-view="history">Lịch sử</button>
+	              <button type="button" class="scenario-tab" data-automation-view="incomplete">Cần xem lại</button>
+            </div>
+            <div class="scenario-toolbar">
+	              <button type="button" class="ghost-button" id="automationUseStudioButton">Sửa cục</button>
+	              <button type="button" class="ghost-button" id="automationOpenFlowButton">Mở Flow</button>
+	              <button type="button" class="secondary-button" id="automationRunButton">Chạy thử</button>
+	            </div>
+	          </div>
+
+	          <section class="easy-panel" id="automationEasyPanel" aria-label="Thao tác nhanh">
+	            <button type="button" class="easy-step" id="easyPromptButton">
+	              <span>1</span>
+	              <strong>Lấy prompt</strong>
+	              <small id="easyPromptStatus">Chưa có prompt</small>
+	            </button>
+	            <button type="button" class="easy-step" id="easyFlowButton">
+	              <span>2</span>
+	              <strong>Flow</strong>
+	              <small id="easyFlowStatus">Chưa đăng nhập</small>
+	            </button>
+	            <button type="button" class="easy-step" id="easyReviewButton">
+	              <span>3</span>
+	              <strong>Duyệt / lưu</strong>
+	              <small id="easyReviewStatus">Tuỳ chọn</small>
+	            </button>
+	            <button type="button" class="easy-step easy-step-run" id="easyRunButton">
+	              <span>4</span>
+	              <strong>Tạo ảnh</strong>
+	              <small>Bấm để chạy</small>
+	            </button>
+	          </section>
+
+          <div class="scenario-canvas" id="scenarioCanvas">
+            <div class="scenario-canvas-tools" aria-label="Điều khiển sơ đồ">
+              <button type="button" class="canvas-tool-button" id="automationZoomOut" title="Thu nhỏ sơ đồ">−</button>
+              <button type="button" class="canvas-tool-button canvas-zoom-label" id="automationZoomReset" title="Đưa zoom về 100%">100%</button>
+              <button type="button" class="canvas-tool-button" id="automationZoomIn" title="Phóng to sơ đồ">+</button>
+              <button type="button" class="canvas-tool-button" id="automationFitButton" title="Căn sơ đồ vừa màn hình">Vừa</button>
+            </div>
+            <div class="scenario-node-row" aria-label="Automation modules">
+              <button type="button" class="scenario-node" data-scenario-step="source">
+                <span class="node-icon node-icon-trello">T</span>
+                <strong id="nodeTitleSource">Prompt Source</strong>
+                <small id="nodeDetailSource">Trello / Sheet / nhập tay</small>
+              </button>
+              <span class="scenario-link" aria-hidden="true"></span>
+              <button type="button" class="scenario-node" data-scenario-step="normalize">
+                <span class="node-icon node-icon-sheet">S</span>
+                <strong id="nodeTitleNormalize">Normalize Prompt</strong>
+                <small id="nodeDetailNormalize">Lọc dòng, lấy prompt mới</small>
+              </button>
+              <span class="scenario-link" aria-hidden="true"></span>
+              <button type="button" class="scenario-node active" data-scenario-step="flow">
+                <span class="node-icon node-icon-flow">F</span>
+                <strong id="nodeTitleFlow">Google Flow</strong>
+                <small id="nodeDetailFlow">Tạo ảnh thay Gemini</small>
+              </button>
+              <span class="scenario-link" aria-hidden="true"></span>
+              <button type="button" class="scenario-node" data-scenario-step="telegram">
+                <span class="node-icon node-icon-telegram">TG</span>
+                <strong id="nodeTitleTelegram">Telegram Review</strong>
+                <small id="nodeDetailTelegram">Gửi ảnh để duyệt</small>
+              </button>
+              <span class="scenario-link" aria-hidden="true"></span>
+              <button type="button" class="scenario-node" data-scenario-step="log">
+                <span class="node-icon node-icon-log">L</span>
+                <strong id="nodeTitleLog">Trello Archive</strong>
+                <small id="nodeDetailLog">Lưu ảnh vào card/list Trello</small>
+              </button>
+            </div>
+
+            <div class="break-route" aria-hidden="true">
+              <span></span>
+              <button type="button" class="break-node" data-scenario-step="review_hold">Pause for approval</button>
+            </div>
+          </div>
+
+          <section class="scenario-view-panel" id="scenarioHistoryPanel" hidden>
+            <div class="scenario-panel-head">
+              <div>
+                <p class="eyebrow">History</p>
+                <h2>Lịch sử chạy ảnh</h2>
+              </div>
+              <button type="button" class="ghost-button card-button" id="automationHistoryRefreshButton">Refresh</button>
+            </div>
+            <div id="automationHistoryPanelList" class="scenario-table-list"></div>
+          </section>
+
+          <section class="scenario-view-panel" id="scenarioIncompletePanel" hidden>
+            <div class="scenario-panel-head">
+              <div>
+                <p class="eyebrow">Incomplete executions</p>
+                <h2>Lượt cần xem lại</h2>
+              </div>
+              <button type="button" class="ghost-button card-button" id="automationIncompleteRefreshButton">Refresh</button>
+            </div>
+            <div id="automationIncompletePanelList" class="scenario-table-list"></div>
+          </section>
+
+          <div class="automation-command">
+            <label class="field wide prompt-field compact-prompt">
+              <span>Prompt để chạy thử luồng Flow</span>
+              <textarea
+                id="automationPromptInput"
+                rows="3"
+                placeholder="Dán prompt mẫu hoặc prompt vừa lấy từ Trello/Sheets để Flow tạo ảnh."
+              ></textarea>
+            </label>
+            <div class="automation-command-side">
+              <label class="field">
+                <span>Nguồn prompt</span>
+                <select id="automationSourceType">
+                  <option value="manual">Nhập tay / clipboard</option>
+                  <option value="trello">Trello list</option>
+                  <option value="sheets">Google Sheets</option>
+                  <option value="folder">Folder / CSV nội bộ</option>
+                </select>
+              </label>
+              <button type="button" id="automationRunImageButton">Tạo ảnh bằng Flow</button>
+            </div>
+          </div>
+
+          <div class="scenario-usage">
+            <div>
+              <span id="automationImageTotalCount">0</span>
+              <small>Ảnh đã tạo</small>
+            </div>
+            <div>
+              <span id="automationActiveCount">0</span>
+              <small>Đang chạy</small>
+            </div>
+            <div>
+              <span id="automationFailureCount">0</span>
+              <small>Cần xem lại</small>
+            </div>
+            <svg viewBox="0 0 680 96" role="img" aria-label="Recent usage chart">
+              <polyline points="0,82 44,82 88,82 132,80 176,52 220,18 264,28 308,72 352,84 396,84 440,40 484,52 528,78 572,82 616,80 680,82" />
+              <polyline class="usage-line-alt" points="0,84 44,84 88,83 132,82 176,66 220,22 264,20 308,44 352,82 396,84 440,60 484,30 528,68 572,82 616,83 680,82" />
+            </svg>
+          </div>
+        </div>
+
+        <aside class="scenario-sidebar" aria-label="Scenario properties">
+	          <section class="inspector-section">
+            <div class="inspector-head">
+              <p class="eyebrow">Scenario usage</p>
+              <button type="button" class="ghost-button card-button" id="automationRefreshButton">Refresh</button>
+            </div>
+            <div class="usage-metrics">
+              <p><strong id="automationCompletedCount">0</strong> images</p>
+              <p><strong id="automationTransferHint">Flow</strong> generator</p>
+            </div>
+          </section>
+
+	          <section class="inspector-section" id="automationPromptSourceSection">
+            <div class="inspector-head">
+              <p class="eyebrow">Prompt source</p>
+              <span class="status-pill" id="automationSheetStatus">Chưa lấy</span>
+            </div>
+            <label class="field">
+              <span>Google Sheet / CSV link</span>
+              <input type="text" id="automationSourceLocationInput" placeholder="Dán link Google Sheet hoặc CSV export" />
+            </label>
+            <label class="field">
+              <span>Paste bảng từ Google Sheets</span>
+              <textarea id="automationSheetPasteInput" rows="3" placeholder="Copy hàng có Product_Key, Prompt_Content, Active rồi paste vào đây"></textarea>
+            </label>
+            <div class="customize-actions source-actions">
+              <button type="button" class="ghost-button card-button" id="automationSheetPreviewButton">Lấy prompt</button>
+              <button type="button" class="ghost-button card-button" id="automationSheetFileButton">Upload .xlsx/.csv</button>
+              <input
+                type="file"
+                id="automationSheetFileInput"
+                accept=".xlsx,.csv,.tsv,text/csv,text/tab-separated-values,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                hidden
+              />
+            </div>
+            <div id="automationSheetPreviewList" class="scenario-table-list prompt-source-preview"></div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="inspector-head">
+              <p class="eyebrow">Module editor</p>
+              <span class="status-pill" id="automationModuleStatus">Đang chọn</span>
+            </div>
+            <label class="field">
+              <span>Module đang chọn</span>
+              <input type="text" id="automationStepNameInput" />
+            </label>
+            <label class="field">
+              <span>Ghi chú thao tác</span>
+              <textarea id="automationStepDetailInput" rows="3"></textarea>
+            </label>
+            <div class="detail-grid sidebar-detail-grid module-editor-grid">
+              <label class="field">
+                <span>Loại module</span>
+                <select id="automationModuleTypeInput">
+                  <option value="source">Prompt source</option>
+                  <option value="normalize">Normalize</option>
+                  <option value="flow">Google Flow</option>
+                  <option value="telegram">Telegram</option>
+                  <option value="trello">Trello</option>
+                  <option value="approval">Approval</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Ký hiệu</span>
+                <input type="text" id="automationStepIconInput" maxlength="4" placeholder="F" />
+              </label>
+              <label class="field module-toggle-field">
+                <span>Bật module</span>
+                <input type="checkbox" id="automationModuleEnabledInput" />
+              </label>
+            </div>
+            <div class="customize-actions module-actions">
+              <button type="button" class="ghost-button card-button" id="automationModuleAddButton">Thêm cục</button>
+              <button type="button" class="ghost-button card-button" id="automationModuleDuplicateButton">Nhân bản</button>
+              <button type="button" class="ghost-button card-button" id="automationModuleMoveLeftButton">Sang trái</button>
+              <button type="button" class="ghost-button card-button" id="automationModuleMoveRightButton">Sang phải</button>
+              <button type="button" class="ghost-button card-button danger-button" id="automationModuleDeleteButton">Xóa cục</button>
+            </div>
+            <div id="automationModuleSettings" class="module-settings"></div>
+            <div class="detail-grid sidebar-detail-grid module-legacy-targets" hidden>
+              <label class="field">
+                <span>Telegram chat</span>
+                <input type="text" id="automationTelegramInput" placeholder="@review_channel hoặc chat id" />
+              </label>
+              <label class="field">
+                <span>Trello card lưu ảnh</span>
+                <input type="text" id="automationTrelloCardInput" placeholder="Card ID hoặc link card Trello" />
+              </label>
+              <label class="field">
+                <span>Trello list tạo card mới</span>
+                <input type="text" id="automationTrelloListInput" placeholder="List ID nếu muốn mỗi job tạo card mới" />
+              </label>
+            </div>
+          </section>
+
+          <section class="inspector-section" id="automationTrelloSection">
+            <div class="inspector-head">
+              <p class="eyebrow">Trello storage</p>
+              <span class="status-pill" id="automationTrelloStatus">Chưa lưu</span>
+            </div>
+            <label class="field">
+              <span>Trello API key</span>
+              <input type="password" id="automationTrelloKeyInput" autocomplete="off" placeholder="Dán API key Trello" />
+            </label>
+            <label class="field">
+              <span>Trello token</span>
+              <input type="password" id="automationTrelloTokenInput" autocomplete="off" placeholder="Dán token Trello" />
+            </label>
+            <label class="field">
+              <span>Cách lưu ảnh</span>
+              <select id="automationTrelloUploadMode">
+                <option value="file">Upload file thật lên Trello</option>
+                <option value="url">Chỉ attach link ảnh</option>
+              </select>
+            </label>
+            <div class="customize-actions trello-actions">
+              <button type="button" class="ghost-button card-button" id="automationTrelloSaveButton">Lưu Trello</button>
+              <button type="button" class="ghost-button card-button" id="automationTrelloClearButton">Xóa key/token</button>
+            </div>
+          </section>
+
+          <section class="inspector-section" id="automationAppIntegrationsSection">
+            <div class="inspector-head">
+              <p class="eyebrow">App integrations</p>
+              <span class="status-pill" id="automationEnvStatus">Chưa lưu</span>
+            </div>
+            <label class="field">
+              <span>Gemini API key tuỳ chọn</span>
+              <input type="password" id="automationGeminiKeyInput" autocomplete="off" placeholder="Không cần nếu chỉ dùng Flow account" />
+            </label>
+            <label class="field">
+              <span>Model nâng prompt tuỳ chọn</span>
+              <input type="text" id="automationGeminiModelInput" placeholder="gemini-2.5-flash" />
+            </label>
+            <label class="field">
+              <span>Telegram bot token</span>
+              <input type="password" id="automationTelegramTokenInput" autocomplete="off" placeholder="Dán token bot Telegram" />
+            </label>
+            <label class="field">
+              <span>Playwright browser path</span>
+              <input type="text" id="automationPlaywrightPathInput" placeholder="Để trống để app tự chọn, hoặc dán thư mục Playwright" />
+            </label>
+            <div class="customize-actions trello-actions">
+              <button type="button" class="ghost-button card-button" id="automationEnvSaveButton">Lưu app</button>
+              <button type="button" class="ghost-button card-button" id="automationEnvClearButton">Xóa secret</button>
+            </div>
+          </section>
+
+          <section class="inspector-section">
+            <p class="eyebrow">Tùy biến người dùng</p>
+            <label class="field">
+              <span>Nhãn nhỏ</span>
+              <input type="text" id="automationAppEyebrowInput" placeholder="Flow v2" />
+            </label>
+            <label class="field">
+              <span>Tên app / scenario</span>
+              <input type="text" id="automationAppTitleInput" placeholder="Flow v2" />
+            </label>
+            <label class="field">
+              <span>Mô tả trên thanh đầu</span>
+              <textarea id="automationAppSubtitleInput" rows="2" placeholder="Nhập prompt rồi Flow tạo ảnh, Telegram duyệt."></textarea>
+            </label>
+            <label class="field">
+              <span>Nguồn prompt cụ thể</span>
+              <small>Dùng Prompt source phía trên để dán sheet, upload file hoặc paste bảng. Export/import vẫn giữ cấu hình nguồn này.</small>
+            </label>
+            <label class="field color-field">
+              <span>Màu chủ đạo</span>
+              <input type="color" id="automationAccentInput" value="#7c2ee6" />
+            </label>
+            <div class="customize-actions">
+              <button type="button" class="ghost-button card-button" id="automationExportButton">Export</button>
+              <button type="button" class="ghost-button card-button" id="automationImportButton">Import</button>
+              <button type="button" class="ghost-button card-button" id="automationResetButton">Reset</button>
+              <input type="file" id="automationImportFile" accept="application/json,.json" hidden />
+            </div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="inspector-head">
+              <p class="eyebrow">Currently running</p>
+              <span class="status-pill" id="automationRunningStatus">No execution</span>
+            </div>
+            <div id="automationHistory" class="automation-history">
+              Chưa có lượt chạy ảnh nào.
+            </div>
+          </section>
+        </aside>
+      </section>
 
       <section class="setup-panel" id="setupPanel" hidden>
         <div class="section-head">
@@ -95,7 +441,7 @@
 
       </section>
 
-      <main class="main-stack">
+      <main class="main-stack legacy-studio" hidden aria-hidden="true">
         <section class="studio-card">
           <div class="studio-aura" aria-hidden="true"></div>
           <div class="studio-shell">
@@ -463,6 +809,6 @@
         </section>
       </main>
     </div>
-    <script type="module" src="/static/app.js?v=20260414e"></script>
+    <script type="module" src="/static/app.js?v=20260514a"></script>
   </body>
 </html>

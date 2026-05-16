@@ -8,6 +8,9 @@ __pycache__/
 *.pyc
 flow_web_ui.egg-info/
 dist/
+output/
+outputs/
+.DS_Store
 data/uploads/*
 data/downloads/*
 data/state.json

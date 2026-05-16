@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import ctypes
+import io
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
@@ -13,17 +16,19 @@ import subprocess
 import time
 import unicodedata
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List
+from xml.etree import ElementTree as ET
 
 from fastapi import HTTPException, UploadFile
 
 from .messages import humanize_flow_error
-from .paths import DOWNLOADS_DIR, UPLOADS_DIR, ensure_app_dirs
+from .paths import DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
 from .schemas import (
     AppConfig,
     ArtifactOpenRequest,
@@ -35,6 +40,8 @@ from .schemas import (
     ConfigUpdateRequest,
     CreateJobRequest,
     DownloadRequest,
+    IntegrationConfig,
+    IntegrationConfigUpdateRequest,
     InterruptedReplayGroup,
     InterruptedReplayItem,
     InterruptedReplayPack,
@@ -47,6 +54,8 @@ from .schemas import (
     OutputShelfItem,
     OutputShelfSnapshot,
     PromptAssistantSnapshot,
+    PromptBatchItemRequest,
+    PromptBatchRequest,
     PromptCreateRequest,
     ProjectEntry,
     ReplayCleanupRequest,
@@ -56,6 +65,8 @@ from .schemas import (
     SkillRecord,
     StoryboardPlanRequest,
     StoryboardScene,
+    TrelloConfig,
+    TrelloConfigUpdateRequest,
     WorkspaceJobCounts,
     WorkspaceSnapshot,
     canonical_project_url,
@@ -93,6 +104,7 @@ class FlowWebService:
     CLEANUP_UPLOAD_GRACE_HOURS = 2
     CLEANUP_DOWNLOAD_RETENTION_DAYS = 7
     CLEANUP_HISTORY_RETENTION_DAYS = 14
+    MAX_PROMPT_BATCH_ITEMS = 40
     SKILL_TEXT_EXTENSIONS = {".sh", ".md", ".txt", ".skill", ".cfg", ".ini", ".env"}
     MEDIA_SKILL_REPO = "inference-sh/skills"
     MEDIA_SKILL_SOURCE_URL = "https://github.com/inference-sh/skills"
@@ -100,6 +112,10 @@ class FlowWebService:
     GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
     GEMINI_TIMEOUT_S = 30
+    TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
+    TELEGRAM_TIMEOUT_S = 20
+    TRELLO_API_BASE_URL = "https://api.trello.com/1"
+    TRELLO_TIMEOUT_S = 30
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
     DEFAULT_IMAGE_MODEL = "NARWHAL"
     IMAGE_MODEL_LABELS = {
@@ -215,8 +231,11 @@ class FlowWebService:
     def __init__(self, store: StateStore) -> None:
         ensure_app_dirs()
         self.store = store
+        self._apply_runtime_integration_env()
         self._tasks: Dict[str, asyncio.Task] = {}
         self._browser_session_lock = asyncio.Lock()
+        self._telegram_approval_sync_lock = asyncio.Lock()
+        self._last_telegram_approval_sync_error = ""
         self._shared_browser: Any | None = None
 
     async def close(self) -> None:
@@ -244,6 +263,8 @@ class FlowWebService:
             **base_state,
             "projects": projects,
             "auth": auth,
+            "integrations": self._integration_config_snapshot(snapshot.integration_config),
+            "trello": self._trello_config_snapshot(snapshot.trello_config),
             "workspace": workspace,
             "output_shelf": output_shelf,
             "replay_pack": replay_pack,
@@ -285,6 +306,385 @@ class FlowWebService:
         config = self._normalized_config(config)
         self._sync_project_to_flow_storage(config)
         return config
+
+    async def update_integration_config(self, request: IntegrationConfigUpdateRequest) -> Dict[str, Any]:
+        current = self.store.snapshot().integration_config
+
+        gemini_api_key = request.gemini_api_key.strip()
+        telegram_bot_token = request.telegram_bot_token.strip()
+        if not request.clear_gemini_api_key:
+            gemini_api_key = gemini_api_key or current.gemini_api_key
+        if not request.clear_telegram_bot_token:
+            telegram_bot_token = telegram_bot_token or current.telegram_bot_token
+
+        gemini_model = self._sanitize_gemini_model(request.gemini_model or current.gemini_model or self.GEMINI_DEFAULT_MODEL)
+        config = IntegrationConfig(
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=request.telegram_chat_id.strip(),
+            playwright_browsers_path=request.playwright_browsers_path.strip(),
+            updated_at=utc_now(),
+        )
+        saved = await self.store.replace_integration_config(config)
+        self._apply_runtime_integration_env(saved)
+        return self._integration_config_snapshot(saved)
+
+    def _integration_config_snapshot(self, config: IntegrationConfig) -> Dict[str, Any]:
+        gemini_api_key = str(config.gemini_api_key or "").strip()
+        telegram_bot_token = str(config.telegram_bot_token or "").strip()
+        gemini_model = self._sanitize_gemini_model(config.gemini_model or self.GEMINI_DEFAULT_MODEL)
+        telegram_chat_id = str(config.telegram_chat_id or "").strip()
+        playwright_browsers_path = str(config.playwright_browsers_path or "").strip()
+        runtime_playwright_path = playwright_browsers_path or os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        return {
+            "gemini": {
+                "configured": bool(gemini_api_key),
+                "api_key_saved": bool(gemini_api_key),
+                "model": gemini_model,
+            },
+            "telegram": {
+                "configured": bool(telegram_bot_token and telegram_chat_id),
+                "bot_token_saved": bool(telegram_bot_token),
+                "chat_id": telegram_chat_id,
+            },
+            "runtime": {
+                "playwright_browsers_path": runtime_playwright_path,
+                "playwright_browsers_path_set": bool(runtime_playwright_path),
+            },
+            "updated_at": config.updated_at,
+        }
+
+    async def update_trello_config(self, request: TrelloConfigUpdateRequest) -> Dict[str, Any]:
+        current = self.store.snapshot().trello_config
+        api_key = request.api_key.strip()
+        token = request.token.strip()
+        if not request.clear_credentials:
+            api_key = api_key or current.api_key
+            token = token or current.token
+
+        upload_mode = request.upload_mode.strip().lower() or current.upload_mode or "file"
+        if upload_mode not in {"file", "url"}:
+            upload_mode = "file"
+
+        config = TrelloConfig(
+            api_key=api_key,
+            token=token,
+            card_id=self._normalize_trello_card_id(request.card_id),
+            list_id=self._normalize_trello_id(request.list_id),
+            upload_mode=upload_mode,
+            set_cover=request.set_cover,
+            updated_at=utc_now(),
+        )
+        saved = await self.store.replace_trello_config(config)
+        return self._trello_config_snapshot(saved)
+
+    def _trello_config_snapshot(self, config: TrelloConfig) -> Dict[str, Any]:
+        api_key = str(config.api_key or "").strip()
+        token = str(config.token or "").strip()
+        card_id = self._normalize_trello_card_id(config.card_id)
+        list_id = self._normalize_trello_id(config.list_id)
+        upload_mode = str(config.upload_mode or "file").strip().lower()
+        if upload_mode not in {"file", "url"}:
+            upload_mode = "file"
+        return {
+            "configured": bool(api_key and token and (card_id or list_id)),
+            "credentials_saved": bool(api_key and token),
+            "api_key_saved": bool(api_key),
+            "token_saved": bool(token),
+            "card_id": card_id,
+            "list_id": list_id,
+            "upload_mode": upload_mode,
+            "set_cover": config.set_cover is not False,
+            "updated_at": config.updated_at,
+        }
+
+    async def preview_prompt_source(
+        self,
+        *,
+        file: UploadFile | None = None,
+        text: str = "",
+        source_url: str = "",
+    ) -> Dict[str, Any]:
+        source_url = str(source_url or "").strip()
+        text = str(text or "").strip()
+        rows: List[Dict[str, str]] = []
+        source_label = ""
+
+        if file is not None and str(file.filename or "").strip():
+            source_label = str(file.filename or "").strip()
+            payload = await file.read()
+            rows = self._parse_prompt_source_bytes(source_label, payload)
+        elif text:
+            source_label = "pasted table"
+            rows = self._parse_delimited_prompt_table(text)
+        elif source_url:
+            source_label = source_url
+            rows = self._load_prompt_source_url(source_url)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Hãy dán link Google Sheet, upload file .xlsx/.csv hoặc paste bảng từ Google Sheets.",
+            )
+
+        return self._prompt_source_preview_payload(rows, source_label)
+
+    def _parse_prompt_source_bytes(self, file_name: str, payload: bytes) -> List[Dict[str, str]]:
+        suffix = Path(str(file_name or "").lower()).suffix
+        if suffix == ".xlsx":
+            return self._parse_xlsx_prompt_table(payload)
+        if suffix in {".csv", ".tsv", ".txt"}:
+            text = self._decode_table_bytes(payload)
+            return self._parse_delimited_prompt_table(text)
+        raise HTTPException(status_code=400, detail="App hiện hỗ trợ file .xlsx, .csv, .tsv hoặc bảng copy từ Google Sheets.")
+
+    def _load_prompt_source_url(self, source_url: str) -> List[Dict[str, str]]:
+        csv_url = self._google_sheet_csv_url(source_url) or source_url
+        request = Request(csv_url, headers={"User-Agent": "Flow-Web-UI/1.0"})
+        try:
+            with urlopen(request, timeout=20) as response:
+                payload = response.read()
+                content_type = str(response.headers.get("content-type") or "").lower()
+        except HTTPError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Không đọc được Google Sheet/CSV (HTTP {exc.code}). Nếu sheet đang riêng tư, hãy tải .xlsx rồi upload vào app.",
+            ) from exc
+        except URLError as exc:
+            raise HTTPException(status_code=400, detail=f"Không đọc được link sheet: {exc.reason}") from exc
+
+        if "html" in content_type:
+            raise HTTPException(
+                status_code=400,
+                detail="Link này trả về HTML chứ không phải CSV. Nếu Google Sheet đang riêng tư, hãy tải .xlsx rồi upload vào app.",
+            )
+        return self._parse_delimited_prompt_table(self._decode_table_bytes(payload))
+
+    def _google_sheet_csv_url(self, source_url: str) -> str:
+        parsed = urlparse(str(source_url or "").strip())
+        if "docs.google.com" not in parsed.netloc or "/spreadsheets/d/" not in parsed.path:
+            return ""
+        sheet_id = parsed.path.split("/spreadsheets/d/", 1)[1].split("/", 1)[0].strip()
+        if not sheet_id:
+            return ""
+        query = dict(item.split("=", 1) for item in parsed.query.split("&") if "=" in item)
+        gid = query.get("gid", "0") or "0"
+        return f"https://docs.google.com/spreadsheets/d/{quote(sheet_id, safe='')}/export?format=csv&gid={quote(gid, safe='')}"
+
+    def _decode_table_bytes(self, payload: bytes) -> str:
+        for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "latin-1"):
+            try:
+                return payload.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return payload.decode("utf-8", errors="replace")
+
+    def _parse_delimited_prompt_table(self, text: str) -> List[Dict[str, str]]:
+        rows_text = [line for line in str(text or "").splitlines() if line.strip()]
+        if not rows_text:
+            return []
+        sample = "\n".join(rows_text[:8])
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters="\t,;")
+        except csv.Error:
+            dialect = csv.excel_tab if sample.count("\t") >= sample.count(",") else csv.excel
+        reader = csv.reader(rows_text, dialect)
+        return self._table_rows_to_dicts([list(row) for row in reader])
+
+    def _parse_xlsx_prompt_table(self, payload: bytes) -> List[Dict[str, str]]:
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(payload))
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail="File .xlsx không hợp lệ.") from exc
+        with archive:
+            sheet_path = self._xlsx_first_sheet_path(archive)
+            shared_strings = self._xlsx_shared_strings(archive)
+            try:
+                root = ET.fromstring(archive.read(sheet_path))
+            except KeyError as exc:
+                raise HTTPException(status_code=400, detail="Không đọc được sheet đầu tiên trong file .xlsx.") from exc
+            matrix: List[List[str]] = []
+            for row in root.findall(".//{*}sheetData/{*}row"):
+                values: Dict[int, str] = {}
+                for cell in row.findall("{*}c"):
+                    ref = str(cell.attrib.get("r") or "")
+                    column_index = self._xlsx_column_index(ref)
+                    if column_index < 0:
+                        column_index = len(values)
+                    values[column_index] = self._xlsx_cell_value(cell, shared_strings)
+                if not values:
+                    continue
+                width = max(values) + 1
+                matrix.append([values.get(index, "") for index in range(width)])
+            return self._table_rows_to_dicts(matrix)
+
+    def _xlsx_first_sheet_path(self, archive: zipfile.ZipFile) -> str:
+        try:
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            first_sheet = workbook.find(".//{*}sheets/{*}sheet")
+            rel_id = str(first_sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id") or "") if first_sheet is not None else ""
+            relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            for relationship in relationships.findall("{*}Relationship"):
+                if relationship.attrib.get("Id") != rel_id:
+                    continue
+                target = str(relationship.attrib.get("Target") or "worksheets/sheet1.xml").lstrip("/")
+                return target if target.startswith("xl/") else f"xl/{target}"
+        except Exception:
+            pass
+        return "xl/worksheets/sheet1.xml"
+
+    def _xlsx_shared_strings(self, archive: zipfile.ZipFile) -> List[str]:
+        try:
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+        except KeyError:
+            return []
+        values: List[str] = []
+        for item in root.findall("{*}si"):
+            texts = [node.text or "" for node in item.findall(".//{*}t")]
+            values.append("".join(texts))
+        return values
+
+    def _xlsx_column_index(self, cell_ref: str) -> int:
+        letters = re.sub(r"[^A-Za-z]", "", str(cell_ref or "")).upper()
+        if not letters:
+            return -1
+        value = 0
+        for letter in letters:
+            value = value * 26 + (ord(letter) - ord("A") + 1)
+        return value - 1
+
+    def _xlsx_cell_value(self, cell: ET.Element, shared_strings: List[str]) -> str:
+        cell_type = str(cell.attrib.get("t") or "")
+        if cell_type == "inlineStr":
+            return "".join(node.text or "" for node in cell.findall(".//{*}is/{*}t")).strip()
+        value = cell.find("{*}v")
+        raw = str(value.text or "") if value is not None else ""
+        if cell_type == "s":
+            try:
+                return shared_strings[int(raw)].strip()
+            except Exception:
+                return ""
+        if cell_type == "b":
+            return "TRUE" if raw == "1" else "FALSE"
+        return raw.strip()
+
+    def _table_rows_to_dicts(self, matrix: List[List[str]]) -> List[Dict[str, str]]:
+        cleaned = [[str(cell or "").strip() for cell in row] for row in matrix if any(str(cell or "").strip() for cell in row)]
+        if not cleaned:
+            return []
+        header_index = 0
+        for index, row in enumerate(cleaned[:20]):
+            normalized = {self._normalize_prompt_source_header(cell) for cell in row}
+            if {"promptcontent", "prompt", "content"} & normalized:
+                header_index = index
+                break
+        headers = cleaned[header_index]
+        rows: List[Dict[str, str]] = []
+        for raw_row in cleaned[header_index + 1:]:
+            item: Dict[str, str] = {}
+            for index, header in enumerate(headers):
+                key = header or f"Column_{index + 1}"
+                item[key] = raw_row[index] if index < len(raw_row) else ""
+            if any(value for value in item.values()):
+                rows.append(item)
+        return rows
+
+    def _prompt_source_preview_payload(self, rows: List[Dict[str, str]], source_label: str) -> Dict[str, Any]:
+        columns = list(rows[0].keys()) if rows else []
+        prompt_column = self._find_prompt_source_column(columns, {"promptcontent", "prompt", "content"})
+        active_column = self._find_prompt_source_column(columns, {"active", "enabled", "use", "run"})
+        product_column = self._find_prompt_source_column(columns, {"productname"}) or self._find_prompt_source_column(
+            columns,
+            {"productkey", "product"},
+        )
+        index_column = self._find_prompt_source_column(columns, {"promptindex", "index", "stt"})
+        notes_column = self._find_prompt_source_column(columns, {"notes", "note", "ghichu"})
+
+        if not prompt_column:
+            raise HTTPException(
+                status_code=400,
+                detail="Không thấy cột prompt. Hãy đặt tên cột là Prompt_Content hoặc Prompt rồi thử lại.",
+            )
+
+        prompts: List[Dict[str, Any]] = []
+        for row_number, row in enumerate(rows, start=2):
+            prompt = str(row.get(prompt_column) or "").strip()
+            if not prompt:
+                continue
+            active = True if not active_column else self._truthy_sheet_value(row.get(active_column, ""))
+            prompts.append(
+                {
+                    "row": row_number,
+                    "active": active,
+                    "prompt": prompt,
+                    "product": str(row.get(product_column) or "").strip() if product_column else "",
+                    "index": str(row.get(index_column) or "").strip() if index_column else "",
+                    "notes": str(row.get(notes_column) or "").strip() if notes_column else "",
+                }
+            )
+
+        active_prompts = [item for item in prompts if item["active"]]
+        selected = active_prompts[0] if active_prompts else prompts[0] if prompts else {}
+        prompt = str(selected.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="File/bảng này chưa có prompt nào dùng được.")
+
+        preview = []
+        for item in (active_prompts or prompts)[:8]:
+            text = str(item.get("prompt") or "")
+            preview.append(
+                {
+                    **item,
+                    "prompt": text if len(text) <= 220 else f"{text[:217]}...",
+                }
+            )
+
+        return {
+            "source": source_label,
+            "columns": columns,
+            "row_count": len(rows),
+            "prompt_count": len(prompts),
+            "active_count": len(active_prompts),
+            "prompt": prompt,
+            "selected": selected,
+            "items": active_prompts or prompts,
+            "preview": preview,
+        }
+
+    def _find_prompt_source_column(self, columns: List[str], candidates: set[str]) -> str:
+        for column in columns:
+            if self._normalize_prompt_source_header(column) in candidates:
+                return column
+        return ""
+
+    def _normalize_prompt_source_header(self, value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+        return re.sub(r"[^a-z0-9]+", "", normalized.lower())
+
+    def _truthy_sheet_value(self, value: str) -> bool:
+        normalized = self._normalize_prompt_source_header(value)
+        return normalized in {"true", "1", "yes", "y", "active", "on", "x", "co", "yesrun"}
+
+    def _apply_runtime_integration_env(self, config: IntegrationConfig | None = None) -> None:
+        current = config or self.store.snapshot().integration_config
+        playwright_path = str(current.playwright_browsers_path or "").strip()
+        if playwright_path:
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = playwright_path
+            return
+        if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+            return
+        local_path = PROJECT_ROOT / ".pw-browsers"
+        if self._playwright_browsers_installed(local_path):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(local_path)
+
+    def _playwright_browsers_installed(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        executable_names = {"chrome", "Chromium", "chrome.exe", "Google Chrome for Testing", "chrome-headless-shell"}
+        try:
+            return any(candidate.is_file() and candidate.name in executable_names for candidate in path.rglob("*"))
+        except OSError:
+            return False
 
     def get_auth_status(self) -> AuthStatus:
         _, is_authenticated, _, _, _ = self._flow_modules()
@@ -1037,17 +1437,111 @@ class FlowWebService:
                     "primary_media_id": getattr(workflow, "primary_media_id", ""),
                     "batch_id": getattr(workflow, "batch_id", ""),
                     "project_id": getattr(workflow, "project_id", ""),
+                    "media_count": len(getattr(workflow, "medias", []) or []),
+                    "media_preview": [
+                        self._workflow_media_preview(media)
+                        for media in (getattr(workflow, "medias", []) or [])[:3]
+                        if isinstance(media, dict)
+                    ],
                 }
                 for workflow in workflows
             ]
 
         return await self._with_client(_go)
 
+    def _workflow_media_preview(self, media: Dict[str, Any]) -> Dict[str, Any]:
+        image = (media.get("image") or {}).get("generatedImage") or {}
+        video = (media.get("video") or {}).get("encodedVideo") or {}
+        return {
+            "name": str(media.get("name") or media.get("mediaName") or "").strip(),
+            "keys": sorted(str(key) for key in media.keys())[:20],
+            "image_keys": sorted(str(key) for key in image.keys())[:20],
+            "video_keys": sorted(str(key) for key in video.keys())[:20],
+            "has_image_url": bool(image.get("fifeUrl") or image.get("url") or media.get("fifeUrl")),
+            "has_video_url": bool(video.get("fifeUrl") or video.get("url") or media.get("fifeUrl")),
+            "raw_excerpt": json.dumps(media, ensure_ascii=False, default=str)[:1200],
+        }
+
+    async def get_project_debug(self) -> Dict[str, Any]:
+        async def _go(client: Any) -> Dict[str, Any]:
+            project_data = await client._api.get_project_data()
+            return self._project_debug_payload(project_data)
+
+        return await self._with_client(_go)
+
+    def _project_debug_payload(self, project_data: Dict[str, Any]) -> Dict[str, Any]:
+        project_contents = project_data.get("projectContents", {}) if isinstance(project_data, dict) else {}
+        workflows = project_contents.get("workflows", []) if isinstance(project_contents, dict) else []
+        media_collection = project_contents.get("media") if isinstance(project_contents, dict) else None
+        if isinstance(media_collection, dict):
+            media_items = [item for item in media_collection.values() if isinstance(item, dict)]
+        elif isinstance(media_collection, list):
+            media_items = [item for item in media_collection if isinstance(item, dict)]
+        else:
+            media_items = []
+        samples: List[Dict[str, Any]] = []
+
+        def visit(value: Any, path: str = "$") -> None:
+            if len(samples) >= 30:
+                return
+            if isinstance(value, dict):
+                keys = set(value.keys())
+                interesting = (
+                    {"media", "medias", "mediaId", "mediaName", "primaryMediaId", "fifeUrl", "generatedImage", "image"}
+                    & keys
+                )
+                if interesting:
+                    samples.append(
+                        {
+                            "path": path,
+                            "keys": sorted(str(key) for key in value.keys())[:40],
+                            "excerpt": json.dumps(value, ensure_ascii=False, default=str)[:1800],
+                        }
+                    )
+                for key, child in value.items():
+                    visit(child, f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value[:20]):
+                    visit(child, f"{path}[{index}]")
+
+        visit(project_data)
+        sorted_workflows = sorted(
+            [item for item in workflows if isinstance(item, dict)],
+            key=lambda item: str((item.get("metadata") or {}).get("createTime") or ""),
+            reverse=True,
+        )
+        return {
+            "top_keys": sorted(str(key) for key in project_data.keys()) if isinstance(project_data, dict) else [],
+            "project_contents_keys": sorted(str(key) for key in project_contents.keys()) if isinstance(project_contents, dict) else [],
+            "workflow_count": len(workflows or []),
+            "media_collection_type": type(media_collection).__name__,
+            "media_count": len(media_items),
+            "latest_media": [self._workflow_media_preview(media) for media in media_items[:10]],
+            "latest_workflows": [
+                {
+                    "name": str(workflow.get("name") or ""),
+                    "metadata": workflow.get("metadata", {}),
+                    "project_id": str(workflow.get("projectId") or ""),
+                    "keys": sorted(str(key) for key in workflow.keys()),
+                }
+                for workflow in sorted_workflows[:5]
+            ],
+            "samples": samples,
+        }
+
     async def get_model_config(self) -> Dict[str, Any]:
         async def _go(client: Any) -> Dict[str, Any]:
             return await client.get_model_config()
 
-        return await self._with_client(_go)
+        try:
+            return await self._with_client(_go)
+        except Exception as exc:
+            logging.warning("Falling back to bundled model options after Flow model config failed: %s", exc)
+            return {
+                "result": {"videoModels": []},
+                "fallback": True,
+                "error": humanize_flow_error(str(exc)),
+            }
 
     async def save_upload(self, upload: UploadFile) -> Dict[str, str]:
         ensure_app_dirs()
@@ -1114,6 +1608,169 @@ class FlowWebService:
             await self.store.append_log(job.id, policy_notice)
         self._tasks[job.id] = asyncio.create_task(self._run_flow_job(job.id, request))
         return job
+
+    async def enqueue_prompt_batch(self, request: PromptBatchRequest) -> JobRecord:
+        config = self._normalized_config(self.store.snapshot().config)
+        if not config.project_id:
+            raise HTTPException(status_code=400, detail="Vui lòng lưu mã project trước.")
+        if not self.get_auth_status().authenticated:
+            raise HTTPException(
+                status_code=400,
+                detail="Cần đăng nhập Google Flow trước khi chạy batch prompt từ sheet.",
+            )
+
+        base_request = self._resolve_job_request(request.job, config)
+        if base_request.type != "image":
+            raise HTTPException(status_code=400, detail="Batch prompt từ sheet hiện chỉ hỗ trợ tạo ảnh.")
+
+        limit = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(request.limit or self.MAX_PROMPT_BATCH_ITEMS)))
+        items = self._prompt_batch_items(request.items, limit)
+        if not items:
+            raise HTTPException(status_code=400, detail="Sheet chưa có dòng Active=TRUE nào có prompt để chạy.")
+
+        validation_payload = _model_dump(base_request)
+        validation_payload["prompt"] = items[0]["prompt"]
+        self._validate_job_request(CreateJobRequest(**validation_payload))
+
+        title = str(request.title or "").strip() or f"Chạy batch {len(items)} prompt từ sheet"
+        batch_job = JobRecord(
+            type="batch_image",
+            status="queued",
+            title=title,
+            input={
+                "type": "batch_image",
+                "total": len(items),
+                "limit": limit,
+                "job": _model_dump(base_request),
+                "items": items,
+            },
+            result={"total": len(items), "completed": 0, "failed": 0, "child_job_ids": []},
+        )
+        await self.store.add_job(batch_job)
+        self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
+        return batch_job
+
+    def _prompt_batch_items(self, items: List[PromptBatchItemRequest], limit: int) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for item in items or []:
+            prompt = str(item.prompt or "").strip()
+            if not prompt or item.active is False:
+                continue
+            normalized.append(
+                {
+                    "row": int(item.row or 0),
+                    "active": True,
+                    "prompt": prompt,
+                    "product": str(item.product or "").strip(),
+                    "index": str(item.index or "").strip(),
+                    "notes": str(item.notes or "").strip(),
+                }
+            )
+            if len(normalized) >= limit:
+                break
+        return normalized
+
+    def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
+        label = str(item.get("product") or "").strip() or f"Prompt dòng {item.get('row') or index + 1}"
+        prompt_index = str(item.get("index") or "").strip()
+        suffix = f" #{prompt_index}" if prompt_index else ""
+        return f"Sheet {index + 1}/{total} · {label}{suffix}"[:120]
+
+    def _prompt_batch_child_request(self, base_request: CreateJobRequest, item: Dict[str, Any], index: int, total: int) -> CreateJobRequest:
+        payload = _model_dump(base_request)
+        payload["prompt"] = str(item.get("prompt") or "").strip()
+        payload["title"] = self._prompt_batch_child_title(item, index, total)
+        payload["source_job_id"] = ""
+        return CreateJobRequest(**payload)
+
+    async def _patch_prompt_batch_result(
+        self,
+        batch_id: str,
+        *,
+        total: int,
+        child_job_ids: List[str],
+        completed: int,
+        failed: int,
+        current_index: int = 0,
+        current_child_job_id: str = "",
+    ) -> None:
+        await self.store.patch_job(
+            batch_id,
+            result={
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+                "remaining": max(0, total - completed - failed),
+                "child_job_ids": child_job_ids,
+                "current_index": current_index,
+                "current_child_job_id": current_child_job_id,
+            },
+        )
+
+    async def _run_prompt_batch(self, batch_id: str, base_request: CreateJobRequest, items: List[Dict[str, Any]]) -> None:
+        total = len(items)
+        child_job_ids: List[str] = []
+        completed = 0
+        failed = 0
+        await self.store.patch_job(batch_id, status="running")
+        await self.store.append_log(batch_id, f"Bắt đầu vòng lặp {total} prompt active từ sheet.")
+
+        try:
+            for index, item in enumerate(items):
+                child_request = self._prompt_batch_child_request(base_request, item, index, total)
+                self._validate_job_request(child_request)
+                child_job = JobRecord(
+                    type="image",
+                    status="queued",
+                    title=child_request.title or self._default_title(child_request),
+                    input=_model_dump(child_request),
+                )
+                await self.store.add_job(child_job)
+                child_job_ids.append(child_job.id)
+                await self._patch_prompt_batch_result(
+                    batch_id,
+                    total=total,
+                    child_job_ids=child_job_ids,
+                    completed=completed,
+                    failed=failed,
+                    current_index=index + 1,
+                    current_child_job_id=child_job.id,
+                )
+                await self.store.set_progress_hint(
+                    batch_id,
+                    stage="sending_request",
+                    detail=f"Đang chạy prompt {index + 1}/{total}: {child_request.title}",
+                )
+                await self.store.append_log(batch_id, f"Đang chạy prompt {index + 1}/{total}: {child_request.title}")
+
+                await self._run_flow_job(child_job.id, child_request)
+                saved_child = self.store.get_job(child_job.id)
+                if saved_child is not None and saved_child.status == "completed":
+                    completed += 1
+                    await self.store.append_log(batch_id, f"Prompt {index + 1}/{total} đã tạo ảnh và gửi qua các module sau Flow.")
+                else:
+                    failed += 1
+                    detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
+                    await self.store.append_log(batch_id, f"Prompt {index + 1}/{total} bị lỗi: {detail}")
+
+                await self._patch_prompt_batch_result(
+                    batch_id,
+                    total=total,
+                    child_job_ids=child_job_ids,
+                    completed=completed,
+                    failed=failed,
+                    current_index=index + 1,
+                    current_child_job_id="",
+                )
+
+            final_status = "failed" if failed == total else "completed"
+            error = f"{failed}/{total} prompt bị lỗi trong batch." if failed == total else ""
+            await self.store.patch_job(batch_id, status=final_status, error=error)
+            await self.store.append_log(batch_id, f"Batch sheet hoàn tất: {completed} xong, {failed} lỗi.")
+        except Exception as exc:
+            detail = self._flow_error_detail(exc)
+            await self.store.patch_job(batch_id, status="failed", error=detail)
+            await self.store.append_log(batch_id, f"Batch sheet thất bại: {detail}")
 
     async def create_skill(self, request: SkillCreateRequest) -> SkillRecord:
         fields_set = self._fields_set(request)
@@ -1223,6 +1880,9 @@ class FlowWebService:
         }
 
     def _gemini_api_key(self) -> str:
+        configured = str(self.store.snapshot().integration_config.gemini_api_key or "").strip()
+        if configured:
+            return configured
         for key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"):
             value = str(os.getenv(key_name, "")).strip()
             if value:
@@ -1230,7 +1890,12 @@ class FlowWebService:
         return ""
 
     def _gemini_model(self) -> str:
-        raw = str(os.getenv("GEMINI_MODEL", self.GEMINI_DEFAULT_MODEL)).strip()
+        configured = str(self.store.snapshot().integration_config.gemini_model or "").strip()
+        raw = configured or str(os.getenv("GEMINI_MODEL", self.GEMINI_DEFAULT_MODEL)).strip()
+        return self._sanitize_gemini_model(raw)
+
+    def _sanitize_gemini_model(self, value: str) -> str:
+        raw = str(value or self.GEMINI_DEFAULT_MODEL).strip()
         sanitized = re.sub(r"[^a-zA-Z0-9._-]+", "", raw)
         return sanitized or self.GEMINI_DEFAULT_MODEL
 
@@ -2706,8 +3371,687 @@ exit 1
         except Exception:
             return
 
+    def _automation_graph_payload(self, request: CreateJobRequest) -> Dict[str, Any]:
+        graph = _model_dump(request.automation_graph)
+        raw_modules = graph.get("modules") if isinstance(graph, dict) else []
+        modules: List[Dict[str, Any]] = []
+        for index, raw_module in enumerate(raw_modules or []):
+            module = raw_module if isinstance(raw_module, dict) else {}
+            module_type = re.sub(r"[^a-z0-9_]+", "", str(module.get("type") or "custom").strip().lower()) or "custom"
+            module_id = str(module.get("id") or f"{module_type}_{index + 1}").strip() or f"{module_type}_{index + 1}"
+            title = str(module.get("title") or self._automation_module_default_title(module_type)).strip()
+            detail = str(module.get("detail") or "").strip()
+            settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+            modules.append(
+                {
+                    "id": module_id,
+                    "type": module_type,
+                    "title": title,
+                    "detail": detail,
+                    "enabled": module.get("enabled") is not False,
+                    "settings": settings,
+                    "index": index,
+                }
+            )
+
+        if not modules:
+            modules = [
+                {
+                    "id": "flow",
+                    "type": "flow",
+                    "title": self._automation_module_default_title("flow"),
+                    "detail": "Tạo artifact bằng Google Flow",
+                    "enabled": True,
+                    "settings": {},
+                    "index": 0,
+                }
+            ]
+            if request.type == "image" and request.telegram_enabled:
+                modules.append(
+                    {
+                        "id": "telegram",
+                        "type": "telegram",
+                        "title": self._automation_module_default_title("telegram"),
+                        "detail": "Gửi ảnh để duyệt",
+                        "enabled": True,
+                        "settings": {},
+                        "index": 1,
+                    }
+                )
+            if request.type == "image" and request.trello_enabled:
+                modules.append(
+                    {
+                        "id": "trello",
+                        "type": "trello",
+                        "title": self._automation_module_default_title("trello"),
+                        "detail": "Lưu ảnh vào Trello",
+                        "enabled": True,
+                        "settings": {},
+                        "index": 2,
+                    }
+                )
+
+        raw_edges = graph.get("edges") if isinstance(graph, dict) else []
+        edges = [
+            {
+                "source": str(edge.get("source") or "").strip(),
+                "target": str(edge.get("target") or "").strip(),
+                "condition": str(edge.get("condition") or "success").strip() or "success",
+            }
+            for edge in (raw_edges or [])
+            if isinstance(edge, dict) and str(edge.get("source") or "").strip() and str(edge.get("target") or "").strip()
+        ]
+        if not edges:
+            enabled = [module for module in modules if module["enabled"]]
+            edges = [
+                {
+                    "source": enabled[index]["id"],
+                    "target": enabled[index + 1]["id"],
+                    "condition": "success",
+                }
+                for index in range(max(0, len(enabled) - 1))
+            ]
+
+        return {
+            "version": int(graph.get("version") or 1) if isinstance(graph, dict) else 1,
+            "modules": modules,
+            "edges": edges,
+            "selected_module_id": str(graph.get("selected_module_id") or "").strip() if isinstance(graph, dict) else "",
+        }
+
+    def _automation_module_default_title(self, module_type: str) -> str:
+        return {
+            "source": "Prompt Source",
+            "normalize": "Normalize Prompt",
+            "flow": "Google Flow",
+            "telegram": "Telegram Review",
+            "trello": "Trello Archive",
+            "approval": "Approval",
+            "custom": "Custom Module",
+        }.get(str(module_type or "").strip().lower(), "Custom Module")
+
+    def _automation_execution_payload(self, request: CreateJobRequest) -> Dict[str, Any]:
+        graph = self._automation_graph_payload(request)
+        nodes = []
+        for module in graph["modules"]:
+            nodes.append(
+                {
+                    "id": module["id"],
+                    "type": module["type"],
+                    "title": module["title"],
+                    "detail": module["detail"],
+                    "enabled": module["enabled"],
+                    "status": "pending" if module["enabled"] else "disabled",
+                    "input": {},
+                    "output": {},
+                    "error": "",
+                    "started_at": "",
+                    "completed_at": "",
+                }
+            )
+        return {
+            "mode": "graph",
+            "version": graph["version"],
+            "nodes": nodes,
+            "edges": graph["edges"],
+            "current_module_id": "",
+            "completed": False,
+        }
+
+    async def _ensure_automation_execution(self, job_id: str, request: CreateJobRequest) -> Dict[str, Any]:
+        job = self.store.get_job(job_id)
+        result = dict(job.result or {}) if job is not None else {}
+        execution = result.get("automation_execution")
+        if not isinstance(execution, dict) or not isinstance(execution.get("nodes"), list):
+            execution = self._automation_execution_payload(request)
+            result["automation_execution"] = execution
+            await self.store.patch_job(job_id, result=result)
+        return execution
+
+    async def _set_automation_module_status(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        module_ref: str,
+        status: str,
+        *,
+        input_data: Dict[str, Any] | None = None,
+        output: Dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        await self._ensure_automation_execution(job_id, request)
+        job = self.store.get_job(job_id)
+        if job is None:
+            return
+        result = dict(job.result or {})
+        execution = dict(result.get("automation_execution") or self._automation_execution_payload(request))
+        nodes = list(execution.get("nodes") or [])
+        module_ref = str(module_ref or "").strip()
+        node = next((item for item in nodes if item.get("id") == module_ref), None)
+        if node is None:
+            node = next((item for item in nodes if item.get("type") == module_ref), None)
+        if node is None:
+            return
+
+        now = utc_now()
+        node["status"] = status
+        if input_data is not None:
+            node["input"] = input_data
+        if output is not None:
+            node["output"] = output
+        if error:
+            node["error"] = humanize_flow_error(error)
+        if status == "running" and not node.get("started_at"):
+            node["started_at"] = now
+        if status in {"completed", "skipped", "failed", "disabled"}:
+            node["completed_at"] = now
+        execution["nodes"] = nodes
+        execution["current_module_id"] = node.get("id", "") if status == "running" else execution.get("current_module_id", "")
+        if status in {"completed", "skipped", "disabled"} and execution.get("current_module_id") == node.get("id"):
+            execution["current_module_id"] = ""
+        if status == "failed":
+            execution["current_module_id"] = node.get("id", "")
+        execution["completed"] = all(
+            str(item.get("status") or "") in {"completed", "skipped", "disabled"}
+            for item in nodes
+        )
+        result["automation_execution"] = execution
+        await self.store.patch_job(job_id, result=result)
+
+    async def _fail_active_automation_module(self, job_id: str, request: CreateJobRequest, detail: str) -> None:
+        await self._ensure_automation_execution(job_id, request)
+        job = self.store.get_job(job_id)
+        execution = (job.result or {}).get("automation_execution") if job is not None else {}
+        nodes = execution.get("nodes") if isinstance(execution, dict) else []
+        active = next((node for node in nodes if node.get("status") == "running"), None)
+        module_ref = active.get("id") if active else "flow"
+        await self._set_automation_module_status(job_id, request, module_ref, "failed", error=detail)
+
+    async def _run_automation_pre_modules(self, job_id: str, request: CreateJobRequest) -> None:
+        graph = self._automation_graph_payload(request)
+        for module in graph["modules"]:
+            if not module["enabled"]:
+                continue
+            module_type = module["type"]
+            if module_type == "flow":
+                return
+            if module_type == "source":
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module["id"],
+                    "running",
+                    input_data={
+                        "source_type": module["settings"].get("sourceType") or "manual",
+                        "source_location": module["settings"].get("sourceLocation") or "",
+                    },
+                )
+                await self.store.append_log(job_id, f"Module {module['title']}: đã lấy prompt đầu vào.")
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module["id"],
+                    "completed",
+                    output={"prompt_ready": bool(str(request.prompt or "").strip()), "prompt_length": len(request.prompt or "")},
+                )
+            elif module_type == "normalize":
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module["id"],
+                    "running",
+                    input_data={"prompt_length": len(request.prompt or "")},
+                )
+                normalized_prompt = re.sub(r"\s+", " ", str(request.prompt or "")).strip()
+                await self.store.append_log(job_id, f"Module {module['title']}: prompt đã được chuẩn hóa.")
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module["id"],
+                    "completed",
+                    output={"prompt_length": len(normalized_prompt), "changed": normalized_prompt != str(request.prompt or "")},
+                )
+            elif module_type == "custom":
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module["id"],
+                    "completed",
+                    output={"note": module["settings"].get("customNote") or "Custom module không có runner nên được ghi nhận như bước no-op."},
+                )
+
+    def _request_with_automation_module_settings(self, request: CreateJobRequest, module: Dict[str, Any]) -> CreateJobRequest:
+        settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+        payload = _model_dump(request)
+        if module.get("type") == "telegram" and settings.get("telegramChat"):
+            payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
+        if module.get("type") == "trello":
+            if settings.get("trelloCard"):
+                payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
+            if settings.get("trelloList"):
+                payload["trello_list_id"] = str(settings.get("trelloList") or "").strip()
+        return CreateJobRequest(**payload)
+
+    async def _run_automation_post_modules(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifacts: List[JobArtifact],
+        result: Dict[str, Any],
+        *,
+        start_after_module_id: str = "",
+        skip_finished: bool = False,
+    ) -> Dict[str, Any]:
+        graph = self._automation_graph_payload(request)
+        next_result = dict(result)
+        waiting_for_start = bool(str(start_after_module_id or "").strip())
+        for module in graph["modules"]:
+            if waiting_for_start:
+                if module["id"] == start_after_module_id:
+                    waiting_for_start = False
+                continue
+            if not module["enabled"]:
+                continue
+            module_type = module["type"]
+            if module_type in {"source", "normalize", "flow"}:
+                continue
+            if skip_finished and self._automation_module_status(job_id, module["id"]) in {"completed", "skipped", "disabled"}:
+                continue
+            module_request = self._request_with_automation_module_settings(request, module)
+            try:
+                if module_type == "telegram":
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running",
+                        input_data={"artifact_count": len(artifacts), "chat_id": module_request.telegram_chat_id},
+                    )
+                    telegram_result = await self._send_telegram_review_pack(job_id, module_request, artifacts)
+                    if telegram_result:
+                        next_result["telegram"] = telegram_result
+                    status = "completed" if telegram_result.get("configured", True) else "skipped"
+                    await self._set_automation_module_status(job_id, request, module["id"], status, output=telegram_result or {})
+                elif module_type == "trello":
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running",
+                        input_data={
+                            "artifact_count": len(artifacts),
+                            "card_id": module_request.trello_card_id,
+                            "list_id": module_request.trello_list_id,
+                        },
+                    )
+                    trello_result = await self._archive_trello_artifacts(job_id, module_request, artifacts)
+                    if trello_result:
+                        next_result["trello"] = trello_result
+                    status = "completed" if trello_result.get("configured", True) else "skipped"
+                    await self._set_automation_module_status(job_id, request, module["id"], status, output=trello_result or {})
+                elif module_type == "approval":
+                    waiting_for_telegram = bool(request.telegram_enabled and artifacts)
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running" if waiting_for_telegram else "completed",
+                        input_data={"artifact_count": len(artifacts)},
+                        output={
+                            "awaiting_user_approval": waiting_for_telegram,
+                            "pending": len(artifacts) if waiting_for_telegram else 0,
+                        },
+                    )
+                    await self.store.append_log(
+                        job_id,
+                        f"Module {module['title']}: đang chờ người dùng duyệt trên Telegram."
+                        if waiting_for_telegram
+                        else f"Module {module['title']}: đã ghi nhận bước duyệt/log theo cấu hình.",
+                    )
+                    if waiting_for_telegram:
+                        return next_result
+                else:
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running",
+                        input_data={"artifact_count": len(artifacts), "module_type": module_type},
+                    )
+                    custom_result = await self._run_custom_automation_module(job_id, request, module, artifacts)
+                    if custom_result:
+                        custom_results = dict(next_result.get("custom_modules") or {})
+                        custom_results[module["id"]] = custom_result
+                        next_result["custom_modules"] = custom_results
+                    status = "completed" if custom_result.get("configured", True) else "skipped"
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        status,
+                        output=custom_result,
+                    )
+            except Exception as exc:
+                detail = self._flow_error_detail(exc)
+                await self._set_automation_module_status(job_id, request, module["id"], "failed", error=detail)
+                raise
+        return next_result
+
+    async def _run_custom_automation_module(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        module: Dict[str, Any],
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Any]:
+        settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+        url = str(settings.get("customWebhookUrl") or settings.get("webhookUrl") or "").strip()
+        note = str(settings.get("customNote") or "").strip()
+        if not url:
+            await self.store.append_log(job_id, f"Module {module['title']}: chưa có webhook/API nên đã bỏ qua.")
+            return {"configured": False, "note": note or "Chưa cấu hình webhook/API cho cục custom."}
+
+        method = str(settings.get("customWebhookMethod") or settings.get("method") or "POST").strip().upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            method = "POST"
+        timeout_s = self._custom_webhook_timeout(settings.get("customWebhookTimeout"))
+        context = self._custom_module_context(job_id, request, module, artifacts)
+        headers = self._custom_webhook_headers(settings.get("customWebhookHeaders"), context)
+        body_template = str(settings.get("customWebhookBody") or "").strip()
+        body_bytes = self._custom_webhook_body(method, body_template, context, headers)
+        target_url = self._custom_webhook_url(url, method, context, body_template)
+
+        response = await asyncio.to_thread(
+            self._custom_webhook_request,
+            method,
+            target_url,
+            headers,
+            body_bytes,
+            timeout_s,
+        )
+        await self.store.append_log(job_id, f"Module {module['title']}: webhook/API custom đã chạy xong.")
+        return {
+            "configured": True,
+            "method": method,
+            "url": self._redact_url_for_output(target_url),
+            "status_code": response.get("status_code"),
+            "response": response.get("body"),
+        }
+
+    def _custom_webhook_timeout(self, value: Any) -> float:
+        try:
+            timeout = float(value or 20)
+        except (TypeError, ValueError):
+            timeout = 20.0
+        return max(3.0, min(120.0, timeout))
+
+    def _custom_module_context(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        module: Dict[str, Any],
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Any]:
+        artifact_payloads = [_model_dump(artifact) for artifact in artifacts]
+        first_artifact = artifact_payloads[0] if artifact_payloads else {}
+        public_urls = [str(item.get("public_url") or item.get("url") or "").strip() for item in artifact_payloads]
+        public_urls = [url for url in public_urls if url]
+        local_paths = [str(item.get("local_path") or "").strip() for item in artifact_payloads]
+        local_paths = [path for path in local_paths if path]
+        return {
+            "job_id": job_id,
+            "job_title": request.title or self._default_title(request),
+            "job_type": request.type,
+            "prompt": request.prompt,
+            "model": request.model,
+            "aspect": request.aspect,
+            "count": request.count,
+            "module": {
+                "id": module.get("id", ""),
+                "type": module.get("type", "custom"),
+                "title": module.get("title", ""),
+                "detail": module.get("detail", ""),
+            },
+            "artifact_count": len(artifact_payloads),
+            "artifacts": artifact_payloads,
+            "artifact_urls": public_urls,
+            "artifact_local_paths": local_paths,
+            "first_artifact_url": str(first_artifact.get("public_url") or first_artifact.get("url") or ""),
+            "first_artifact_path": str(first_artifact.get("local_path") or ""),
+            "created_at": utc_now(),
+        }
+
+    def _custom_webhook_headers(self, raw_headers: Any, context: Dict[str, Any]) -> Dict[str, str]:
+        parsed: Dict[str, Any] = {}
+        if isinstance(raw_headers, dict):
+            parsed = raw_headers
+        else:
+            text = str(raw_headers or "").strip()
+            if text:
+                try:
+                    candidate = json.loads(self._render_custom_template(text, context))
+                    if isinstance(candidate, dict):
+                        parsed = candidate
+                except Exception:
+                    for line in text.splitlines():
+                        if ":" not in line:
+                            continue
+                        key, value = line.split(":", 1)
+                        if key.strip():
+                            parsed[key.strip()] = self._render_custom_template(value.strip(), context)
+        return {str(key).strip(): str(value) for key, value in parsed.items() if str(key).strip()}
+
+    def _custom_webhook_body(
+        self,
+        method: str,
+        body_template: str,
+        context: Dict[str, Any],
+        headers: Dict[str, str],
+    ) -> bytes | None:
+        if method == "GET":
+            return None
+        if body_template:
+            rendered = self._render_custom_template(body_template, context)
+            try:
+                payload = json.loads(rendered)
+                if not any(key.lower() == "content-type" for key in headers):
+                    headers["Content-Type"] = "application/json"
+                return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            except json.JSONDecodeError:
+                if not any(key.lower() == "content-type" for key in headers):
+                    headers["Content-Type"] = "text/plain; charset=utf-8"
+                return rendered.encode("utf-8")
+
+        if not any(key.lower() == "content-type" for key in headers):
+            headers["Content-Type"] = "application/json"
+        return json.dumps(context, ensure_ascii=False).encode("utf-8")
+
+    def _custom_webhook_url(self, url: str, method: str, context: Dict[str, Any], body_template: str) -> str:
+        rendered = self._render_custom_template(url, context)
+        parsed = urlparse(rendered)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError("Webhook/API custom phải là URL http hoặc https hợp lệ.")
+        if method != "GET" or body_template:
+            return rendered
+        query = urlencode({"job_id": context["job_id"], "artifact_count": context["artifact_count"]})
+        separator = "&" if parsed.query else "?"
+        return f"{rendered}{separator}{query}"
+
+    def _custom_webhook_request(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        body: bytes | None,
+        timeout_s: float,
+    ) -> Dict[str, Any]:
+        request = Request(url, data=body, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=timeout_s) as response:
+                raw = response.read(512_000).decode("utf-8", errors="replace")
+                status_code = getattr(response, "status", 200)
+        except HTTPError as exc:
+            detail = exc.read(4096).decode("utf-8", errors="replace")
+            raise RuntimeError(f"Webhook/API custom trả lỗi HTTP {exc.code}: {detail or exc.reason}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Webhook/API custom không kết nối được: {exc.reason or exc}") from exc
+
+        body_payload: Any = raw[:4000]
+        if raw:
+            try:
+                body_payload = json.loads(raw)
+            except json.JSONDecodeError:
+                body_payload = raw[:4000]
+        return {"status_code": status_code, "body": body_payload}
+
+    def _render_custom_template(self, template: str, context: Dict[str, Any]) -> str:
+        def lookup(path: str) -> Any:
+            current: Any = context
+            for part in path.split("."):
+                if isinstance(current, dict):
+                    current = current.get(part, "")
+                elif isinstance(current, list):
+                    try:
+                        current = current[int(part)]
+                    except (ValueError, IndexError):
+                        return ""
+                else:
+                    return ""
+            return current
+
+        def replace(match: re.Match[str]) -> str:
+            value = lookup(match.group(1).strip())
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+
+        return re.sub(r"\{\{\s*([A-Za-z0-9_.]+)\s*\}\}", replace, str(template or ""))
+
+    def _redact_url_for_output(self, url: str) -> str:
+        parsed = urlparse(url)
+        if not parsed.query:
+            return url
+        safe_query_parts = []
+        for part in parsed.query.split("&"):
+            key = part.split("=", 1)[0].lower()
+            if any(token in key for token in ("key", "token", "secret", "password", "auth")):
+                safe_query_parts.append(f"{part.split('=', 1)[0]}=***")
+            else:
+                safe_query_parts.append(part)
+        return parsed._replace(query="&".join(safe_query_parts)).geturl()
+
+    def _automation_module_status(self, job_id: str, module_id: str) -> str:
+        job = self.store.get_job(job_id)
+        execution = (job.result or {}).get("automation_execution") if job is not None else {}
+        nodes = execution.get("nodes") if isinstance(execution, dict) else []
+        node = next((item for item in nodes if item.get("id") == module_id), None)
+        return str((node or {}).get("status") or "")
+
+    def _automation_modules_after(self, request: CreateJobRequest, module_id: str) -> List[Dict[str, Any]]:
+        graph = self._automation_graph_payload(request)
+        modules = graph["modules"]
+        for index, module in enumerate(modules):
+            if module["id"] == module_id:
+                return modules[index + 1 :]
+        return []
+
+    async def _skip_pending_automation_modules_after(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        module_id: str,
+        reason: str,
+    ) -> None:
+        for module in self._automation_modules_after(request, module_id):
+            if not module["enabled"] or module["type"] in {"source", "normalize", "flow", "approval"}:
+                continue
+            if self._automation_module_status(job_id, module["id"]) not in {"", "pending", "running"}:
+                continue
+            await self._set_automation_module_status(
+                job_id,
+                request,
+                module["id"],
+                "skipped",
+                output={"reason": reason},
+            )
+
+    def _approved_artifacts_for_job(self, job: JobRecord, approvals: Dict[str, Any]) -> List[JobArtifact]:
+        approved_indexes: set[int] = set()
+        for key, value in approvals.items():
+            if not isinstance(value, dict) or value.get("status") != "approved":
+                continue
+            try:
+                approved_indexes.add(int(key))
+            except (TypeError, ValueError):
+                continue
+        return [artifact for index, artifact in enumerate(job.artifacts) if index in approved_indexes]
+
+    async def _resume_automation_after_approval(self, job_id: str, approval_module_id: str) -> None:
+        job = self.store.get_job(job_id)
+        if job is None or not approval_module_id:
+            return
+        try:
+            request = CreateJobRequest(**(job.input or {}))
+        except Exception:
+            return
+        remaining = [
+            module
+            for module in self._automation_modules_after(request, approval_module_id)
+            if module["enabled"] and module["type"] not in {"source", "normalize", "flow", "approval"}
+        ]
+        if not remaining:
+            return
+
+        result = dict(job.result or {})
+        approvals = dict(result.get("telegram_approvals") or {})
+        approved_artifacts = self._approved_artifacts_for_job(job, approvals)
+        if not approved_artifacts:
+            await self._skip_pending_automation_modules_after(
+                job_id,
+                request,
+                approval_module_id,
+                "Không có ảnh nào được duyệt trên Telegram.",
+            )
+            await self.store.append_log(job_id, "Không có ảnh nào được duyệt nên các module sau Approval đã được bỏ qua.")
+            latest_job = self.store.get_job(job_id)
+            if latest_job is not None:
+                latest_result = dict(latest_job.result or result)
+                await self.store.patch_job(job_id, result=latest_result)
+            return
+
+        await self.store.append_log(job_id, "Telegram đã duyệt xong, tiếp tục chạy các module sau Approval.")
+        resumed_result = await self._run_automation_post_modules(
+            job_id,
+            request,
+            approved_artifacts,
+            result,
+            start_after_module_id=approval_module_id,
+            skip_finished=True,
+        )
+        latest_job = self.store.get_job(job_id)
+        latest_execution = (latest_job.result or {}).get("automation_execution") if latest_job is not None else None
+        if latest_execution:
+            resumed_result = dict(resumed_result)
+            resumed_result["automation_execution"] = latest_execution
+        await self.store.patch_job(job_id, result=resumed_result)
+
     async def _run_flow_job(self, job_id: str, request: CreateJobRequest) -> None:
         await self.store.patch_job(job_id, status="running")
+        await self._ensure_automation_execution(job_id, request)
+        await self._run_automation_pre_modules(job_id, request)
+        await self._set_automation_module_status(
+            job_id,
+            request,
+            "flow",
+            "running",
+            input_data={
+                "type": request.type,
+                "prompt": request.prompt,
+                "model": request.model,
+                "aspect": request.aspect,
+                "count": request.count,
+            },
+        )
         await self._set_job_progress(job_id, "connecting", "Em đang khởi tạo client và kết nối tới project Flow hiện tại.")
         await self.store.append_log(job_id, "Đang khởi tạo kết nối tới Flow")
         artifacts: List[JobArtifact] = []
@@ -3076,16 +4420,832 @@ exit 1
                 merged_result.update(result)
                 result = merged_result
             await self.store.replace_artifacts(job_id, artifacts)
+            await self._set_automation_module_status(
+                job_id,
+                request,
+                "flow",
+                "completed",
+                output={
+                    "artifact_count": len(artifacts),
+                    "media_names": [artifact.media_name for artifact in artifacts if artifact.media_name],
+                    "mode": result.get("mode", request.type),
+                },
+            )
+            result = await self._run_automation_post_modules(job_id, request, artifacts, result)
+            latest_job = self.store.get_job(job_id)
+            latest_execution = (latest_job.result or {}).get("automation_execution") if latest_job is not None else None
+            if latest_execution:
+                result = dict(result)
+                result["automation_execution"] = latest_execution
             await self.store.patch_job(job_id, status="completed", result=result)
             await self.store.append_log(job_id, "Tác vụ đã hoàn tất")
         except HTTPException as exc:
             detail = self._flow_error_detail(exc)
+            await self._fail_active_automation_module(job_id, request, detail)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
         except Exception as exc:
             detail = self._flow_error_detail(exc)
+            await self._fail_active_automation_module(job_id, request, detail)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+
+    async def _archive_trello_artifacts(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Any]:
+        if request.type != "image" or not artifacts or not request.trello_enabled:
+            return {}
+
+        key, token = self._trello_credentials()
+        if not key or not token:
+            return {"configured": False}
+
+        trello_config = self.store.snapshot().trello_config
+        card_id = self._normalize_trello_card_id(
+            request.trello_card_id or trello_config.card_id or os.getenv("TRELLO_CARD_ID", "")
+        )
+        list_id = self._normalize_trello_id(request.trello_list_id or trello_config.list_id or os.getenv("TRELLO_LIST_ID", ""))
+        set_cover = bool(request.trello_set_cover and trello_config.set_cover is not False)
+        card_url = ""
+        created_card = False
+
+        if not card_id and list_id:
+            try:
+                card_payload = await asyncio.to_thread(
+                    self._trello_create_card,
+                    key,
+                    token,
+                    list_id,
+                    self._trello_card_name(job_id, request),
+                    self._trello_card_description(job_id, request),
+                )
+                card_id = str(card_payload.get("id") or card_payload.get("shortLink") or "").strip()
+                card_url = str(card_payload.get("shortUrl") or card_payload.get("url") or "").strip()
+                created_card = True
+                await self.store.append_log(job_id, f"Đã tạo card Trello để lưu ảnh: {card_url or card_id}")
+            except Exception as exc:
+                await self.store.append_log(job_id, f"Không tạo được card Trello: {humanize_flow_error(str(exc))}")
+                return {
+                    "configured": True,
+                    "sent": 0,
+                    "failed": len(artifacts),
+                    "error": humanize_flow_error(str(exc)),
+                }
+
+        if not card_id:
+            await self.store.append_log(job_id, "Trello đã cấu hình key/token nhưng thiếu Trello card hoặc list để lưu ảnh.")
+            return {
+                "configured": True,
+                "sent": 0,
+                "failed": len(artifacts),
+                "error": "missing_trello_target",
+            }
+
+        upload_mode = (trello_config.upload_mode or os.getenv("TRELLO_UPLOAD_MODE", "file")).strip().lower()
+        if upload_mode not in {"file", "url"}:
+            upload_mode = "file"
+        stored = 0
+        failed = 0
+        attachments: List[Dict[str, Any]] = []
+        for index, artifact in enumerate(artifacts):
+            artifact_url = str(artifact.url or artifact.public_url or "").strip()
+            if not artifact_url:
+                failed += 1
+                continue
+
+            name = self._trello_attachment_name(job_id, artifact, index)
+            try:
+                if upload_mode == "url":
+                    attachment_payload = await asyncio.to_thread(
+                        self._trello_attach_url,
+                        key,
+                        token,
+                        card_id,
+                        artifact_url,
+                        name,
+                        set_cover and index == 0,
+                    )
+                else:
+                    try:
+                        attachment_payload = await asyncio.to_thread(
+                            self._trello_attach_file_from_url,
+                            key,
+                            token,
+                            card_id,
+                            artifact_url,
+                            name,
+                            artifact.mime_type or "image/jpeg",
+                            set_cover and index == 0,
+                        )
+                    except Exception as file_exc:
+                        await self.store.append_log(
+                            job_id,
+                            f"Upload file ảnh {index + 1} lên Trello chưa được, thử attach bằng URL: {humanize_flow_error(str(file_exc))}",
+                        )
+                        attachment_payload = await asyncio.to_thread(
+                            self._trello_attach_url,
+                            key,
+                            token,
+                            card_id,
+                            artifact_url,
+                            name,
+                            set_cover and index == 0,
+                        )
+
+                stored += 1
+                attachments.append(self._trello_attachment_summary(attachment_payload))
+            except Exception as exc:
+                failed += 1
+                await self.store.append_log(
+                    job_id,
+                    f"Không lưu được ảnh {index + 1} lên Trello: {humanize_flow_error(str(exc))}",
+                )
+
+        if stored:
+            await self.store.append_log(job_id, f"Đã lưu {stored} ảnh lên Trello.")
+        return {
+            "configured": True,
+            "sent": stored,
+            "failed": failed,
+            "card_id": card_id,
+            "card_url": card_url,
+            "created_card": created_card,
+            "attachments": attachments,
+        }
+
+    def _trello_credentials(self) -> tuple[str, str]:
+        config = self.store.snapshot().trello_config
+        key = str(config.api_key or "").strip() or os.getenv("TRELLO_API_KEY", "").strip()
+        token = str(config.token or "").strip() or os.getenv("TRELLO_TOKEN", "").strip()
+        return key, token
+
+    def _normalize_trello_id(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            return raw.strip().strip("/")
+        if parsed.scheme and parsed.netloc:
+            raw = parsed.path or raw
+        return raw.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+
+    def _normalize_trello_card_id(self, value: str) -> str:
+        raw = self._normalize_trello_id(value)
+        if "/c/" in raw:
+            raw = raw.split("/c/", 1)[1]
+        if raw.startswith("c/"):
+            raw = raw[2:]
+        if "/" in raw:
+            raw = raw.split("/", 1)[0]
+        return raw.strip()
+
+    def _trello_card_name(self, job_id: str, request: CreateJobRequest) -> str:
+        prompt = str(request.prompt or "").strip().replace("\n", " ")
+        prompt = re.sub(r"\s+", " ", prompt)
+        if len(prompt) > 72:
+            prompt = f"{prompt[:69]}..."
+        return prompt or f"Flow image {job_id[:8]}"
+
+    def _trello_card_description(self, job_id: str, request: CreateJobRequest) -> str:
+        prompt = str(request.prompt or "").strip()
+        return "\n".join(
+            part
+            for part in [
+                "Generated by Flow Web UI.",
+                f"Job: {job_id}",
+                f"Model: {self._image_ui_model_label(request.model or self.DEFAULT_IMAGE_MODEL)}",
+                f"Aspect: {request.aspect or 'square'}",
+                f"Prompt:\n{prompt}" if prompt else "",
+            ]
+            if part
+        )
+
+    def _trello_attachment_name(self, job_id: str, artifact: JobArtifact, index: int) -> str:
+        suffix = Path(str(artifact.media_name or "")).suffix or ".jpg"
+        if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            suffix = ".jpg"
+        return f"flow-{job_id[:8]}-{index + 1}{suffix}"
+
+    def _trello_endpoint(self, path: str, key: str, token: str) -> str:
+        auth = urlencode({"key": key, "token": token})
+        return f"{self.TRELLO_API_BASE_URL}/{path.strip('/')}?{auth}"
+
+    def _trello_request_json(
+        self,
+        path: str,
+        key: str,
+        token: str,
+        *,
+        fields: Dict[str, Any] | None = None,
+        data: bytes | None = None,
+        headers: Dict[str, str] | None = None,
+    ) -> Any:
+        payload = data
+        request_headers = {"Accept": "application/json", **(headers or {})}
+        if payload is None:
+            payload = urlencode({k: v for k, v in (fields or {}).items() if str(v) != ""}).encode("utf-8")
+            request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        request = Request(
+            self._trello_endpoint(path, key, token),
+            data=payload,
+            headers=request_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                raw_payload = response.read().decode("utf-8", errors="replace")
+                return json.loads(raw_payload) if raw_payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail or exc.reason}") from exc
+        except URLError as exc:
+            raise RuntimeError(str(exc.reason or exc)) from exc
+
+    def _trello_create_card(self, key: str, token: str, list_id: str, name: str, description: str) -> Dict[str, Any]:
+        payload = self._trello_request_json(
+            "cards",
+            key,
+            token,
+            fields={
+                "idList": list_id,
+                "name": name,
+                "desc": description,
+                "pos": "top",
+            },
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def _trello_attach_url(
+        self,
+        key: str,
+        token: str,
+        card_id: str,
+        artifact_url: str,
+        name: str,
+        set_cover: bool,
+    ) -> Dict[str, Any]:
+        payload = self._trello_request_json(
+            f"cards/{quote(card_id, safe='')}/attachments",
+            key,
+            token,
+            fields={
+                "name": name,
+                "url": artifact_url,
+                "setCover": "true" if set_cover else "false",
+            },
+        )
+        if isinstance(payload, list):
+            return payload[0] if payload else {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _trello_attach_file_from_url(
+        self,
+        key: str,
+        token: str,
+        card_id: str,
+        artifact_url: str,
+        name: str,
+        mime_type: str,
+        set_cover: bool,
+    ) -> Dict[str, Any]:
+        file_bytes, detected_mime = self._read_remote_file(artifact_url)
+        mime = detected_mime or mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
+        body, content_type = self._multipart_form_data(
+            fields={
+                "name": name,
+                "mimeType": mime,
+                "setCover": "true" if set_cover else "false",
+            },
+            file_field="file",
+            file_name=name,
+            file_mime=mime,
+            file_bytes=file_bytes,
+        )
+        payload = self._trello_request_json(
+            f"cards/{quote(card_id, safe='')}/attachments",
+            key,
+            token,
+            data=body,
+            headers={"Content-Type": content_type},
+        )
+        if isinstance(payload, list):
+            return payload[0] if payload else {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _read_remote_file(self, url: str) -> tuple[bytes, str]:
+        request = Request(url, headers={"User-Agent": "FlowWebUI/0.1"})
+        try:
+            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                content_type = response.headers.get_content_type() if response.headers else ""
+                return response.read(), content_type
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Không tải được ảnh nguồn ({exc.code}): {detail or exc.reason}") from exc
+        except URLError as exc:
+            raise RuntimeError(str(exc.reason or exc)) from exc
+
+    def _multipart_form_data(
+        self,
+        *,
+        fields: Dict[str, Any],
+        file_field: str,
+        file_name: str,
+        file_mime: str,
+        file_bytes: bytes,
+    ) -> tuple[bytes, str]:
+        boundary = f"----flowweb{uuid.uuid4().hex}"
+        body = bytearray()
+        for key, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+            body.extend(str(value).encode("utf-8"))
+            body.extend(b"\r\n")
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; filename="{file_name}"\r\n'
+                f"Content-Type: {file_mime}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.extend(file_bytes)
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+        return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+    def _trello_attachment_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": str(payload.get("id") or "").strip(),
+            "name": str(payload.get("name") or "").strip(),
+            "url": str(payload.get("url") or "").strip(),
+        }
+
+    async def _send_telegram_review_pack(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Any]:
+        if request.type != "image" or not artifacts or not request.telegram_enabled:
+            return {}
+
+        token, chat_id = self._telegram_credentials(request.telegram_chat_id)
+        if not token or not chat_id:
+            return {"configured": False}
+
+        sent = 0
+        failed = 0
+        messages: List[Dict[str, Any]] = []
+        for index, artifact in enumerate(artifacts):
+            photo_source = await self._telegram_photo_source(job_id, artifact, index)
+            if not photo_source:
+                failed += 1
+                continue
+            caption = self._telegram_review_caption(job_id, request, artifact, index)
+            reply_markup = self._telegram_approval_reply_markup(job_id, index)
+            try:
+                message_payload = await asyncio.to_thread(
+                    self._send_telegram_photo,
+                    token,
+                    chat_id,
+                    photo_source,
+                    caption,
+                    reply_markup,
+                )
+                sent += 1
+                messages.append(
+                    {
+                        "artifact_index": index,
+                        "message_id": str(message_payload.get("message_id") or ""),
+                        "chat_id": chat_id,
+                        "status": "pending",
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                await self.store.append_log(
+                    job_id,
+                    f"Không gửi được ảnh {index + 1} sang Telegram: {humanize_flow_error(str(exc))}",
+                )
+
+        if sent:
+            await self.store.append_log(job_id, f"Đã gửi {sent} ảnh sang Telegram để duyệt.")
+        return {
+            "configured": True,
+            "sent": sent,
+            "failed": failed,
+            "chat_id": chat_id,
+            "pending_approvals": sent,
+            "messages": messages,
+        }
+
+    async def _telegram_photo_source(self, job_id: str, artifact: JobArtifact, artifact_index: int) -> str:
+        local_path = str(artifact.local_path or "").strip()
+        if local_path and Path(local_path).expanduser().is_file():
+            return local_path
+
+        remote_url = str(artifact.url or artifact.public_url or "").strip()
+        if not remote_url:
+            return ""
+        if not self._telegram_requires_file_upload(remote_url):
+            return remote_url
+
+        try:
+            return await self._materialize_artifact_file(job_id, artifact, artifact_index)
+        except Exception as exc:
+            await self.store.append_log(
+                job_id,
+                f"Không tải được ảnh {artifact_index + 1} về máy trước khi gửi Telegram: {humanize_flow_error(str(exc))}",
+            )
+            return remote_url
+
+    def _telegram_requires_file_upload(self, url: str) -> bool:
+        parsed = urlparse(str(url or "").strip())
+        return parsed.netloc.endswith("labs.google")
+
+    async def _materialize_artifact_file(self, job_id: str, artifact: JobArtifact, artifact_index: int) -> str:
+        local_path = str(artifact.local_path or "").strip()
+        if local_path and Path(local_path).expanduser().is_file():
+            return local_path
+
+        source = str(artifact.url or artifact.public_url or "").strip()
+        if not source:
+            return ""
+
+        job = self.store.get_job(job_id)
+        if job is not None:
+            file_name = self._download_name(job, artifact, artifact_index)
+        else:
+            file_name = f"{job_id}-{artifact_index + 1}.jpg"
+        destination = self._download_root() / file_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        async def _go(client: Any) -> str:
+            saved = await client.download(source, destination)
+            return str(saved)
+
+        workflow_id = str(artifact.workflow_id or "").strip()
+        if not workflow_id and job is not None and isinstance(job.input, dict):
+            workflow_id = str(job.input.get("workflow_id") or "").strip()
+        local_path = await self._with_client(_go, workflow_id=workflow_id)
+        artifact.local_path = local_path
+        artifact.public_url = self._public_download_url(local_path)
+        if job is not None:
+            await self.store.replace_artifacts(job_id, job.artifacts)
+        return local_path
+
+    def _telegram_credentials(self, requested_chat_id: str = "") -> tuple[str, str]:
+        config = self.store.snapshot().integration_config
+        token = str(config.telegram_bot_token or "").strip() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        chat_id = (
+            str(requested_chat_id or "").strip()
+            or str(config.telegram_chat_id or "").strip()
+            or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        )
+        return token, chat_id
+
+    def _telegram_review_caption(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifact: JobArtifact,
+        index: int,
+    ) -> str:
+        prompt = str(artifact.prompt or request.prompt or "").strip()
+        if len(prompt) > 780:
+            prompt = f"{prompt[:777]}..."
+        parts = [
+            f"Flow image #{index + 1}",
+            f"Job: {job_id[:8]}",
+        ]
+        if prompt:
+            parts.append(f"Prompt: {prompt}")
+        parts.append("Bấm Duyệt hoặc Từ chối bên dưới. Sau đó quay lại app bấm Đồng bộ duyệt Telegram.")
+        return "\n".join(parts)
+
+    def _telegram_approval_reply_markup(self, job_id: str, artifact_index: int) -> Dict[str, Any]:
+        safe_index = max(0, int(artifact_index))
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "✅ Duyệt",
+                        "callback_data": f"fw:approve:{job_id}:{safe_index}",
+                    },
+                    {
+                        "text": "❌ Từ chối",
+                        "callback_data": f"fw:reject:{job_id}:{safe_index}",
+                    },
+                ]
+            ]
+        }
+
+    def _send_telegram_photo(
+        self,
+        token: str,
+        chat_id: str,
+        photo_url: str,
+        caption: str,
+        reply_markup: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        endpoint = self.TELEGRAM_API_URL_TEMPLATE.format(token=quote(token, safe=":"), method="sendPhoto")
+        local_photo = Path(str(photo_url or "")).expanduser()
+        if local_photo.is_file():
+            fields: Dict[str, Any] = {
+                "chat_id": chat_id,
+                "caption": caption,
+            }
+            if reply_markup:
+                fields["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+            mime = mimetypes.guess_type(local_photo.name)[0] or "image/jpeg"
+            body, content_type = self._multipart_form_data(
+                fields=fields,
+                file_field="photo",
+                file_name=local_photo.name,
+                file_mime=mime,
+                file_bytes=local_photo.read_bytes(),
+            )
+            request = Request(
+                endpoint,
+                data=body,
+                headers={"Content-Type": content_type},
+                method="POST",
+            )
+        else:
+            payload: Dict[str, Any] = {
+                "chat_id": chat_id,
+                "photo": photo_url,
+                "caption": caption,
+            }
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
+            body = json.dumps(payload).encode("utf-8")
+            request = Request(
+                endpoint,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+        try:
+            with urlopen(request, timeout=self.TELEGRAM_TIMEOUT_S) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+                data = json.loads(payload) if payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(detail or str(exc)) from exc
+        except URLError as exc:
+            raise RuntimeError(str(exc.reason or exc)) from exc
+
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("description") or "Telegram không nhận ảnh."))
+        result = data.get("result")
+        return result if isinstance(result, dict) else {}
+
+    async def run_telegram_approval_sync_loop(self, interval_s: float = 5.0) -> None:
+        interval = max(0.1, float(interval_s or 5.0))
+        while True:
+            try:
+                await self.sync_telegram_approvals()
+                self._last_telegram_approval_sync_error = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._last_telegram_approval_sync_error = humanize_flow_error(str(exc))
+            await asyncio.sleep(interval)
+
+    async def sync_telegram_approvals(self) -> Dict[str, Any]:
+        async with self._telegram_approval_sync_lock:
+            result = await self._sync_telegram_approvals_unlocked()
+            if result.get("configured") is not False:
+                result["last_error"] = self._last_telegram_approval_sync_error
+            return result
+
+    async def _sync_telegram_approvals_unlocked(self) -> Dict[str, Any]:
+        token, _ = self._telegram_credentials("")
+        if not token:
+            return {"configured": False, "processed": 0, "approvals": []}
+
+        updates = await asyncio.to_thread(self._telegram_get_updates, token)
+        max_update_id = -1
+        approvals: List[Dict[str, Any]] = []
+        for update in updates:
+            try:
+                max_update_id = max(max_update_id, int(update.get("update_id", -1)))
+            except Exception:
+                pass
+            callback = update.get("callback_query") if isinstance(update, dict) else None
+            parsed = self._parse_telegram_approval_callback(callback or {})
+            if not parsed:
+                continue
+            approval = await self._apply_telegram_approval(
+                parsed["job_id"],
+                parsed["artifact_index"],
+                parsed["status"],
+                callback or {},
+            )
+            if approval:
+                approvals.append(approval)
+                callback_id = str((callback or {}).get("id") or "").strip()
+                if callback_id:
+                    await asyncio.to_thread(
+                        self._telegram_answer_callback_query,
+                        token,
+                        callback_id,
+                        "Đã ghi nhận duyệt ảnh." if parsed["status"] == "approved" else "Đã ghi nhận từ chối ảnh.",
+                    )
+
+        if max_update_id >= 0:
+            await asyncio.to_thread(self._telegram_get_updates, token, max_update_id + 1)
+
+        return {
+            "configured": True,
+            "processed": len(approvals),
+            "approvals": approvals,
+        }
+
+    def _telegram_get_updates(self, token: str, offset: int | None = None) -> List[Dict[str, Any]]:
+        endpoint = self.TELEGRAM_API_URL_TEMPLATE.format(token=quote(token, safe=":"), method="getUpdates")
+        payload: Dict[str, Any] = {
+            "timeout": 0,
+            "allowed_updates": ["callback_query"],
+        }
+        if offset is not None:
+            payload["offset"] = offset
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.TELEGRAM_TIMEOUT_S) as response:
+                raw_payload = response.read().decode("utf-8", errors="replace")
+                data = json.loads(raw_payload) if raw_payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(detail or str(exc)) from exc
+        except URLError as exc:
+            raise RuntimeError(str(exc.reason or exc)) from exc
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("description") or "Telegram không trả callback."))
+        result = data.get("result")
+        return result if isinstance(result, list) else []
+
+    def _telegram_answer_callback_query(self, token: str, callback_query_id: str, text: str) -> None:
+        endpoint = self.TELEGRAM_API_URL_TEMPLATE.format(token=quote(token, safe=":"), method="answerCallbackQuery")
+        body = json.dumps(
+            {
+                "callback_query_id": callback_query_id,
+                "text": text,
+                "show_alert": False,
+            }
+        ).encode("utf-8")
+        request = Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=self.TELEGRAM_TIMEOUT_S) as response:
+                payload = response.read().decode("utf-8", errors="replace")
+                data = json.loads(payload) if payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(detail or str(exc)) from exc
+        except URLError as exc:
+            raise RuntimeError(str(exc.reason or exc)) from exc
+        if not data.get("ok", False):
+            raise RuntimeError(str(data.get("description") or "Telegram không xác nhận callback."))
+
+    def _parse_telegram_approval_callback(self, callback: Dict[str, Any]) -> Dict[str, Any]:
+        data = str(callback.get("data") or "").strip()
+        parts = data.split(":")
+        if len(parts) != 4 or parts[0] != "fw" or parts[1] not in {"approve", "reject"}:
+            return {}
+        try:
+            artifact_index = int(parts[3])
+        except ValueError:
+            return {}
+        if artifact_index < 0:
+            return {}
+        return {
+            "status": "approved" if parts[1] == "approve" else "rejected",
+            "job_id": parts[2],
+            "artifact_index": artifact_index,
+        }
+
+    async def _apply_telegram_approval(
+        self,
+        job_id: str,
+        artifact_index: int,
+        status: str,
+        callback: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        job = self.store.get_job(job_id)
+        if job is None or artifact_index < 0 or artifact_index >= len(job.artifacts):
+            return {}
+
+        result = dict(job.result or {})
+        approvals = dict(result.get("telegram_approvals") or {})
+        key = str(artifact_index)
+        previous = approvals.get(key) if isinstance(approvals.get(key), dict) else {}
+        reviewer = self._telegram_callback_reviewer(callback)
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        approval = {
+            "artifact_index": artifact_index,
+            "status": status,
+            "reviewer": reviewer,
+            "callback_query_id": str(callback.get("id") or "").strip(),
+            "message_id": str(message.get("message_id") or "").strip(),
+            "chat_id": str((message.get("chat") or {}).get("id") or "").strip()
+            if isinstance(message.get("chat"), dict)
+            else "",
+            "updated_at": utc_now(),
+        }
+        approvals[key] = approval
+        result["telegram_approvals"] = approvals
+        summary = self._telegram_approval_summary(approvals, len(job.artifacts))
+        result["telegram_approval_summary"] = summary
+        approval_module_id = self._sync_automation_approval_execution(result, summary, len(job.artifacts))
+        await self.store.patch_job(job_id, result=result)
+
+        if previous.get("status") != status:
+            label = "đã duyệt" if status == "approved" else "đã từ chối"
+            reviewer_name = reviewer.get("name") or reviewer.get("username") or "Telegram user"
+            await self.store.append_log(job_id, f"{reviewer_name} {label} ảnh {artifact_index + 1} trên Telegram.")
+        if approval_module_id and summary.get("pending") == 0:
+            await self._resume_automation_after_approval(job_id, approval_module_id)
+        return approval
+
+    def _telegram_callback_reviewer(self, callback: Dict[str, Any]) -> Dict[str, Any]:
+        user = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        first = str(user.get("first_name") or "").strip()
+        last = str(user.get("last_name") or "").strip()
+        username = str(user.get("username") or "").strip()
+        return {
+            "id": str(user.get("id") or "").strip(),
+            "name": " ".join(part for part in [first, last] if part).strip(),
+            "username": username,
+        }
+
+    def _telegram_approval_summary(self, approvals: Dict[str, Any], artifact_count: int) -> Dict[str, Any]:
+        approved = 0
+        rejected = 0
+        pending = max(0, artifact_count)
+        for value in approvals.values():
+            if not isinstance(value, dict):
+                continue
+            if value.get("status") == "approved":
+                approved += 1
+            elif value.get("status") == "rejected":
+                rejected += 1
+        resolved = approved + rejected
+        pending = max(0, artifact_count - resolved)
+        return {
+            "total": artifact_count,
+            "approved": approved,
+            "rejected": rejected,
+            "pending": pending,
+            "resolved": resolved,
+            "status": "completed" if artifact_count and resolved >= artifact_count else "waiting",
+        }
+
+    def _sync_automation_approval_execution(
+        self,
+        result: Dict[str, Any],
+        summary: Dict[str, Any],
+        artifact_count: int,
+    ) -> str:
+        execution = result.get("automation_execution")
+        if not isinstance(execution, dict) or not isinstance(execution.get("nodes"), list):
+            return ""
+        nodes = execution["nodes"]
+        approval_node = next((node for node in nodes if node.get("type") == "approval"), None)
+        if not approval_node:
+            return ""
+        now = utc_now()
+        approval_node["status"] = "completed" if summary.get("pending") == 0 and artifact_count else "running"
+        approval_node["output"] = {
+            "awaiting_user_approval": summary.get("pending", 0) > 0,
+            "telegram_approval_summary": summary,
+        }
+        if not approval_node.get("started_at"):
+            approval_node["started_at"] = now
+        if approval_node["status"] == "completed":
+            approval_node["completed_at"] = now
+        execution["current_module_id"] = approval_node.get("id", "") if approval_node["status"] == "running" else ""
+        execution["completed"] = all(
+            str(node.get("status") or "") in {"completed", "skipped", "disabled"}
+            for node in nodes
+        )
+        return str(approval_node.get("id") or "")
 
     def _build_video_artifacts(
         self,
@@ -4548,6 +6708,11 @@ exit 1
                 batch_target = max(1, min(4, remaining))
                 attempts += 1
 
+                try:
+                    known_media_before_submit = self._project_media_names(await client_self._api.get_project_data())
+                except Exception:
+                    known_media_before_submit = set()
+
                 await client_self._ui.open_settings_panel(page)
                 switched = await client_self._ui.switch_mode(page, GenerationMode.IMAGE)
                 if not switched:
@@ -4557,16 +6722,53 @@ exit 1
                 await client_self._ui.set_count(page, batch_target)
                 await client_self._ui.fill_prompt(page, prompt)
                 call_start = len(getattr(interceptor, "_calls", []))
-                await client_self._ui.click_submit(page)
-                entry = await _compat_wait_for_new_call(
-                    interceptor,
-                    call_start,
-                    "batchGenerateImages",
-                    timeout_s=max(30, timeout_s),
-                    fail_on_tails=["batchAsyncGenerateVideo"],
+                clicked = await client_self._ui.click_submit(page)
+                if not clicked:
+                    raise RuntimeError("Google Flow chưa bấm được nút tạo ảnh.")
+
+                endpoint_task = asyncio.create_task(
+                    _compat_wait_for_new_call(
+                        interceptor,
+                        call_start,
+                        "batchGenerateImages",
+                        timeout_s=max(30, timeout_s),
+                        fail_on_tails=["batchAsyncGenerateVideo"],
+                    )
                 )
-                batch_images = _compat_parse_images(entry.resp)
+                project_task = asyncio.create_task(
+                    self._wait_for_new_project_images(
+                        client_self,
+                        known_media_before_submit,
+                        prompt=prompt,
+                        target_count=batch_target,
+                        timeout_s=max(30, timeout_s),
+                    )
+                )
+
+                batch_images: List[Any] = []
+                errors: List[Exception] = []
+                pending = {endpoint_task, project_task}
+                while pending and not batch_images:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        try:
+                            result = task.result()
+                        except Exception as exc:
+                            errors.append(exc)
+                            continue
+                        if isinstance(result, list):
+                            batch_images = result
+                        else:
+                            batch_images = _compat_parse_images(result.resp)
+                        if batch_images:
+                            break
+
+                for task in pending:
+                    task.cancel()
+
                 if not batch_images:
+                    if errors:
+                        raise errors[-1]
                     raise RuntimeError("Google Flow không trả ảnh nào về từ yêu cầu hiện tại.")
                 images.extend(batch_images)
 
@@ -7002,6 +9204,10 @@ exit 1
 
     def _project_media_names(self, project_data: Dict[str, Any]) -> set[str]:
         names: set[str] = set()
+        for media in self._project_media_items(project_data):
+            media_name = str(media.get("name") or media.get("mediaName") or "").strip()
+            if media_name:
+                names.add(media_name)
         for workflow in project_data.get("projectContents", {}).get("workflows", []) or []:
             metadata = workflow.get("metadata", {}) or {}
             primary_media_id = str(metadata.get("primaryMediaId") or "").strip()
@@ -7012,6 +9218,196 @@ exit 1
                 if media_name:
                     names.add(media_name)
         return names
+
+    def _project_media_items(self, project_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        project_contents = project_data.get("projectContents", {}) if isinstance(project_data, dict) else {}
+        media_collection = project_contents.get("media") if isinstance(project_contents, dict) else None
+        if isinstance(media_collection, dict):
+            return [item for item in media_collection.values() if isinstance(item, dict)]
+        if isinstance(media_collection, list):
+            return [item for item in media_collection if isinstance(item, dict)]
+        return []
+
+    def _project_workflow_metadata_by_id(self, project_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        workflows = ((project_data.get("projectContents") or {}).get("workflows") or []) if isinstance(project_data, dict) else []
+        metadata_by_id: Dict[str, Dict[str, Any]] = {}
+        for workflow in workflows:
+            if not isinstance(workflow, dict):
+                continue
+            workflow_id = str(workflow.get("name") or "").strip()
+            if workflow_id:
+                metadata_by_id[workflow_id] = workflow.get("metadata", {}) or {}
+        return metadata_by_id
+
+    def _project_generated_images(
+        self,
+        project_data: Dict[str, Any],
+        *,
+        known_media: set[str] | None = None,
+        prompt: str = "",
+        limit: int = 4,
+        fallback_workflow_id: str = "",
+    ) -> List[Any]:
+        from flow._api import GeneratedImage
+
+        known = {str(item or "").strip() for item in (known_media or set()) if str(item or "").strip()}
+        images: List[Any] = []
+        seen: set[str] = set()
+        workflow_metadata_by_id = self._project_workflow_metadata_by_id(project_data)
+
+        media_sources = list(self._project_media_items(project_data))
+        workflows = project_data.get("projectContents", {}).get("workflows", []) or []
+        for workflow in workflows:
+            if not isinstance(workflow, dict):
+                continue
+            workflow_id = str(workflow.get("name") or fallback_workflow_id or "").strip()
+            for media_item in workflow.get("medias", []) or []:
+                if not isinstance(media_item, dict):
+                    continue
+                if not media_item.get("workflowId") and workflow_id:
+                    media_item = {**media_item, "workflowId": workflow_id, "projectId": media_item.get("projectId") or workflow.get("projectId")}
+                media_sources.append(media_item)
+
+        for media_item in media_sources:
+            media_name = str(media_item.get("name") or media_item.get("mediaName") or "").strip()
+            if not media_name or media_name in known or media_name in seen:
+                continue
+            image_node = media_item.get("image") or {}
+            generated = image_node.get("generatedImage") or {}
+            if not generated:
+                continue
+
+            workflow_id = str(media_item.get("workflowId") or fallback_workflow_id or "").strip()
+            metadata = workflow_metadata_by_id.get(workflow_id, {})
+            media_metadata = media_item.get("mediaMetadata", {}) or {}
+            request_data = media_metadata.get("requestData", {}) or {}
+            workflow_prompt = str(
+                generated.get("prompt")
+                or metadata.get("displayName")
+                or self._prompt_from_flow_request_data(request_data)
+                or prompt
+                or ""
+            ).strip()
+            workflow_create_time = str(
+                media_metadata.get("createTime")
+                or metadata.get("createTime")
+                or ""
+            ).strip()
+            fife_url = str(
+                generated.get("fifeUrl")
+                or generated.get("url")
+                or image_node.get("fifeUrl")
+                or media_item.get("fifeUrl")
+                or ""
+            ).strip()
+
+            image = GeneratedImage.__new__(GeneratedImage)
+            image._raw = media_item
+            image.media_name = media_name
+            image.project_id = str(media_item.get("projectId") or "").strip()
+            image.workflow_id = workflow_id
+            image.fife_url = fife_url
+            image.seed = generated.get("seed", 0)
+            image.model = str(generated.get("modelNameType") or generated.get("model") or "").strip()
+            image.prompt = workflow_prompt
+            image.dimensions = image_node.get("dimensions") or media_item.get("dimensions", {}) or {}
+            image.file_path = None
+            image._flow_workflow_create_time = workflow_create_time
+            images.append(image)
+            seen.add(media_name)
+
+        images.sort(key=lambda item: str(getattr(item, "_flow_workflow_create_time", "") or ""), reverse=True)
+        return images[: max(1, min(4, int(limit or 1)))]
+
+    def _prompt_from_flow_request_data(self, request_data: Dict[str, Any]) -> str:
+        prompt_inputs = request_data.get("promptInputs", []) if isinstance(request_data, dict) else []
+        for prompt_input in prompt_inputs or []:
+            if not isinstance(prompt_input, dict):
+                continue
+            text_input = str(prompt_input.get("textInput") or "").strip()
+            if text_input:
+                return text_input
+            structured = prompt_input.get("structuredPrompt") or {}
+            parts = structured.get("parts", []) if isinstance(structured, dict) else []
+            text = " ".join(str(part.get("text") or "").strip() for part in parts if isinstance(part, dict)).strip()
+            if text:
+                return text
+        return ""
+
+    async def _flow_project_image_urls_by_workflow(self, client: Any) -> Dict[str, str]:
+        page = await client._bm.page()
+        try:
+            return await page.evaluate(
+                """
+                () => {
+                  const urls = {};
+                  const links = [...document.querySelectorAll('a[href*="/edit/"]')];
+                  for (const link of links) {
+                    const href = link.href || link.getAttribute('href') || '';
+                    const match = href.match(/\\/edit\\/([^/?#]+)/);
+                    if (!match) continue;
+                    const img = link.querySelector('img[src], img[srcset]');
+                    const src = img ? (img.currentSrc || img.src || '') : '';
+                    if (src && !src.startsWith('data:')) {
+                      urls[match[1]] = src;
+                    }
+                  }
+                  return urls;
+                }
+                """
+            )
+        except Exception:
+            return {}
+
+    async def _wait_for_new_project_images(
+        self,
+        client: Any,
+        known_media: set[str],
+        *,
+        prompt: str,
+        target_count: int,
+        timeout_s: float,
+        fallback_workflow_id: str = "",
+    ) -> List[Any]:
+        target = max(1, min(4, int(target_count or 1)))
+        deadline = time.monotonic() + max(5.0, float(timeout_s or 30))
+        best: List[Any] = []
+        first_seen_at = 0.0
+
+        while time.monotonic() < deadline:
+            try:
+                project_data = await client._api.get_project_data()
+            except Exception:
+                await asyncio.sleep(1.0)
+                continue
+
+            images = self._project_generated_images(
+                project_data,
+                known_media=known_media,
+                prompt=prompt,
+                limit=target,
+                fallback_workflow_id=fallback_workflow_id,
+            )
+            if images and any(not str(getattr(image, "fife_url", "") or "").strip() for image in images):
+                urls_by_workflow = await self._flow_project_image_urls_by_workflow(client)
+                for image in images:
+                    if str(getattr(image, "fife_url", "") or "").strip():
+                        continue
+                    workflow_id = str(getattr(image, "workflow_id", "") or "").strip()
+                    image.fife_url = urls_by_workflow.get(workflow_id, "")
+                images = [image for image in images if str(getattr(image, "fife_url", "") or "").strip()]
+            if len(images) > len(best):
+                best = images
+                first_seen_at = first_seen_at or time.monotonic()
+            if len(best) >= target:
+                return best[:target]
+            if best and first_seen_at and time.monotonic() - first_seen_at >= 4.0:
+                return best[:target]
+            await asyncio.sleep(1.0)
+
+        if best:
+            return best[:target]
+        raise RuntimeError("Google Flow không trả ảnh mới trong project sau khi bấm tạo ảnh.")
 
     async def _generate_image_edit_result(
         self,
@@ -7099,12 +9495,12 @@ exit 1
 
             await self.store.append_log(
                 job_id,
-                "Flow vua bat reCAPTCHA khi tao anh. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
+                "Flow API tu choi luot gui tu dong. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
             )
             await self._set_job_progress(
                 job_id,
                 "sending_request",
-                "Flow dang yeu cau xac nhan reCAPTCHA. Em dang tai lai trang project va gui lai bang giao dien Flow.",
+                "Flow API tu choi luot gui truc tiep. Em dang tai lai project va gui lai bang giao dien Flow.",
             )
             await self._reload_flow_project_page(client)
             return await self._generate_images_via_ui(client, request, reference_media_names)
@@ -7142,7 +9538,7 @@ exit 1
         if reference_media_names:
             if len(reference_media_names) > 1:
                 raise RuntimeError(
-                    "Flow dang chan nhanh ghep nhieu anh bang reCAPTCHA, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
+                    "Flow API dang chan nhanh ghep nhieu anh, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
                 )
             return await self._generate_single_reference_image_via_ui(
                 client,
@@ -7201,26 +9597,67 @@ exit 1
         if not filled:
             raise RuntimeError("Google Flow chua dien duoc prompt vao man hinh chinh anh.")
 
+        try:
+            known_media_before_submit = self._project_media_names(await client._api.get_project_data())
+        except Exception:
+            known_media_before_submit = set()
+
         clicked = await client._ui.click_submit(page)
         if not clicked:
             raise RuntimeError("Google Flow chua bam duoc nut tao anh o man hinh chinh anh.")
 
-        try:
-            entry = await interceptor.wait_for(
+        endpoint_task = asyncio.create_task(
+            interceptor.wait_for(
                 "batchGenerateImages",
                 timeout=max(30.0, min(120.0, float(timeout_s or 120))),
                 require_success=True,
             )
-        except Exception as exc:
-            detail = str(exc or "").lower()
-            if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
-                raise RuntimeError(
-                    "Google Flow co the dang doi xac nhan reCAPTCHA tren tab Flow. "
-                    "Hay mo tab Google Flow, xac nhan neu thay captcha, roi bam Chay lai."
-                ) from exc
-            raise
-        images = self._parse_images_from_flow_payload(entry.resp, prompt=prompt, fallback_workflow_id=resolved_workflow_id)
+        )
+        project_task = asyncio.create_task(
+            self._wait_for_new_project_images(
+                client,
+                known_media_before_submit,
+                prompt=prompt,
+                target_count=max(1, min(4, int(count or 1))),
+                timeout_s=max(30.0, min(120.0, float(timeout_s or 120))),
+                fallback_workflow_id=resolved_workflow_id,
+            )
+        )
+
+        images: List[Any] = []
+        errors: List[Exception] = []
+        pending = {endpoint_task, project_task}
+        while pending and not images:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    result = task.result()
+                except Exception as exc:
+                    errors.append(exc)
+                    continue
+                if isinstance(result, list):
+                    images = result
+                else:
+                    images = self._parse_images_from_flow_payload(
+                        result.resp,
+                        prompt=prompt,
+                        fallback_workflow_id=resolved_workflow_id,
+                    )
+                if images:
+                    break
+
+        for task in pending:
+            task.cancel()
+
         if not images:
+            if errors:
+                detail = str(errors[-1] or "").lower()
+                if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
+                    raise RuntimeError(
+                        "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
+                        "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong."
+                    ) from errors[-1]
+                raise errors[-1]
             raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
         return images[: max(1, min(4, int(count or 1)))]
 

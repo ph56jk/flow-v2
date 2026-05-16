@@ -8,6 +8,7 @@ from .messages import classify_job_error, humanize_flow_error
 from .paths import STATE_FILE, ensure_app_dirs
 from .schemas import (
     AppConfig,
+    IntegrationConfig,
     JobArtifact,
     JobErrorSnapshot,
     JobLog,
@@ -20,6 +21,7 @@ from .schemas import (
     JobRetrySnapshot,
     SkillRecord,
     StateSnapshot,
+    TrelloConfig,
     normalized_app_config,
     utc_now,
 )
@@ -43,6 +45,8 @@ class StateStore:
         self._lock = asyncio.Lock()
         self._state = self._load()
         self._normalize_saved_config()
+        self._normalize_saved_trello_config()
+        self._normalize_saved_integration_config()
         self._normalize_saved_jobs()
         self._repair_incomplete_jobs()
 
@@ -54,6 +58,18 @@ class StateStore:
             self._state.config = normalized_app_config(config)
             await self._save_locked()
         return self._state.config
+
+    async def replace_trello_config(self, config: TrelloConfig) -> TrelloConfig:
+        async with self._lock:
+            self._state.trello_config = self._normalize_trello_config(config)
+            await self._save_locked()
+        return self._state.trello_config
+
+    async def replace_integration_config(self, config: IntegrationConfig) -> IntegrationConfig:
+        async with self._lock:
+            self._state.integration_config = self._normalize_integration_config(config)
+            await self._save_locked()
+        return self._state.integration_config
 
     async def list_jobs(self) -> List[JobRecord]:
         return list(self._state.jobs)
@@ -270,6 +286,52 @@ class StateStore:
         STATE_FILE.write_text(
             json.dumps(_model_dump(self._state), indent=2),
             encoding="utf-8",
+        )
+
+    def _normalize_saved_trello_config(self) -> None:
+        normalized = self._normalize_trello_config(self._state.trello_config)
+        if _model_dump(normalized) == _model_dump(self._state.trello_config):
+            return
+        self._state.trello_config = normalized
+        STATE_FILE.write_text(
+            json.dumps(_model_dump(self._state), indent=2),
+            encoding="utf-8",
+        )
+
+    def _normalize_saved_integration_config(self) -> None:
+        normalized = self._normalize_integration_config(self._state.integration_config)
+        if _model_dump(normalized) == _model_dump(self._state.integration_config):
+            return
+        self._state.integration_config = normalized
+        STATE_FILE.write_text(
+            json.dumps(_model_dump(self._state), indent=2),
+            encoding="utf-8",
+        )
+
+    def _normalize_trello_config(self, config: TrelloConfig) -> TrelloConfig:
+        payload = _model_dump(config)
+        upload_mode = str(payload.get("upload_mode") or "file").strip().lower()
+        if upload_mode not in {"file", "url"}:
+            upload_mode = "file"
+        return TrelloConfig(
+            api_key=str(payload.get("api_key") or "").strip(),
+            token=str(payload.get("token") or "").strip(),
+            card_id=str(payload.get("card_id") or "").strip(),
+            list_id=str(payload.get("list_id") or "").strip(),
+            upload_mode=upload_mode,
+            set_cover=payload.get("set_cover") is not False,
+            updated_at=str(payload.get("updated_at") or "").strip(),
+        )
+
+    def _normalize_integration_config(self, config: IntegrationConfig) -> IntegrationConfig:
+        payload = _model_dump(config)
+        return IntegrationConfig(
+            gemini_api_key=str(payload.get("gemini_api_key") or "").strip(),
+            gemini_model=str(payload.get("gemini_model") or "gemini-2.5-flash").strip() or "gemini-2.5-flash",
+            telegram_bot_token=str(payload.get("telegram_bot_token") or "").strip(),
+            telegram_chat_id=str(payload.get("telegram_chat_id") or "").strip(),
+            playwright_browsers_path=str(payload.get("playwright_browsers_path") or "").strip(),
+            updated_at=str(payload.get("updated_at") or "").strip(),
         )
 
     def _normalize_saved_jobs(self) -> None:

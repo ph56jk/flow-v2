@@ -24,6 +24,25 @@ class AppConfig(BaseModel):
     output_dir: str = ""
 
 
+class TrelloConfig(BaseModel):
+    api_key: str = ""
+    token: str = ""
+    card_id: str = ""
+    list_id: str = ""
+    upload_mode: str = "file"
+    set_cover: bool = True
+    updated_at: str = ""
+
+
+class IntegrationConfig(BaseModel):
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    playwright_browsers_path: str = ""
+    updated_at: str = ""
+
+
 def _model_dump_payload(model: Any) -> Dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump(mode="json")
@@ -226,6 +245,8 @@ class PublicSkillSnapshot(BaseModel):
 
 class StateSnapshot(BaseModel):
     config: AppConfig = Field(default_factory=AppConfig)
+    trello_config: TrelloConfig = Field(default_factory=TrelloConfig)
+    integration_config: IntegrationConfig = Field(default_factory=IntegrationConfig)
     jobs: List[JobRecord] = Field(default_factory=list)
     skills: List[SkillRecord] = Field(default_factory=list)
 
@@ -239,6 +260,48 @@ class ConfigUpdateRequest(BaseModel):
     generation_timeout_s: int = 300
     poll_interval_s: float = 5.0
     output_dir: str = ""
+
+
+class TrelloConfigUpdateRequest(BaseModel):
+    api_key: str = ""
+    token: str = ""
+    card_id: str = ""
+    list_id: str = ""
+    upload_mode: str = "file"
+    set_cover: bool = True
+    clear_credentials: bool = False
+
+
+class IntegrationConfigUpdateRequest(BaseModel):
+    gemini_api_key: str = ""
+    gemini_model: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    playwright_browsers_path: str = ""
+    clear_gemini_api_key: bool = False
+    clear_telegram_bot_token: bool = False
+
+
+class AutomationModuleRequest(BaseModel):
+    id: str = ""
+    type: str = "custom"
+    title: str = ""
+    detail: str = ""
+    enabled: bool = True
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AutomationEdgeRequest(BaseModel):
+    source: str = ""
+    target: str = ""
+    condition: str = "success"
+
+
+class AutomationGraphRequest(BaseModel):
+    version: int = 1
+    modules: List[AutomationModuleRequest] = Field(default_factory=list)
+    edges: List[AutomationEdgeRequest] = Field(default_factory=list)
+    selected_module_id: str = ""
 
 
 class CreateJobRequest(BaseModel):
@@ -256,12 +319,35 @@ class CreateJobRequest(BaseModel):
     reference_media_names: List[str] = Field(default_factory=list)
     media_id: str = ""
     workflow_id: str = ""
+    telegram_chat_id: str = ""
+    telegram_enabled: bool = True
+    trello_enabled: bool = True
+    automation_graph: AutomationGraphRequest = Field(default_factory=AutomationGraphRequest)
+    trello_card_id: str = ""
+    trello_list_id: str = ""
+    trello_set_cover: bool = True
     motion: str = ""
     position: str = ""
     resolution: str = "1080p"
     mask_x: float = 0.5
     mask_y: float = 0.5
     brush_size: int = 40
+
+
+class PromptBatchItemRequest(BaseModel):
+    row: int = 0
+    active: bool = True
+    prompt: str = ""
+    product: str = ""
+    index: str = ""
+    notes: str = ""
+
+
+class PromptBatchRequest(BaseModel):
+    job: CreateJobRequest = Field(default_factory=lambda: CreateJobRequest(type="image"))
+    items: List[PromptBatchItemRequest] = Field(default_factory=list)
+    title: str = ""
+    limit: int = 40
 
 
 class DownloadRequest(BaseModel):

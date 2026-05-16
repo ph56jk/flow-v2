@@ -1,4 +1,4 @@
-# Flow Web UI
+# Flow v2
 
 Web app local điều khiển [flow-py](https://github.com/eddie-fqh/flow-py) qua giao diện trình duyệt. App bọc các luồng chính của `flow-py`: đăng nhập Google Flow, kiểm tra credits, sinh video/ảnh, image-to-video, extend, upscale, camera motion/position, insert/remove object, xem workflows và tải kết quả.
 
@@ -17,11 +17,22 @@ Web app local điều khiển [flow-py](https://github.com/eddie-fqh/flow-py) qu
 
 ## 2. Chạy nhanh kiểu một phát
 
+### Một launcher chung cho mọi hệ điều hành
+
+Nếu máy đã có Python 3.11+, có thể dùng cùng một launcher trên Windows, macOS và Linux:
+
+```bash
+python3 scripts/run_flow_web.py
+```
+
+Launcher này tự tạo `.venv`, cài dependency, cài Chromium cho Playwright, mở trình duyệt và chạy app ở `http://127.0.0.1:8000`.
+Trên Windows nếu chưa có Python 3.11, dùng script PowerShell bên dưới vì nó có thể tự kéo Python portable.
+
 ### Windows
 
 ```powershell
-git clone https://github.com/ph56jk/flow.git
-cd flow
+git clone https://github.com/ph56jk/flow-v2.git
+cd flow-v2
 powershell -ExecutionPolicy Bypass -File .\scripts\run_flow_web.ps1
 ```
 
@@ -33,12 +44,18 @@ Script này sẽ tự:
 - cài Chromium cho Playwright nếu chưa có
 - mở app ở `http://127.0.0.1:8000`
 
+Nếu đã có Python 3.11 sẵn, có thể chạy chung cùng macOS/Linux:
+
+```powershell
+py -3.11 .\scripts\run_flow_web.py
+```
+
 ### Windows portable: giải nén là chạy
 
 Nếu không muốn mỗi máy lại tải Python, dependency và Chromium từ đầu, có thể build sẵn một bản portable ngay trên Windows:
 
 ```powershell
-cd flow
+cd flow-v2
 powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_portable.ps1
 ```
 
@@ -52,11 +69,11 @@ Trong đó đã có sẵn:
 - Python portable
 - dependency Python
 - Chromium cho Playwright
-- launcher `Flow Web UI.cmd`
+- launcher `Flow v2.cmd`
 
 Người dùng cuối chỉ cần:
 1. copy hoặc giải nén thư mục đó sang máy Windows khác
-2. double click `Flow Web UI.cmd`
+2. double click `Flow v2.cmd`
 
 Không cần clone repo, không cần cài Python, không cần chờ tải Chromium lại.
 
@@ -65,7 +82,7 @@ Không cần clone repo, không cần cài Python, không cần chờ tải Chro
 Nếu muốn đóng thành một file zip để share:
 
 ```powershell
-cd flow
+cd flow-v2
 powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
 ```
 
@@ -78,19 +95,21 @@ dist\flow-windows-release.zip
 Người nhận chỉ cần:
 1. tải file zip
 2. giải nén
-3. double click `Flow Web UI.cmd`
+3. double click `Flow v2.cmd`
 
 ### macOS / Linux
 
 ```bash
-git clone https://github.com/ph56jk/flow.git
-cd flow
+git clone https://github.com/ph56jk/flow-v2.git
+cd flow-v2
 chmod +x ./scripts/run_flow_web.sh ./scripts/run_flow_web.command
 ./scripts/run_flow_web.sh
 ```
 
 Nếu dùng macOS và thích double-click:
 - mở [run_flow_web.command](./scripts/run_flow_web.command)
+
+Script `.sh` hiện gọi launcher Python chung nên hành vi trên macOS/Linux bám cùng một đường chạy với Windows có Python 3.11.
 
 ### ⚠️ Windows lưu ý đặc biệt
 
@@ -108,8 +127,8 @@ Nếu dùng macOS và thích double-click:
 ### 3.1. Clone repo
 
 ```bash
-git clone https://github.com/ph56jk/flow.git
-cd flow
+git clone https://github.com/ph56jk/flow-v2.git
+cd flow-v2
 ```
 
 ### 3.2. Cài Python 3.11 (nếu chưa có)
@@ -171,17 +190,45 @@ python -m playwright install chromium
 Tạo file `.env.local` với nội dung:
 
 ```env
-# Tuỳ chọn trên Windows — mặc định script đã tự dùng C:\pw-flow
-PLAYWRIGHT_BROWSERS_PATH=C:\pw-flow
-
-# Tuỳ chọn — để dùng Gemini thật cho Prompt AI
-GEMINI_API_KEY=AIza...
-GEMINI_MODEL=gemini-2.5-flash
+# Không cần env cho thao tác thường ngày:
+# nhập trực tiếp trong app ở sidebar App integrations / Trello storage.
+# Các biến dưới chỉ còn là fallback nâng cao nếu muốn cấu hình ngoài UI.
+# PLAYWRIGHT_BROWSERS_PATH=C:\pw-flow
+# GEMINI_API_KEY=AIza...
+# GEMINI_MODEL=gemini-2.5-flash
+# TELEGRAM_BOT_TOKEN=123456:bot-token
+# TELEGRAM_CHAT_ID=@kenh_duyet_anh
+# TRELLO_API_KEY=your_trello_key
+# TRELLO_TOKEN=your_trello_token
+# TRELLO_CARD_ID=trello_card_id_or_short_link
+# TRELLO_LIST_ID=trello_list_id
+# TRELLO_UPLOAD_MODE=file
 ```
 
-App sẽ tự nạp file này khi khởi động. Nếu không tạo Prompt AI sẽ dùng kho skill nội bộ.
+App sẽ tự nạp file này khi khởi động nếu có, nhưng không bắt buộc. Nếu không tạo Prompt AI sẽ dùng kho skill nội bộ.
+Telegram cũng không bắt buộc: nếu chưa cấu hình, app vẫn tạo ảnh bằng Flow và lưu lịch sử như bình thường.
+Gemini là tuỳ chọn, chỉ dùng cho phần **AI viết prompt**. Nếu workflow chỉ là Google Sheet/Excel -> Flow -> Telegram/Trello thì chỉ cần tài khoản Flow đã đăng nhập.
+Telegram và Playwright path có thể nhập trong sidebar **App integrations** rồi bấm **Lưu app**. Không cần sửa `.env.local`; API key/token được lưu trong state local của app và chỉ trả về frontend dưới dạng trạng thái đã lưu.
+Trello cũng là tuỳ chọn: mở dashboard, đi tới **Trello storage**, dán API key/token, nhập card hoặc list, chọn cách lưu ảnh rồi bấm **Lưu Trello**. API key lấy ở `https://trello.com/app-key`, token tạo từ link token trên trang đó.
 
-### 4.2. File `~/.flow-py/config.json` (tự sinh sau lần đăng nhập đầu)
+### 4.2. Custom giao diện và luồng automation
+
+Trong sidebar **Tùy biến người dùng**, có thể đổi:
+- tên app / scenario
+- mô tả trên thanh đầu
+- nguồn prompt bằng link Google Sheet/CSV, upload `.xlsx/.csv/.tsv`, hoặc paste bảng copy từ Google Sheets
+- màu chủ đạo
+- tên và ghi chú từng module trong diagram
+- Gemini, Telegram, Playwright path và Trello card/list dùng cho bước viết prompt, duyệt và lưu trữ
+- bấm từng module để đổi loại, đổi ký hiệu, bật/tắt, thêm, xóa, nhân bản hoặc di chuyển module trong diagram
+
+Khi dùng file/bảng prompt, app tìm cột `Prompt_Content` hoặc `Prompt`, ưu tiên các dòng có `Active = TRUE`, rồi đưa prompt đầu tiên vào ô **Tạo ảnh bằng Flow**.
+
+Giao diện người dùng chính hiện chỉ để lộ dashboard kiểu Make. Các form Studio cũ vẫn được giữ trong code để tái sử dụng logic tạo ảnh/video khi cần, nhưng không còn là luồng thao tác chính của người dùng.
+
+Các tuỳ chỉnh này được lưu trong trình duyệt bằng `localStorage`. Muốn mang sang máy Windows hoặc MacBook khác, bấm **Export** để tải `flow-automation-config.json`, rồi sang máy mới bấm **Import** trong cùng khu vực.
+
+### 4.3. File `~/.flow-py/config.json` (tự sinh sau lần đăng nhập đầu)
 
 Đảm bảo `"headless": false` để cửa sổ Chromium hiện ra và giải reCAPTCHA khi cần:
 
