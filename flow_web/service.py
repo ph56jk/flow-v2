@@ -600,12 +600,19 @@ class FlowWebService:
             columns,
             {"used", "done", "completed", "generated", "processed", "dadung", "dungroi", "xong"},
         )
-        product_column = self._find_prompt_source_column(columns, {"productname"}) or self._find_prompt_source_column(
-            columns,
-            {"productkey", "product"},
-        )
+        product_key_column = self._find_prompt_source_column(columns, {"productkey", "productid", "productcode", "sku"})
+        product_name_column = self._find_prompt_source_column(columns, {"productname", "producttitle", "product"})
+        product_column = product_name_column or product_key_column
         index_column = self._find_prompt_source_column(columns, {"promptindex", "index", "stt"})
         notes_column = self._find_prompt_source_column(columns, {"notes", "note", "ghichu"})
+        trello_card_column = self._find_prompt_source_column(
+            columns,
+            {"trellocard", "trellocardid", "trellocardurl", "card", "cardid", "cardurl", "sourcecard", "sourcecardurl"},
+        )
+        trello_list_column = self._find_prompt_source_column(
+            columns,
+            {"trellolist", "trellolistid", "list", "listid", "sourcelist"},
+        )
 
         if not prompt_column:
             raise HTTPException(
@@ -620,6 +627,8 @@ class FlowWebService:
                 continue
             active = True if not active_column else self._truthy_sheet_value(row.get(active_column, ""))
             used = False if not used_column else self._truthy_sheet_value(row.get(used_column, ""))
+            product_key = str(row.get(product_key_column) or "").strip() if product_key_column else ""
+            product_name = str(row.get(product_name_column) or "").strip() if product_name_column else ""
             prompts.append(
                 {
                     "row": row_number,
@@ -627,8 +636,12 @@ class FlowWebService:
                     "used": used,
                     "prompt": prompt,
                     "product": str(row.get(product_column) or "").strip() if product_column else "",
+                    "product_key": product_key,
+                    "product_name": product_name,
                     "index": str(row.get(index_column) or "").strip() if index_column else "",
                     "notes": str(row.get(notes_column) or "").strip() if notes_column else "",
+                    "trello_card_id": str(row.get(trello_card_column) or "").strip() if trello_card_column else "",
+                    "trello_list_id": str(row.get(trello_list_column) or "").strip() if trello_list_column else "",
                 }
             )
 
@@ -1673,8 +1686,12 @@ class FlowWebService:
                     "used": False,
                     "prompt": prompt,
                     "product": str(item.product or "").strip(),
+                    "product_key": str(item.product_key or "").strip(),
+                    "product_name": str(item.product_name or "").strip(),
                     "index": str(item.index or "").strip(),
                     "notes": str(item.notes or "").strip(),
+                    "trello_card_id": str(item.trello_card_id or "").strip(),
+                    "trello_list_id": str(item.trello_list_id or "").strip(),
                 }
             )
             if len(normalized) >= limit:
@@ -1692,6 +1709,15 @@ class FlowWebService:
         payload["prompt"] = str(item.get("prompt") or "").strip()
         payload["title"] = self._prompt_batch_child_title(item, index, total)
         payload["source_job_id"] = ""
+        payload["prompt_source_row"] = int(item.get("row") or 0)
+        payload["prompt_product"] = str(item.get("product") or "").strip()
+        payload["prompt_product_key"] = str(item.get("product_key") or "").strip()
+        payload["prompt_index"] = str(item.get("index") or "").strip()
+        payload["prompt_notes"] = str(item.get("notes") or "").strip()
+        if item.get("trello_card_id"):
+            payload["trello_card_id"] = str(item.get("trello_card_id") or "").strip()
+        if item.get("trello_list_id"):
+            payload["trello_list_id"] = str(item.get("trello_list_id") or "").strip()
         return CreateJobRequest(**payload)
 
     async def _patch_prompt_batch_result(
@@ -4058,6 +4084,16 @@ exit 1
         if not card_id:
             if not board_id:
                 raise RuntimeError("Trello Source cần Card ID/link card hoặc Board URL Trello có card chứa attachment ảnh.")
+            if request.prompt_source_row and not list_id:
+                product_hint = (
+                    request.prompt_product
+                    or request.prompt_product_key
+                    or f"dòng {request.prompt_source_row}"
+                )
+                raise RuntimeError(
+                    "Batch sheet chưa có Trello card cụ thể nên app đã dừng để tránh lấy nhầm card đầu tiên trên board. "
+                    f"Hãy dán link card ở cục Trello Source, chọn List lọc card, hoặc thêm cột Trello_Card/Card_URL cho {product_hint}."
+                )
             card_id = await asyncio.to_thread(self._trello_first_image_card_id_on_board, key, token, board_id, list_id)
             if not card_id:
                 scope = f" trong list {list_id}" if list_id else ""

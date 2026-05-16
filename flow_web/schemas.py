@@ -329,6 +329,11 @@ class CreateJobRequest(BaseModel):
     trello_card_id: str = ""
     trello_list_id: str = ""
     trello_set_cover: bool = True
+    prompt_source_row: int = 0
+    prompt_product: str = ""
+    prompt_product_key: str = ""
+    prompt_index: str = ""
+    prompt_notes: str = ""
     motion: str = ""
     position: str = ""
     resolution: str = "1080p"
@@ -343,8 +348,12 @@ class PromptBatchItemRequest(BaseModel):
     used: bool = False
     prompt: str = ""
     product: str = ""
+    product_key: str = ""
+    product_name: str = ""
     index: str = ""
     notes: str = ""
+    trello_card_id: str = ""
+    trello_list_id: str = ""
 
 
 class PromptBatchRequest(BaseModel):

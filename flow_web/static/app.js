@@ -423,6 +423,7 @@ function defaultAutomationConfig() {
     selectedStep: "flow",
     sourceType: "sheets",
     sourceLocation: DEFAULT_PROMPT_SHEET_URL,
+    promptProductFilter: "",
     telegramChat: "",
     sheetLog: "",
     trelloBoardId: DEFAULT_TRELLO_BOARD_URL,
@@ -458,6 +459,7 @@ function normalizeAutomationConfig(value = {}) {
     selectedStep,
     sourceType,
     sourceLocation,
+    promptProductFilter: String(parsed?.promptProductFilter || ""),
     telegramChat: String(parsed?.telegramChat || ""),
     sheetLog: String(parsed?.sheetLog || ""),
     trelloBoardId,
@@ -711,6 +713,7 @@ const elements = {
   automationSheetFileButton: document.querySelector("#automationSheetFileButton"),
   automationSheetPreviewButton: document.querySelector("#automationSheetPreviewButton"),
   automationSheetPreviewList: document.querySelector("#automationSheetPreviewList"),
+  automationProductFilterInput: document.querySelector("#automationProductFilterInput"),
   automationTrelloBoardInput: document.querySelector("#automationTrelloBoardInput"),
   automationTrelloBoardStorageInput: document.querySelector("#automationTrelloBoardStorageInput"),
   automationTrelloCardInput: document.querySelector("#automationTrelloCardInput"),
@@ -1626,6 +1629,7 @@ function syncAutomationFromForm() {
   state.automation.prompt = elements.automationPromptInput.value;
   state.automation.sourceType = elements.automationSourceType.value || "manual";
   state.automation.sourceLocation = elements.automationSourceLocationInput.value.trim();
+  state.automation.promptProductFilter = elements.automationProductFilterInput?.value?.trim() || "";
   state.automation.telegramChat = elements.automationTelegramInput.value.trim();
   state.automation.sheetLog = elements.automationSheetInput?.value?.trim() || state.automation.sheetLog || "";
   state.automation.trelloBoardId =
@@ -1852,6 +1856,9 @@ function renderAutomationInspector(stats) {
   if (document.activeElement !== elements.automationSourceLocationInput) {
     elements.automationSourceLocationInput.value = state.automation.sourceLocation || "";
   }
+  if (elements.automationProductFilterInput && document.activeElement !== elements.automationProductFilterInput) {
+    elements.automationProductFilterInput.value = state.automation.promptProductFilter || "";
+  }
   if (document.activeElement !== elements.automationAppEyebrowInput) {
     elements.automationAppEyebrowInput.value = state.automation.appEyebrow || "Flow v2";
   }
@@ -1932,6 +1939,10 @@ function renderModuleSettings(module) {
         <span>Sheet / CSV link</span>
         <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(settings.sourceLocation || state.automation.sourceLocation || "")}" placeholder="Dán link Google Sheet hoặc CSV" />
       </label>
+      <label class="field">
+        <span>Lọc sản phẩm</span>
+        <input type="text" data-module-setting="promptProductFilter" value="${escapeHtml(settings.promptProductFilter || state.automation.promptProductFilter || "")}" placeholder="Ví dụ: tote_bag, áo, wedding_hoop" />
+      </label>
       <div class="customize-actions source-actions">
         <button type="button" class="ghost-button card-button" data-module-action="preview-source">Lấy prompt</button>
         <button type="button" class="ghost-button card-button" data-module-action="upload-source">Upload file</button>
@@ -1985,7 +1996,7 @@ function renderModuleSettings(module) {
         <span>Số ảnh lấy tối đa</span>
         <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 4)}" />
       </label>
-      <small>Nếu chưa nhập card, cục này sẽ tìm card đầu tiên trên board có attachment ảnh. Trello Archive phía sau sẽ lưu ảnh duyệt về đúng card đó.</small>
+      <small>Batch từ sheet nên có Card lấy ảnh gốc hoặc cột Trello_Card/Card_URL. Nếu chỉ có board, app sẽ dừng để tránh lấy nhầm card đầu tiên.</small>
     `;
     return;
   }
@@ -2198,9 +2209,22 @@ function activePromptSourceItems() {
     return [];
   }
   const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
+  const filter = String(state.automation.promptProductFilter || "").trim().toLowerCase();
   return items
     .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
     .filter((item) => item?.used !== true)
+    .filter((item) => {
+      if (!filter) {
+        return true;
+      }
+      const haystack = [
+        item.product,
+        item.product_key,
+        item.product_name,
+        item.notes,
+      ].map((value) => String(value || "").toLowerCase()).join(" ");
+      return haystack.includes(filter);
+    })
     .slice(0, 40)
     .map((item) => ({
       row: Number(item.row || 0),
@@ -2208,8 +2232,12 @@ function activePromptSourceItems() {
       used: false,
       prompt: String(item.prompt || "").trim(),
       product: String(item.product || "").trim(),
+      product_key: String(item.product_key || "").trim(),
+      product_name: String(item.product_name || "").trim(),
       index: String(item.index || "").trim(),
       notes: String(item.notes || "").trim(),
+      trello_card_id: String(item.trello_card_id || "").trim(),
+      trello_list_id: String(item.trello_list_id || "").trim(),
     }));
 }
 
@@ -3673,6 +3701,11 @@ function syncModuleSettingFromControl(control) {
     if (elements.automationSourceLocationInput) {
       elements.automationSourceLocationInput.value = state.automation.sourceLocation;
     }
+  } else if (setting === "promptProductFilter") {
+    state.automation.promptProductFilter = String(value || "").trim();
+    if (elements.automationProductFilterInput) {
+      elements.automationProductFilterInput.value = state.automation.promptProductFilter;
+    }
   } else if (setting === "imageModel") {
     state.drafts.image.model = value || defaultModelForMode("image");
   } else if (setting === "imageAspect") {
@@ -4594,6 +4627,7 @@ elements.scenarioCanvas.addEventListener("click", (event) => {
   elements.automationAppTitleInput,
   elements.automationAppSubtitleInput,
   elements.automationSourceLocationInput,
+  elements.automationProductFilterInput,
   elements.automationAccentInput,
 ]
   .filter(Boolean)
