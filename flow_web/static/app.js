@@ -18,10 +18,13 @@ const REFERENCE_ROLE_OPTIONS = [
 ];
 const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
 const AUTOMATION_CONFIG_VERSION = 1;
+const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jkj2p_H2hsbDgh-kzc0WqUFWtmqR0gYqbE9Zp4U/edit?gid=2137274733#gid=2137274733";
+const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
 const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "telegram", "review_hold", "log"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
 const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
+let promptSourceAutoPreviewStarted = false;
 const AUTOMATION_MODULE_TYPE_CONFIG = {
   source: {
     label: "Prompt source",
@@ -418,11 +421,11 @@ function defaultAutomationConfig() {
     enabled: false,
     view: "diagram",
     selectedStep: "flow",
-    sourceType: "manual",
-    sourceLocation: "",
+    sourceType: "sheets",
+    sourceLocation: DEFAULT_PROMPT_SHEET_URL,
     telegramChat: "",
     sheetLog: "",
-    trelloBoardId: "",
+    trelloBoardId: DEFAULT_TRELLO_BOARD_URL,
     trelloCardId: "",
     trelloListId: "",
     trelloSetCover: true,
@@ -443,17 +446,21 @@ function normalizeAutomationConfig(value = {}) {
   const modules = normalizeAutomationModules(parsed);
   const hasSelected = modules.some((module) => module.id === parsed?.selectedStep);
   const selectedStep = hasSelected ? parsed.selectedStep : (modules.find((module) => module.type === "flow") || modules[0])?.id || "flow";
+  const parsedSourceLocation = String(parsed?.sourceLocation || "").trim();
+  const sourceLocation = parsedSourceLocation || fallback.sourceLocation;
+  const sourceType = parsedSourceLocation ? String(parsed?.sourceType || fallback.sourceType) : fallback.sourceType;
+  const trelloBoardId = String(parsed?.trelloBoardId || "").trim() || fallback.trelloBoardId;
   return {
     ...fallback,
     ...parsed,
     version: AUTOMATION_CONFIG_VERSION,
     view: ["diagram", "history", "incomplete"].includes(parsed?.view) ? parsed.view : fallback.view,
     selectedStep,
-    sourceType: String(parsed?.sourceType || fallback.sourceType),
-    sourceLocation: String(parsed?.sourceLocation || ""),
+    sourceType,
+    sourceLocation,
     telegramChat: String(parsed?.telegramChat || ""),
     sheetLog: String(parsed?.sheetLog || ""),
-    trelloBoardId: String(parsed?.trelloBoardId || ""),
+    trelloBoardId,
     trelloCardId: String(parsed?.trelloCardId || ""),
     trelloListId: String(parsed?.trelloListId || ""),
     trelloSetCover: parsed?.trelloSetCover !== false,
@@ -3167,6 +3174,7 @@ async function loadState({ silent = false } = {}) {
     }
 
     renderAll();
+    maybeAutoPreviewPromptSource();
     if (isReady() && !state.modelOptionsLoaded) {
       void loadModelOptions();
     }
@@ -3176,6 +3184,17 @@ async function loadState({ silent = false } = {}) {
   } catch (error) {
     showMessage(error.message, "error");
   }
+}
+
+function maybeAutoPreviewPromptSource() {
+  if (promptSourceAutoPreviewStarted || state.promptSourcePreview?.prompt_count) {
+    return;
+  }
+  if (state.automation.sourceType !== "sheets" || !String(state.automation.sourceLocation || "").trim()) {
+    return;
+  }
+  promptSourceAutoPreviewStarted = true;
+  void previewPromptSource(null, { silent: true });
 }
 
 async function saveConfig(event) {
@@ -3591,7 +3610,7 @@ async function saveIntegrationConfig({ clearSecrets = false } = {}) {
   }
 }
 
-async function previewPromptSource(file = null) {
+async function previewPromptSource(file = null, { silent = false } = {}) {
   syncAutomationFromForm();
   const data = new FormData();
   data.append("source_url", state.automation.sourceLocation || "");
@@ -3618,9 +3637,13 @@ async function previewPromptSource(file = null) {
     saveAutomationConfig(state.automation);
     renderAll();
     const count = Number(payload.active_count || payload.prompt_count || 0);
-    showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi gửi Telegram duyệt.`, "success");
+    if (!silent) {
+      showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi gửi Telegram duyệt.`, "success");
+    }
   } catch (error) {
-    showMessage(error.message, "error");
+    if (!silent) {
+      showMessage(error.message, "error");
+    }
   } finally {
     if (elements.automationSheetPreviewButton) {
       elements.automationSheetPreviewButton.disabled = false;
