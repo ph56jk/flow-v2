@@ -1729,12 +1729,12 @@ class FlowWebService:
 
         matched = [item for item in items if self._prompt_batch_item_matches_trello_source(item, source_hint)]
         if not matched:
-            source_label = source_hint.get("card_name") or source_hint.get("list_name") or source_hint.get("card_id") or "Trello source"
+            source_label = source_hint.get("card_name") or source_hint.get("card_id") or "card Trello đang ở list nguồn"
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Card/list Trello nguồn là {source_label}, nhưng sheet chưa có prompt Active khớp Product_Key/Product_Name. "
-                    "Hãy điền ô Lọc sản phẩm, đổi tên card/list theo Product_Key, hoặc thêm cột Trello_Card/Card_URL vào sheet."
+                    f"Card Trello nguồn là {source_label}, nhưng sheet chưa có prompt Active khớp Product_Key/Product_Name. "
+                    "Hãy đổi tên card theo Product_Key trong sheet, điền ô Lọc sản phẩm, hoặc thêm cột Trello_Card/Card_URL vào sheet."
                 ),
             )
 
@@ -1745,11 +1745,7 @@ class FlowWebService:
         return CreateJobRequest(**payload), matched, source_hint
 
     def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
-        source_terms = [
-            source_hint.get("card_name"),
-            source_hint.get("list_name"),
-            source_hint.get("card_short_link"),
-        ]
+        source_terms = [source_hint.get("card_name")]
         source_text = " ".join(self._compact_match_text(value) for value in source_terms if value)
         if not source_text:
             return False
