@@ -209,7 +209,7 @@ App sẽ tự nạp file này khi khởi động nếu có, nhưng không bắt 
 Telegram cũng không bắt buộc: nếu chưa cấu hình, app vẫn tạo ảnh bằng Flow và lưu lịch sử như bình thường.
 Gemini là tuỳ chọn, chỉ dùng cho phần **AI viết prompt**. Nếu workflow chỉ là Google Sheet/Excel -> Flow -> Telegram/Trello thì chỉ cần tài khoản Flow đã đăng nhập.
 Telegram và Playwright path có thể nhập trong sidebar **App integrations** rồi bấm **Lưu app**. Không cần sửa `.env.local`; API key/token được lưu trong state local của app và chỉ trả về frontend dưới dạng trạng thái đã lưu.
-Trello cũng là tuỳ chọn: mở dashboard, đi tới **Trello storage**, dán API key/token, nhập card hoặc list, chọn cách lưu ảnh rồi bấm **Lưu Trello**. API key lấy ở `https://trello.com/app-key`, token tạo từ link token trên trang đó.
+Trello cũng là tuỳ chọn: mở dashboard, đi tới **Trello storage**, dán API key/token, nhập board/card/list, chọn cách lưu ảnh rồi bấm **Lưu Trello**. API key lấy ở `https://trello.com/app-key`, token tạo từ link token trên trang đó. Có thể dán board URL như `https://trello.com/b/board123/demo-board`; Trello Source sẽ tự tìm card đầu tiên có attachment ảnh nếu chưa nhập card cụ thể.
 
 ### 4.2. Custom giao diện và luồng automation
 

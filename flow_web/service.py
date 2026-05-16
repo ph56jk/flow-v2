@@ -370,6 +370,7 @@ class FlowWebService:
         config = TrelloConfig(
             api_key=api_key,
             token=token,
+            board_id=self._normalize_trello_board_id(request.board_id),
             card_id=self._normalize_trello_card_id(request.card_id),
             list_id=self._normalize_trello_id(request.list_id),
             upload_mode=upload_mode,
@@ -382,16 +383,18 @@ class FlowWebService:
     def _trello_config_snapshot(self, config: TrelloConfig) -> Dict[str, Any]:
         api_key = str(config.api_key or "").strip()
         token = str(config.token or "").strip()
+        board_id = self._normalize_trello_board_id(config.board_id)
         card_id = self._normalize_trello_card_id(config.card_id)
         list_id = self._normalize_trello_id(config.list_id)
         upload_mode = str(config.upload_mode or "file").strip().lower()
         if upload_mode not in {"file", "url"}:
             upload_mode = "file"
         return {
-            "configured": bool(api_key and token and (card_id or list_id)),
+            "configured": bool(api_key and token and (board_id or card_id or list_id)),
             "credentials_saved": bool(api_key and token),
             "api_key_saved": bool(api_key),
             "token_saved": bool(token),
+            "board_id": board_id,
             "card_id": card_id,
             "list_id": list_id,
             "upload_mode": upload_mode,
@@ -3637,6 +3640,8 @@ exit 1
         if module.get("type") == "telegram" and settings.get("telegramChat"):
             payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
         if module.get("type") in {"trello", "trello_source"}:
+            if settings.get("trelloBoard"):
+                payload["trello_board_id"] = str(settings.get("trelloBoard") or "").strip()
             if settings.get("trelloCard"):
                 payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
             if settings.get("trelloList"):
@@ -4013,11 +4018,24 @@ exit 1
             return request
 
         module_request = self._request_with_automation_module_settings(request, module)
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            module_request.trello_board_id
+            or request.trello_board_id
+            or trello_config.board_id
+            or os.getenv("TRELLO_BOARD_ID", "")
+        )
         card_id = self._normalize_trello_card_id(
             module_request.trello_card_id
             or request.trello_card_id
-            or self.store.snapshot().trello_config.card_id
+            or trello_config.card_id
             or os.getenv("TRELLO_CARD_ID", "")
+        )
+        list_id = self._normalize_trello_id(
+            module_request.trello_list_id
+            or request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
         )
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         try:
@@ -4031,14 +4049,19 @@ exit 1
             request,
             module["id"],
             "running",
-            input_data={"card_id": card_id, "limit": limit},
+            input_data={"board_id": board_id, "card_id": card_id, "list_id": list_id, "limit": limit},
         )
 
         key, token = self._trello_credentials()
         if not key or not token:
             raise RuntimeError("Trello Source cần API key/token Trello để lấy ảnh gốc từ card.")
         if not card_id:
-            raise RuntimeError("Trello Source cần Card ID hoặc link card Trello chứa ảnh gốc.")
+            if not board_id:
+                raise RuntimeError("Trello Source cần Card ID/link card hoặc Board URL Trello có card chứa attachment ảnh.")
+            card_id = await asyncio.to_thread(self._trello_first_image_card_id_on_board, key, token, board_id, list_id)
+            if not card_id:
+                scope = f" trong list {list_id}" if list_id else ""
+                raise RuntimeError(f"Board Trello này chưa có card nào{scope} chứa attachment ảnh để làm ảnh tham chiếu.")
 
         paths = await asyncio.to_thread(self._download_trello_card_image_attachments, key, token, card_id, job_id, limit)
         if not paths:
@@ -4058,6 +4081,10 @@ exit 1
                 for index, _ in enumerate(selected_paths)
             ],
         )
+        if board_id:
+            payload["trello_board_id"] = board_id
+        if list_id:
+            payload["trello_list_id"] = payload.get("trello_list_id") or list_id
         payload["trello_card_id"] = payload.get("trello_card_id") or card_id
 
         await self._set_automation_module_status(
@@ -4066,7 +4093,9 @@ exit 1
             module["id"],
             "completed",
             output={
+                "board_id": board_id,
                 "card_id": card_id,
+                "list_id": list_id,
                 "reference_image_count": len(selected_paths),
                 "reference_image_names": [Path(path).name for path in selected_paths],
             },
@@ -4707,6 +4736,16 @@ exit 1
             raw = raw.split("/", 1)[0]
         return raw.strip()
 
+    def _normalize_trello_board_id(self, value: str) -> str:
+        raw = self._normalize_trello_id(value)
+        if "/b/" in raw:
+            raw = raw.split("/b/", 1)[1]
+        if raw.startswith("b/"):
+            raw = raw[2:]
+        if "/" in raw:
+            raw = raw.split("/", 1)[0]
+        return raw.strip()
+
     def _trello_card_name(self, job_id: str, request: CreateJobRequest) -> str:
         prompt = str(request.prompt or "").strip().replace("\n", " ")
         prompt = re.sub(r"\s+", " ", prompt)
@@ -4795,6 +4834,43 @@ exit 1
             target.write_bytes(data)
             paths.append(str(target))
         return paths
+
+    def _trello_first_image_card_id_on_board(
+        self,
+        key: str,
+        token: str,
+        board_id: str,
+        list_id: str = "",
+    ) -> str:
+        board_id = self._normalize_trello_board_id(board_id)
+        list_id = self._normalize_trello_id(list_id)
+        if not board_id:
+            return ""
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/cards",
+            key,
+            token,
+            fields={"fields": "id,name,shortLink,url,idList,closed", "filter": "open"},
+        )
+        cards = payload if isinstance(payload, list) else []
+        for card in cards:
+            if not isinstance(card, dict) or card.get("closed"):
+                continue
+            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not card_id:
+                continue
+            if list_id and self._normalize_trello_id(str(card.get("idList") or "")) != list_id:
+                continue
+            attachments_payload = self._trello_get_json(
+                f"cards/{quote(card_id, safe='')}/attachments",
+                key,
+                token,
+                fields={"fields": "id,name,url,mimeType"},
+            )
+            attachments = attachments_payload if isinstance(attachments_payload, list) else []
+            if any(self._trello_attachment_is_image(item) for item in attachments if isinstance(item, dict)):
+                return card_id
+        return ""
 
     def _trello_attachment_is_image(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").lower()

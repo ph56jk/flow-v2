@@ -422,6 +422,7 @@ function defaultAutomationConfig() {
     sourceLocation: "",
     telegramChat: "",
     sheetLog: "",
+    trelloBoardId: "",
     trelloCardId: "",
     trelloListId: "",
     trelloSetCover: true,
@@ -452,6 +453,7 @@ function normalizeAutomationConfig(value = {}) {
     sourceLocation: String(parsed?.sourceLocation || ""),
     telegramChat: String(parsed?.telegramChat || ""),
     sheetLog: String(parsed?.sheetLog || ""),
+    trelloBoardId: String(parsed?.trelloBoardId || ""),
     trelloCardId: String(parsed?.trelloCardId || ""),
     trelloListId: String(parsed?.trelloListId || ""),
     trelloSetCover: parsed?.trelloSetCover !== false,
@@ -500,6 +502,7 @@ function defaultTrelloState() {
     credentials_saved: false,
     api_key_saved: false,
     token_saved: false,
+    board_id: "",
     card_id: "",
     list_id: "",
     upload_mode: "file",
@@ -517,6 +520,7 @@ function normalizeTrelloState(value = {}) {
     credentials_saved: Boolean(payload.credentials_saved),
     api_key_saved: Boolean(payload.api_key_saved),
     token_saved: Boolean(payload.token_saved),
+    board_id: String(payload.board_id || ""),
     card_id: String(payload.card_id || ""),
     list_id: String(payload.list_id || ""),
     upload_mode: uploadMode,
@@ -700,6 +704,8 @@ const elements = {
   automationSheetFileButton: document.querySelector("#automationSheetFileButton"),
   automationSheetPreviewButton: document.querySelector("#automationSheetPreviewButton"),
   automationSheetPreviewList: document.querySelector("#automationSheetPreviewList"),
+  automationTrelloBoardInput: document.querySelector("#automationTrelloBoardInput"),
+  automationTrelloBoardStorageInput: document.querySelector("#automationTrelloBoardStorageInput"),
   automationTrelloCardInput: document.querySelector("#automationTrelloCardInput"),
   automationTrelloListInput: document.querySelector("#automationTrelloListInput"),
   automationTrelloKeyInput: document.querySelector("#automationTrelloKeyInput"),
@@ -1615,6 +1621,11 @@ function syncAutomationFromForm() {
   state.automation.sourceLocation = elements.automationSourceLocationInput.value.trim();
   state.automation.telegramChat = elements.automationTelegramInput.value.trim();
   state.automation.sheetLog = elements.automationSheetInput?.value?.trim() || state.automation.sheetLog || "";
+  state.automation.trelloBoardId =
+    elements.automationTrelloBoardInput?.value?.trim() ||
+    elements.automationTrelloBoardStorageInput?.value?.trim() ||
+    state.automation.trelloBoardId ||
+    "";
   state.automation.trelloCardId = elements.automationTrelloCardInput.value.trim();
   state.automation.trelloListId = elements.automationTrelloListInput.value.trim();
   state.automation.appEyebrow = elements.automationAppEyebrowInput.value.trim() || "Flow v2";
@@ -1670,7 +1681,14 @@ function automationStepTone(module, stats) {
     if (!state.trello?.credentials_saved) {
       return "blocked";
     }
-    return module.settings?.trelloCard || state.automation.trelloCardId || state.trello?.card_id ? "ready" : "pending";
+    return module.settings?.trelloCard ||
+      state.automation.trelloCardId ||
+      state.trello?.card_id ||
+      module.settings?.trelloBoard ||
+      state.automation.trelloBoardId ||
+      state.trello?.board_id
+      ? "ready"
+      : "pending";
   }
   if (stepKey === "normalize") {
     return state.automation.prompt.trim() ? "done" : "pending";
@@ -1796,6 +1814,13 @@ function renderAutomationInspector(stats) {
       elements.automationSheetInput.value = state.automation.sheetLog || "";
     }
   }
+  const boardValue = state.automation.trelloBoardId || state.trello?.board_id || "";
+  if (document.activeElement !== elements.automationTrelloBoardInput && elements.automationTrelloBoardInput) {
+    elements.automationTrelloBoardInput.value = boardValue;
+  }
+  if (document.activeElement !== elements.automationTrelloBoardStorageInput && elements.automationTrelloBoardStorageInput) {
+    elements.automationTrelloBoardStorageInput.value = boardValue;
+  }
   if (document.activeElement !== elements.automationTrelloCardInput) {
     elements.automationTrelloCardInput.value = state.automation.trelloCardId || state.trello?.card_id || "";
   }
@@ -1847,9 +1872,9 @@ function renderAutomationInspector(stats) {
       elements.automationTrelloStatus.textContent = "Đã sẵn sàng";
       elements.automationTrelloStatus.dataset.state = "ready";
     } else if (state.trello?.credentials_saved) {
-      elements.automationTrelloStatus.textContent = "Thiếu card/list";
+      elements.automationTrelloStatus.textContent = "Thiếu board/card/list";
       elements.automationTrelloStatus.dataset.state = "pending";
-    } else if (state.trello?.card_id || state.trello?.list_id) {
+    } else if (state.trello?.board_id || state.trello?.card_id || state.trello?.list_id) {
       elements.automationTrelloStatus.textContent = "Thiếu key/token";
       elements.automationTrelloStatus.dataset.state = "pending";
     } else {
@@ -1938,14 +1963,22 @@ function renderModuleSettings(module) {
   if (type === "trello_source") {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
+        <span>Board chứa card ảnh</span>
+        <input type="text" data-module-setting="trelloBoard" value="${escapeHtml(settings.trelloBoard || state.automation.trelloBoardId || state.trello?.board_id || "")}" placeholder="Board ID hoặc link board Trello" />
+      </label>
+      <label class="field">
         <span>Card lấy ảnh gốc</span>
         <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello chứa ảnh gốc" />
+      </label>
+      <label class="field">
+        <span>List lọc card tùy chọn</span>
+        <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu chỉ muốn lấy card trong một list" />
       </label>
       <label class="field">
         <span>Số ảnh lấy tối đa</span>
         <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 4)}" />
       </label>
-      <small>Cục này tải ảnh attachment từ card Trello để làm ảnh tham chiếu cho Google Flow. Trello Archive phía sau sẽ lưu ảnh duyệt về đúng card này.</small>
+      <small>Nếu chưa nhập card, cục này sẽ tìm card đầu tiên trên board có attachment ảnh. Trello Archive phía sau sẽ lưu ảnh duyệt về đúng card đó.</small>
     `;
     return;
   }
@@ -2180,7 +2213,12 @@ function renderEasyPanel(stats) {
   const flowModuleReady = automationModuleEnabled("flow");
   const flowReady = flowModuleReady && projectReady && Boolean(state.auth?.authenticated);
   const telegramReady = automationModuleEnabled("telegram") && Boolean(state.integrations?.telegram?.configured || state.automation.telegramChat);
-  const trelloReady = automationModuleEnabled("trello") && Boolean(state.trello?.configured || state.automation.trelloCardId || state.automation.trelloListId);
+  const trelloReady = automationModuleEnabled("trello") && Boolean(
+    state.trello?.configured ||
+    state.automation.trelloBoardId ||
+    state.automation.trelloCardId ||
+    state.automation.trelloListId
+  );
 
   if (elements.easyPromptStatus) {
     elements.easyPromptStatus.textContent = batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Dán sheet hoặc nhập tay";
@@ -3445,6 +3483,7 @@ async function saveTrelloConfig({ clearCredentials = false } = {}) {
   const payload = {
     api_key: clearCredentials ? "" : elements.automationTrelloKeyInput?.value?.trim() || "",
     token: clearCredentials ? "" : elements.automationTrelloTokenInput?.value?.trim() || "",
+    board_id: elements.automationTrelloBoardStorageInput?.value?.trim() || elements.automationTrelloBoardInput?.value?.trim() || "",
     card_id: elements.automationTrelloCardInput?.value?.trim() || "",
     list_id: elements.automationTrelloListInput?.value?.trim() || "",
     upload_mode: elements.automationTrelloUploadMode?.value || state.trello?.upload_mode || "file",
@@ -3465,6 +3504,7 @@ async function saveTrelloConfig({ clearCredentials = false } = {}) {
       body: JSON.stringify(payload),
     });
     state.trello = normalizeTrelloState(response.trello || {});
+    state.automation.trelloBoardId = state.trello.board_id || payload.board_id;
     state.automation.trelloCardId = state.trello.card_id || payload.card_id;
     state.automation.trelloListId = state.trello.list_id || payload.list_id;
     saveAutomationConfig(state.automation);
@@ -3478,13 +3518,13 @@ async function saveTrelloConfig({ clearCredentials = false } = {}) {
 
     renderAutomationDashboard();
     if (clearCredentials) {
-      showMessage("Đã xóa key/token Trello trong app. Card/list vẫn giữ để cấu hình lại nhanh.", "success");
+      showMessage("Đã xóa key/token Trello trong app. Board/card/list vẫn giữ để cấu hình lại nhanh.", "success");
     } else if (state.trello.configured) {
       showMessage("Đã lưu Trello. Ảnh Flow tạo xong sẽ tự đẩy lên nơi lưu này.", "success");
     } else if (state.trello.credentials_saved) {
-      showMessage("Đã lưu key/token Trello. Hãy thêm card hoặc list để app biết lưu ảnh vào đâu.", "success");
+      showMessage("Đã lưu key/token Trello. Hãy thêm board, card hoặc list để app biết lấy/lưu ảnh ở đâu.", "success");
     } else {
-      showMessage("Đã lưu card/list Trello. Hãy thêm API key và token để bật lưu trữ tự động.", "success");
+      showMessage("Đã lưu board/card/list Trello. Hãy thêm API key và token để bật tự động.", "success");
     }
   } catch (error) {
     showMessage(error.message, "error");
@@ -3623,6 +3663,14 @@ function syncModuleSettingFromControl(control) {
     if (elements.automationTelegramInput) {
       elements.automationTelegramInput.value = state.automation.telegramChat;
     }
+  } else if (setting === "trelloBoard") {
+    state.automation.trelloBoardId = String(value || "").trim();
+    if (elements.automationTrelloBoardInput) {
+      elements.automationTrelloBoardInput.value = state.automation.trelloBoardId;
+    }
+    if (elements.automationTrelloBoardStorageInput) {
+      elements.automationTrelloBoardStorageInput.value = state.automation.trelloBoardId;
+    }
   } else if (setting === "trelloCard") {
     state.automation.trelloCardId = String(value || "").trim();
     if (elements.automationTrelloCardInput) {
@@ -3729,6 +3777,7 @@ function automationImageJobPayload(prompt) {
     telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
     trello_enabled: trelloEnabled,
     automation_graph: graph,
+    trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
     trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
     trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
     trello_set_cover: state.automation.trelloSetCover !== false,
@@ -4514,6 +4563,8 @@ elements.scenarioCanvas.addEventListener("click", (event) => {
   elements.automationModuleEnabledInput,
   elements.automationTelegramInput,
   elements.automationSheetInput,
+  elements.automationTrelloBoardInput,
+  elements.automationTrelloBoardStorageInput,
   elements.automationTrelloCardInput,
   elements.automationTrelloListInput,
   elements.automationAppEyebrowInput,

@@ -27,6 +27,7 @@ class AppConfig(BaseModel):
 class TrelloConfig(BaseModel):
     api_key: str = ""
     token: str = ""
+    board_id: str = ""
     card_id: str = ""
     list_id: str = ""
     upload_mode: str = "file"
@@ -265,6 +266,7 @@ class ConfigUpdateRequest(BaseModel):
 class TrelloConfigUpdateRequest(BaseModel):
     api_key: str = ""
     token: str = ""
+    board_id: str = ""
     card_id: str = ""
     list_id: str = ""
     upload_mode: str = "file"
@@ -323,6 +325,7 @@ class CreateJobRequest(BaseModel):
     telegram_enabled: bool = True
     trello_enabled: bool = True
     automation_graph: AutomationGraphRequest = Field(default_factory=AutomationGraphRequest)
+    trello_board_id: str = ""
     trello_card_id: str = ""
     trello_list_id: str = ""
     trello_set_cover: bool = True

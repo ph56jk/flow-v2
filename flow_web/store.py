@@ -316,6 +316,7 @@ class StateStore:
         return TrelloConfig(
             api_key=str(payload.get("api_key") or "").strip(),
             token=str(payload.get("token") or "").strip(),
+            board_id=str(payload.get("board_id") or "").strip(),
             card_id=str(payload.get("card_id") or "").strip(),
             list_id=str(payload.get("list_id") or "").strip(),
             upload_mode=upload_mode,
