@@ -1647,9 +1647,12 @@ class FlowWebService:
             raise HTTPException(status_code=400, detail="Batch prompt từ sheet hiện chỉ hỗ trợ tạo ảnh.")
 
         limit = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(request.limit or self.MAX_PROMPT_BATCH_ITEMS)))
-        items = self._prompt_batch_items(request.items, limit)
+        source_item_count = len(request.items or [])
+        items = self._prompt_batch_items(request.items, max(limit, source_item_count))
         if not items:
             raise HTTPException(status_code=400, detail="Sheet chưa có dòng Active=TRUE nào có prompt để chạy.")
+        base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
+        items = items[:limit]
 
         validation_payload = _model_dump(base_request)
         validation_payload["prompt"] = items[0]["prompt"]
@@ -1666,8 +1669,9 @@ class FlowWebService:
                 "limit": limit,
                 "job": _model_dump(base_request),
                 "items": items,
+                "trello_source_hint": trello_source_hint,
             },
-            result={"total": len(items), "completed": 0, "failed": 0, "child_job_ids": []},
+            result={"total": len(items), "completed": 0, "failed": 0, "child_job_ids": [], "trello_source_hint": trello_source_hint},
         )
         await self.store.add_job(batch_job)
         self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
@@ -1697,6 +1701,73 @@ class FlowWebService:
             if len(normalized) >= limit:
                 break
         return normalized
+
+    async def _align_prompt_batch_with_trello_source(
+        self,
+        base_request: CreateJobRequest,
+        items: List[Dict[str, Any]],
+    ) -> tuple[CreateJobRequest, List[Dict[str, Any]], Dict[str, Any]]:
+        if not items or any(str(item.get("trello_card_id") or "").strip() for item in items):
+            return base_request, items, {}
+
+        graph = self._automation_graph_payload(base_request)
+        module = next(
+            (
+                item
+                for item in graph["modules"]
+                if item["enabled"] and item["type"] == "trello_source"
+            ),
+            None,
+        )
+        if module is None:
+            return base_request, items, {}
+
+        module_request = self._request_with_automation_module_settings(base_request, module)
+        source_hint = await asyncio.to_thread(self._trello_source_card_hint, module_request)
+        if not source_hint:
+            return base_request, items, {}
+
+        matched = [item for item in items if self._prompt_batch_item_matches_trello_source(item, source_hint)]
+        if not matched:
+            source_label = source_hint.get("card_name") or source_hint.get("list_name") or source_hint.get("card_id") or "Trello source"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Card/list Trello nguồn là {source_label}, nhưng sheet chưa có prompt Active khớp Product_Key/Product_Name. "
+                    "Hãy điền ô Lọc sản phẩm, đổi tên card/list theo Product_Key, hoặc thêm cột Trello_Card/Card_URL vào sheet."
+                ),
+            )
+
+        payload = _model_dump(base_request)
+        payload["trello_card_id"] = payload.get("trello_card_id") or str(source_hint.get("card_id") or "")
+        if source_hint.get("list_id"):
+            payload["trello_list_id"] = payload.get("trello_list_id") or str(source_hint.get("list_id") or "")
+        return CreateJobRequest(**payload), matched, source_hint
+
+    def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
+        source_terms = [
+            source_hint.get("card_name"),
+            source_hint.get("list_name"),
+            source_hint.get("card_short_link"),
+        ]
+        source_text = " ".join(self._compact_match_text(value) for value in source_terms if value)
+        if not source_text:
+            return False
+
+        item_terms = [
+            item.get("product_key"),
+            item.get("product_name"),
+            item.get("product"),
+            item.get("notes"),
+        ]
+        for value in item_terms:
+            normalized = self._compact_match_text(value)
+            if normalized and (normalized in source_text or source_text in normalized):
+                return True
+        return False
+
+    def _compact_match_text(self, value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         label = str(item.get("product") or "").strip() or f"Prompt dòng {item.get('row') or index + 1}"
@@ -4878,10 +4949,81 @@ exit 1
         board_id: str,
         list_id: str = "",
     ) -> str:
+        card = self._trello_first_image_card_on_board(key, token, board_id, list_id)
+        return str(card.get("id") or card.get("shortLink") or "").strip() if card else ""
+
+    def _trello_source_card_hint(self, request: CreateJobRequest) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            return {}
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id
+            or trello_config.board_id
+            or os.getenv("TRELLO_BOARD_ID", "")
+        )
+        card_id = self._normalize_trello_card_id(
+            request.trello_card_id
+            or trello_config.card_id
+            or os.getenv("TRELLO_CARD_ID", "")
+        )
+        list_id = self._normalize_trello_id(
+            request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
+        )
+        if card_id:
+            card = self._trello_get_json(
+                f"cards/{quote(card_id, safe='')}",
+                key,
+                token,
+                fields={"fields": "id,name,shortLink,url,idList,closed"},
+            )
+            if not isinstance(card, dict) or card.get("closed"):
+                return {}
+        elif board_id and list_id:
+            card = self._trello_first_image_card_on_board(key, token, board_id, list_id)
+        else:
+            return {}
+
+        if not isinstance(card, dict):
+            return {}
+        card_list_id = self._normalize_trello_id(str(card.get("idList") or list_id or ""))
+        return {
+            "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+            "card_name": str(card.get("name") or "").strip(),
+            "card_short_link": str(card.get("shortLink") or "").strip(),
+            "card_url": str(card.get("url") or "").strip(),
+            "list_id": card_list_id,
+            "list_name": self._trello_list_name(key, token, card_list_id),
+        }
+
+    def _trello_list_name(self, key: str, token: str, list_id: str) -> str:
+        list_id = self._normalize_trello_id(list_id)
+        if not list_id:
+            return ""
+        try:
+            payload = self._trello_get_json(
+                f"lists/{quote(list_id, safe='')}",
+                key,
+                token,
+                fields={"fields": "name"},
+            )
+        except Exception:
+            return ""
+        return str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+
+    def _trello_first_image_card_on_board(
+        self,
+        key: str,
+        token: str,
+        board_id: str,
+        list_id: str = "",
+    ) -> Dict[str, Any]:
         board_id = self._normalize_trello_board_id(board_id)
         list_id = self._normalize_trello_id(list_id)
         if not board_id:
-            return ""
+            return {}
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
             key,
@@ -4905,8 +5047,8 @@ exit 1
             )
             attachments = attachments_payload if isinstance(attachments_payload, list) else []
             if any(self._trello_attachment_is_image(item) for item in attachments if isinstance(item, dict)):
-                return card_id
-        return ""
+                return card
+        return {}
 
     def _trello_attachment_is_image(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").lower()

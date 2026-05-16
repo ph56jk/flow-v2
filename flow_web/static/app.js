@@ -20,6 +20,7 @@ const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
 const AUTOMATION_CONFIG_VERSION = 1;
 const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jkj2p_H2hsbDgh-kzc0WqUFWtmqR0gYqbE9Zp4U/edit?gid=2137274733#gid=2137274733";
 const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
+const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
 const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "telegram", "review_hold", "log"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
@@ -428,7 +429,7 @@ function defaultAutomationConfig() {
     sheetLog: "",
     trelloBoardId: DEFAULT_TRELLO_BOARD_URL,
     trelloCardId: "",
-    trelloListId: "",
+    trelloListId: DEFAULT_TRELLO_SOURCE_LIST_ID,
     trelloSetCover: true,
     prompt: "",
     appEyebrow: "Flow v2",
@@ -451,6 +452,7 @@ function normalizeAutomationConfig(value = {}) {
   const sourceLocation = parsedSourceLocation || fallback.sourceLocation;
   const sourceType = parsedSourceLocation ? String(parsed?.sourceType || fallback.sourceType) : fallback.sourceType;
   const trelloBoardId = String(parsed?.trelloBoardId || "").trim() || fallback.trelloBoardId;
+  const trelloListId = String(parsed?.trelloListId || "").trim() || fallback.trelloListId;
   return {
     ...fallback,
     ...parsed,
@@ -464,7 +466,7 @@ function normalizeAutomationConfig(value = {}) {
     sheetLog: String(parsed?.sheetLog || ""),
     trelloBoardId,
     trelloCardId: String(parsed?.trelloCardId || ""),
-    trelloListId: String(parsed?.trelloListId || ""),
+    trelloListId,
     trelloSetCover: parsed?.trelloSetCover !== false,
     prompt: String(parsed?.prompt || ""),
     appEyebrow: String(parsed?.appEyebrow || fallback.appEyebrow),
@@ -2204,13 +2206,13 @@ function renderAutomationViewPanels(stats) {
     : `<div class="scenario-panel-empty">Không có execution nào cần xử lý.</div>`;
 }
 
-function activePromptSourceItems() {
+function activePromptSourceItems({ limit = 40 } = {}) {
   if (state.automation.sourceType !== "sheets") {
     return [];
   }
   const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
   const filter = String(state.automation.promptProductFilter || "").trim().toLowerCase();
-  return items
+  const normalizedItems = items
     .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
     .filter((item) => item?.used !== true)
     .filter((item) => {
@@ -2225,7 +2227,6 @@ function activePromptSourceItems() {
       ].map((value) => String(value || "").toLowerCase()).join(" ");
       return haystack.includes(filter);
     })
-    .slice(0, 40)
     .map((item) => ({
       row: Number(item.row || 0),
       active: true,
@@ -2239,6 +2240,7 @@ function activePromptSourceItems() {
       trello_card_id: String(item.trello_card_id || "").trim(),
       trello_list_id: String(item.trello_list_id || "").trim(),
     }));
+  return Number.isFinite(limit) ? normalizedItems.slice(0, Math.max(1, limit)) : normalizedItems;
 }
 
 function renderEasyPanel(stats) {
@@ -3842,7 +3844,7 @@ function automationImageJobPayload(prompt) {
 
 async function submitAutomationImage() {
   syncAutomationFromForm();
-  const batchItems = activePromptSourceItems();
+  const batchItems = activePromptSourceItems({ limit: 500 });
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
   if (!state.config?.project_id) {
     state.setupOpen = true;
