@@ -1652,13 +1652,19 @@ class FlowWebService:
         if not items:
             raise HTTPException(status_code=400, detail="Sheet chưa có dòng Active=TRUE nào có prompt để chạy.")
         base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
+        if trello_source_hint.get("card_id") and len(items) > 1:
+            items = items[:1]
         items = items[:limit]
+        batch_key = self._prompt_batch_key(base_request, items, trello_source_hint)
+        active_batch = self._active_prompt_batch_by_key(batch_key)
+        if active_batch is not None:
+            return active_batch
 
         validation_payload = _model_dump(base_request)
         validation_payload["prompt"] = items[0]["prompt"]
         self._validate_job_request(CreateJobRequest(**validation_payload))
 
-        title = str(request.title or "").strip() or f"Chạy batch {len(items)} prompt từ sheet"
+        title = f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}" if trello_source_hint.get("card_name") else str(request.title or "").strip() or f"Chạy batch {len(items)} prompt từ sheet"
         batch_job = JobRecord(
             type="batch_image",
             status="queued",
@@ -1670,8 +1676,9 @@ class FlowWebService:
                 "job": _model_dump(base_request),
                 "items": items,
                 "trello_source_hint": trello_source_hint,
+                "batch_key": batch_key,
             },
-            result={"total": len(items), "completed": 0, "failed": 0, "child_job_ids": [], "trello_source_hint": trello_source_hint},
+            result={"total": len(items), "completed": 0, "failed": 0, "child_job_ids": [], "trello_source_hint": trello_source_hint, "batch_key": batch_key},
         )
         await self.store.add_job(batch_job)
         self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
@@ -1765,6 +1772,29 @@ class FlowWebService:
     def _compact_match_text(self, value: Any) -> str:
         return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
+    def _prompt_batch_key(
+        self,
+        request: CreateJobRequest,
+        items: List[Dict[str, Any]],
+        trello_source_hint: Dict[str, Any],
+    ) -> str:
+        card_id = str(trello_source_hint.get("card_id") or request.trello_card_id or "").strip()
+        list_id = str(trello_source_hint.get("list_id") or request.trello_list_id or "").strip()
+        rows = ",".join(str(item.get("row") or "") for item in items)
+        prompt_keys = ",".join(str(item.get("product_key") or item.get("product") or "") for item in items)
+        return "|".join([card_id, list_id, rows, prompt_keys]).strip("|")
+
+    def _active_prompt_batch_by_key(self, batch_key: str) -> JobRecord | None:
+        if not batch_key:
+            return None
+        for job in self.store.snapshot().jobs:
+            if job.type != "batch_image" or job.status not in {"queued", "running", "polling"}:
+                continue
+            job_key = str((job.input or {}).get("batch_key") or (job.result or {}).get("batch_key") or "").strip()
+            if job_key == batch_key:
+                return job
+        return None
+
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         label = str(item.get("product") or "").strip() or f"Prompt dòng {item.get('row') or index + 1}"
         prompt_index = str(item.get("index") or "").strip()
@@ -1798,17 +1828,27 @@ class FlowWebService:
         current_index: int = 0,
         current_child_job_id: str = "",
     ) -> None:
+        existing = self.store.get_job(batch_id)
+        existing_input = existing.input if existing is not None and isinstance(existing.input, dict) else {}
+        existing_result = existing.result if existing is not None and isinstance(existing.result, dict) else {}
+        trello_source_hint = existing_result.get("trello_source_hint") or existing_input.get("trello_source_hint") or {}
+        batch_key = str(existing_result.get("batch_key") or existing_input.get("batch_key") or "").strip()
+        result = {
+            "total": total,
+            "completed": completed,
+            "failed": failed,
+            "remaining": max(0, total - completed - failed),
+            "child_job_ids": child_job_ids,
+            "current_index": current_index,
+            "current_child_job_id": current_child_job_id,
+        }
+        if trello_source_hint:
+            result["trello_source_hint"] = trello_source_hint
+        if batch_key:
+            result["batch_key"] = batch_key
         await self.store.patch_job(
             batch_id,
-            result={
-                "total": total,
-                "completed": completed,
-                "failed": failed,
-                "remaining": max(0, total - completed - failed),
-                "child_job_ids": child_job_ids,
-                "current_index": current_index,
-                "current_child_job_id": current_child_job_id,
-            },
+            result=result,
         )
 
     async def _run_prompt_batch(self, batch_id: str, base_request: CreateJobRequest, items: List[Dict[str, Any]]) -> None:
@@ -4132,9 +4172,9 @@ exit 1
         )
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         try:
-            limit = int(settings.get("trelloAttachmentLimit") or 4)
+            limit = int(settings.get("trelloAttachmentLimit") or 1)
         except (TypeError, ValueError):
-            limit = 4
+            limit = 1
         limit = max(1, min(4, limit))
 
         await self._set_automation_module_status(
@@ -10023,6 +10063,12 @@ exit 1
         except Exception:
             await page.goto(edit_url, wait_until="commit", timeout=60_000)
         await asyncio.sleep(2.5)
+        selected, selected_detail = await self._select_flow_edit_target_image(page, reference_media_name)
+        if not selected:
+            raise RuntimeError(
+                "Google Flow chua chon duoc anh goc tren man hinh chinh anh, nen em dung lai de tranh tao anh moi tu prompt. "
+                f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
+            )
 
         interceptor = UIInterceptor()
         interceptor.attach(page)
@@ -10044,19 +10090,45 @@ exit 1
         except Exception:
             known_media_before_submit = set()
 
+        selected, selected_detail = await self._select_flow_edit_target_image(page, reference_media_name)
+        if not selected:
+            raise RuntimeError(
+                "Google Flow bi mat chon anh goc truoc khi bam Create, nen em dung lai de tranh tao anh moi tu prompt. "
+                f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
+            )
+
         clicked = await client._ui.click_submit(page)
         if not clicked:
             raise RuntimeError("Google Flow chua bam duoc nut tao anh o man hinh chinh anh.")
 
-        endpoint_task = asyncio.create_task(
-            interceptor.wait_for(
+        try:
+            result = await interceptor.wait_for(
                 "batchGenerateImages",
                 timeout=max(30.0, min(120.0, float(timeout_s or 120))),
                 require_success=True,
             )
+        except Exception as exc:
+            detail = str(exc or "").lower()
+            if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
+                raise RuntimeError(
+                    "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
+                    "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong."
+                ) from exc
+            raise
+
+        if not self._flow_image_call_uses_selected_image(result, reference_media_name, resolved_workflow_id):
+            raise RuntimeError(
+                "Flow vua gui request tao anh nhung request khong co anh goc dang chon. "
+                "Em da dung lai de tranh luu anh moi khong dung card Trello."
+            )
+
+        images = self._parse_images_from_flow_payload(
+            result.resp,
+            prompt=prompt,
+            fallback_workflow_id=resolved_workflow_id,
         )
-        project_task = asyncio.create_task(
-            self._wait_for_new_project_images(
+        if not images:
+            images = await self._wait_for_new_project_images(
                 client,
                 known_media_before_submit,
                 prompt=prompt,
@@ -10064,44 +10136,124 @@ exit 1
                 timeout_s=max(30.0, min(120.0, float(timeout_s or 120))),
                 fallback_workflow_id=resolved_workflow_id,
             )
-        )
-
-        images: List[Any] = []
-        errors: List[Exception] = []
-        pending = {endpoint_task, project_task}
-        while pending and not images:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                try:
-                    result = task.result()
-                except Exception as exc:
-                    errors.append(exc)
-                    continue
-                if isinstance(result, list):
-                    images = result
-                else:
-                    images = self._parse_images_from_flow_payload(
-                        result.resp,
-                        prompt=prompt,
-                        fallback_workflow_id=resolved_workflow_id,
-                    )
-                if images:
-                    break
-
-        for task in pending:
-            task.cancel()
 
         if not images:
-            if errors:
-                detail = str(errors[-1] or "").lower()
-                if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
-                    raise RuntimeError(
-                        "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
-                        "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong."
-                    ) from errors[-1]
-                raise errors[-1]
             raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
         return images[: max(1, min(4, int(count or 1)))]
+
+    async def _select_flow_edit_target_image(self, page: Any, reference_media_name: str) -> tuple[bool, str]:
+        media_token = str(reference_media_name or "").strip()
+        try:
+            result = await page.evaluate(
+                """
+                (mediaToken) => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 80 || rect.height < 80) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                  };
+                  const clickable = (el) => el.closest('button, [role="button"], [tabindex], a, [data-index], [data-item-index]') || el;
+                  const clickHard = (el) => {
+                    const target = clickable(el);
+                    target.scrollIntoView({block: 'center', inline: 'center'});
+                    const rect = target.getBoundingClientRect();
+                    const x = rect.left + rect.width / 2;
+                    const y = rect.top + rect.height / 2;
+                    const opts = {
+                      bubbles: true,
+                      cancelable: true,
+                      view: window,
+                      clientX: x,
+                      clientY: y,
+                    };
+                    ['pointerdown','mousedown','mouseup','click'].forEach((type) => {
+                      target.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, opts) : new MouseEvent(type, opts));
+                    });
+                    target.click?.();
+                    return {ok: true, x, y, detail: target.outerHTML?.slice(0, 180) || target.tagName};
+                  };
+
+                  const token = String(mediaToken || '').trim();
+                  if (token) {
+                    const escaped = token.replace(/["\\\\]/g, '\\\\$&');
+                    const exact = [
+                      `[data-media-id*="${escaped}"]`,
+                      `[data-media-name*="${escaped}"]`,
+                      `[data-testid*="${escaped}"]`,
+                      `img[alt*="${escaped}"]`,
+                      `img[src*="${escaped}"]`,
+                    ];
+                    for (const selector of exact) {
+                      for (const el of document.querySelectorAll(selector)) {
+                        if (visible(el)) return clickHard(el);
+                      }
+                    }
+                    for (const el of [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]) {
+                      if (!visible(el)) continue;
+                      const haystack = `${el.getAttribute('alt') || ''} ${el.getAttribute('src') || ''} ${el.outerHTML || ''}`;
+                      if (haystack.includes(token)) return clickHard(el);
+                    }
+                  }
+
+                  const candidates = [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]
+                    .filter(visible)
+                    .map((el) => ({el, rect: el.getBoundingClientRect()}))
+                    .filter(({rect}) => rect.width >= 120 && rect.height >= 120)
+                    .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+                  if (candidates.length) return clickHard(candidates[0].el);
+                  return {ok: false, detail: 'no visible media candidate'};
+                }
+                """,
+                media_token,
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        ok = bool((result or {}).get("ok")) if isinstance(result, dict) else False
+        detail = str((result or {}).get("detail") or "").strip() if isinstance(result, dict) else ""
+        if ok:
+            try:
+                x = float((result or {}).get("x"))
+                y = float((result or {}).get("y"))
+                await page.mouse.click(x, y)
+            except Exception:
+                pass
+            await asyncio.sleep(0.4)
+        return ok, detail
+
+    def _flow_image_call_uses_selected_image(self, call: Any, reference_media_name: str, workflow_id: str) -> bool:
+        payload = getattr(call, "req", None)
+        if not isinstance(payload, dict):
+            return False
+        expected_media = str(reference_media_name or "").strip()
+        expected_workflow = str(workflow_id or "").strip()
+        payload_blob = json.dumps(payload, ensure_ascii=False)
+        if expected_media and expected_media in payload_blob:
+            return True
+        if expected_workflow and expected_workflow in payload_blob:
+            return True
+        requests = payload.get("requests") if isinstance(payload.get("requests"), list) else []
+        for item in requests:
+            if not isinstance(item, dict):
+                continue
+            client_context = item.get("clientContext") if isinstance(item.get("clientContext"), dict) else {}
+            if expected_workflow and str(client_context.get("workflowId") or "").strip() == expected_workflow:
+                return True
+            image_inputs = item.get("imageInputs") if isinstance(item.get("imageInputs"), list) else []
+            for image_input in image_inputs:
+                if not isinstance(image_input, dict):
+                    continue
+                values = {
+                    str(image_input.get("name") or "").strip(),
+                    str(image_input.get("mediaName") or "").strip(),
+                    str(image_input.get("imageInputType") or "").strip(),
+                    str(image_input.get("role") or "").strip(),
+                }
+                if expected_media and expected_media in values:
+                    return True
+        return False
 
     async def _find_workflow_id_for_media(self, client: Any, media_name: str) -> str:
         safe_media_name = str(media_name or "").strip()

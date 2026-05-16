@@ -120,6 +120,22 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("NARWHAL", resolved.model)
 
+    def test_flow_image_call_validation_requires_selected_source(self) -> None:
+        good_call = SimpleNamespace(
+            req={
+                "requests": [
+                    {
+                        "clientContext": {"workflowId": "workflow-source"},
+                        "imageInputs": [{"mediaName": "media-source"}],
+                    }
+                ]
+            }
+        )
+        prompt_only_call = SimpleNamespace(req={"requests": [{"clientContext": {"workflowId": "fresh-workflow"}}]})
+
+        self.assertTrue(self.service._flow_image_call_uses_selected_image(good_call, "media-source", "workflow-source"))
+        self.assertFalse(self.service._flow_image_call_uses_selected_image(prompt_only_call, "media-source", "workflow-source"))
+
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
         project_data = {
             "projectContents": {
@@ -2274,6 +2290,74 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(0, saved.result["failed"])
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
         self.assertEqual(["Sheet 1/2 · Hoop #1", "Sheet 2/2 · Blanket #2"], [job.title for job in child_jobs])
+
+    async def test_trello_prompt_batch_runs_one_matching_prompt_and_dedupes_active_batch(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloCard": "https://trello.com/c/card123/wedding-hoop"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=40,
+            items=[
+                {"row": 108, "prompt": "prompt 1", "product_key": "wedding_hoop", "product": "Wedding Hoop", "index": "1", "active": True},
+                {"row": 109, "prompt": "prompt 2", "product_key": "wedding_hoop", "product": "Wedding Hoop", "index": "2", "active": True},
+                {"row": 110, "prompt": "prompt 3", "product_key": "other", "product": "Other", "index": "1", "active": True},
+            ],
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+        seen_prompts: list[str] = []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_prompts.append(child_request.prompt)
+            started.set()
+            await release.wait()
+            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+
+        source_hint = {
+            "card_id": "card123",
+            "card_name": "wedding_hoop",
+            "card_url": "https://trello.com/c/card123/wedding-hoop",
+            "list_id": "list-ready",
+            "list_name": "Ready for AI",
+        }
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_trello_source_card_hint",
+            return_value=source_hint,
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await asyncio.wait_for(started.wait(), timeout=1)
+            duplicate = await self.service.enqueue_prompt_batch(request)
+            release.set()
+            await self.service._tasks[batch.id]
+
+        self.assertEqual(batch.id, duplicate.id)
+        self.assertEqual(["prompt 1"], seen_prompts)
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(1, saved.result["total"])
+        self.assertEqual("card123", saved.result["trello_source_hint"]["card_id"])
+        child_job = self.store.get_job(saved.result["child_job_ids"][0])
+        self.assertEqual("card123", child_job.input["trello_card_id"])
 
     async def test_generate_images_with_retry_reloads_project_after_recaptcha_error(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

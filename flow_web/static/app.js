@@ -26,6 +26,7 @@ const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
 const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
 let promptSourceAutoPreviewStarted = false;
+let automationSubmitInFlight = false;
 const AUTOMATION_MODULE_TYPE_CONFIG = {
   source: {
     label: "Prompt source",
@@ -2000,7 +2001,7 @@ function renderModuleSettings(module) {
       </label>
       <label class="field">
         <span>Số ảnh lấy tối đa</span>
-        <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 4)}" />
+        <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 1)}" />
       </label>
       <small>Batch từ sheet nên có Card lấy ảnh gốc hoặc cột Trello_Card/Card_URL. Nếu chỉ có board, app sẽ dừng để tránh lấy nhầm card đầu tiên.</small>
     `;
@@ -2247,8 +2248,14 @@ function activePromptSourceItems({ limit = 40 } = {}) {
   return Number.isFinite(limit) ? normalizedItems.slice(0, Math.max(1, limit)) : normalizedItems;
 }
 
+function effectiveAutomationBatchLimit() {
+  return automationModuleEnabled("trello_source") ? 1 : 40;
+}
+
 function renderEasyPanel(stats) {
   const batchItems = activePromptSourceItems();
+  const batchLimit = effectiveAutomationBatchLimit();
+  const displayedBatchCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : batchItems.length;
   const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0;
   const projectReady = Boolean(state.config?.project_id);
   const flowModuleReady = automationModuleEnabled("flow");
@@ -2272,10 +2279,16 @@ function renderEasyPanel(stats) {
   }
   const runHint = elements.easyRunButton?.querySelector("small");
   if (runHint) {
-    runHint.textContent = stats.active.length ? "Đang tạo ảnh" : batchItems.length > 1 && flowReady ? "Chạy vòng lặp sheet" : promptReady && flowReady ? "Sẵn sàng chạy" : "Bấm để chạy";
+    runHint.textContent = stats.active.length
+      ? "Đang tạo ảnh"
+      : batchItems.length > 1 && flowReady
+        ? batchLimit === 1
+          ? "Chạy 1 prompt/card Trello"
+          : "Chạy vòng lặp sheet"
+        : promptReady && flowReady ? "Sẵn sàng chạy" : "Bấm để chạy";
   }
   if (elements.automationRunImageButton) {
-    elements.automationRunImageButton.textContent = batchItems.length > 1 ? `Tạo ${batchItems.length} prompt` : "Tạo ảnh bằng Flow";
+    elements.automationRunImageButton.textContent = batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
   }
   if (elements.automationRunButton) {
     elements.automationRunButton.textContent = batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
@@ -3847,6 +3860,9 @@ function automationImageJobPayload(prompt) {
 }
 
 async function submitAutomationImage() {
+  if (automationSubmitInFlight) {
+    return;
+  }
   syncAutomationFromForm();
   const batchItems = activePromptSourceItems({ limit: 500 });
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
@@ -3874,7 +3890,10 @@ async function submitAutomationImage() {
   }
 
   const payload = automationImageJobPayload(prompt);
+  const batchLimit = effectiveAutomationBatchLimit();
+  const queuedCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : 1;
 
+  automationSubmitInFlight = true;
   elements.automationRunButton.disabled = true;
   elements.automationRunImageButton.disabled = true;
   if (elements.easyRunButton) {
@@ -3886,7 +3905,7 @@ async function submitAutomationImage() {
         method: "POST",
         body: JSON.stringify({
           title: `Chạy ${batchItems.length} prompt từ sheet`,
-          limit: 40,
+          limit: batchLimit,
           job: {
             ...payload,
             title: "Automation image from sheet row",
@@ -3906,7 +3925,7 @@ async function submitAutomationImage() {
     saveAutomationConfig(state.automation);
     showMessage(
       batchItems.length > 1
-        ? `Đã xếp hàng ${batchItems.length} prompt active. App sẽ chạy lần lượt, tạo ảnh bằng Flow rồi gửi Telegram để duyệt.`
+        ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi gửi Telegram để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, luồng sẽ dừng ở bước duyệt Telegram/log để chủ nhân xử lý.",
       "success"
     );
@@ -3914,6 +3933,7 @@ async function submitAutomationImage() {
   } catch (error) {
     showMessage(error.message, "error");
   } finally {
+    automationSubmitInFlight = false;
     elements.automationRunButton.disabled = false;
     elements.automationRunImageButton.disabled = false;
     if (elements.easyRunButton) {
