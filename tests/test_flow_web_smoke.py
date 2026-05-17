@@ -543,6 +543,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("product photo", result["prompt"])
         self.assertEqual("Flow should create the product photo from this prompt.", result["items"][0]["prompt"])
 
+    def test_prompt_source_preview_reports_sheet_timeout_as_bad_request(self) -> None:
+        with patch("flow_web.service.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(self.service.preview_prompt_source(source_url="https://docs.google.com/spreadsheets/d/sheet-id/edit?gid=0"))
+
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("quá lâu", str(ctx.exception.detail))
+
     def test_get_auth_status_uses_network_cookies_fallback(self) -> None:
         with patch.object(self.service, "_flow_modules", return_value=(None, lambda: False, None, None, None)), patch.object(
             self.service,
@@ -2154,6 +2162,72 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(execution["completed"])
         self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
         self.assertEqual("card-1", saved.result["trello"]["card_id"])
+
+    async def test_late_telegram_reaction_does_not_flip_completed_approval(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            count=1,
+            telegram_enabled=True,
+            trello_enabled=True,
+            automation_graph={
+                "modules": [
+                    {"id": "source-1", "type": "source", "title": "Prompt Source"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "telegram-1", "type": "telegram", "title": "Telegram Review"},
+                    {"id": "approval-1", "type": "approval", "title": "Approval"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                ]
+            },
+        )
+        job = JobRecord(
+            type="image",
+            status="completed",
+            title="approved job",
+            input=request.model_dump(mode="json"),
+            result={
+                "telegram_approvals": {"0": {"artifact_index": 0, "status": "approved"}},
+                "telegram_approval_summary": {
+                    "total": 1,
+                    "approved": 1,
+                    "rejected": 0,
+                    "pending": 0,
+                    "resolved": 1,
+                    "status": "completed",
+                },
+                "trello": {"configured": True, "sent": 1, "failed": 0, "card_id": "card-1"},
+                "automation_execution": {
+                    "mode": "graph",
+                    "nodes": [
+                        {"id": "approval-1", "type": "approval", "status": "completed", "output": {}},
+                        {"id": "trello-1", "type": "trello", "status": "completed", "output": {"sent": 1}},
+                    ],
+                    "edges": [],
+                    "current_module_id": "",
+                    "completed": True,
+                },
+            },
+            artifacts=[JobArtifact(label="Ảnh 1", url="https://example.com/img.jpg", mime_type="image/jpeg")],
+        )
+        await self.store.add_job(job)
+
+        with patch.object(self.service, "_archive_trello_artifacts", AsyncMock()) as archive:
+            approval = await self.service._apply_telegram_approval(
+                job.id,
+                0,
+                "rejected",
+                {"id": "late-callback", "from": {"first_name": "Reviewer"}},
+            )
+
+        saved = self.store.get_job(job.id)
+        self.assertEqual("approved", approval["status"])
+        self.assertEqual("approved", saved.result["telegram_approvals"]["0"]["status"])
+        self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
+        self.assertEqual(0, saved.result["telegram_approval_summary"]["rejected"])
+        self.assertEqual("completed", saved.result["automation_execution"]["nodes"][1]["status"])
+        self.assertEqual(1, saved.result["trello"]["sent"])
+        archive.assert_not_called()
+        self.assertIn("Bỏ qua phản hồi Telegram", saved.logs[-1].message)
 
     async def test_custom_module_runs_user_configured_webhook(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

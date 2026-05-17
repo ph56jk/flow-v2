@@ -453,6 +453,11 @@ class FlowWebService:
                 status_code=400,
                 detail=f"Không đọc được Google Sheet/CSV (HTTP {exc.code}). Nếu sheet đang riêng tư, hãy tải .xlsx rồi upload vào app.",
             ) from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Đọc Google Sheet quá lâu. Hãy thử lại, hoặc tải sheet thành file .xlsx rồi upload vào app.",
+            ) from exc
         except URLError as exc:
             raise HTTPException(status_code=400, detail=f"Không đọc được link sheet: {exc.reason}") from exc
 
@@ -5749,6 +5754,17 @@ exit 1
         approvals = dict(result.get("telegram_approvals") or {})
         key = str(artifact_index)
         previous = approvals.get(key) if isinstance(approvals.get(key), dict) else {}
+        previous_status = str(previous.get("status") or "").strip()
+        if previous_status in {"approved", "rejected"}:
+            if previous_status != status:
+                reviewer = self._telegram_callback_reviewer(callback)
+                reviewer_name = reviewer.get("name") or reviewer.get("username") or "Telegram user"
+                previous_label = "đã duyệt" if previous_status == "approved" else "đã từ chối"
+                await self.store.append_log(
+                    job_id,
+                    f"Bỏ qua phản hồi Telegram của {reviewer_name} vì ảnh {artifact_index + 1} {previous_label} trước đó.",
+                )
+            return previous
         reviewer = self._telegram_callback_reviewer(callback)
         message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
         approval = {
