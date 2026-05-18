@@ -2499,6 +2499,69 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("matched-card", child_job.input["trello_card_id"])
         self.assertEqual("ideas-list", child_job.input["trello_list_id"])
 
+    async def test_auto_trello_prompt_batch_discovers_multiple_image_cards(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=10,
+            auto_trello=True,
+            items=[
+                {"row": 2, "prompt": "bear prompt", "product_key": "gau_bong", "product": "Gấu bông", "index": "1", "active": True},
+                {"row": 3, "prompt": "hoop prompt", "product_key": "wedding_hoop", "product": "Wedding Hoop", "index": "1", "active": True},
+            ],
+        )
+        seen: list[tuple[str, str]] = []
+        cards = [
+            {"id": "card-bear", "name": "gau_bong", "shortLink": "bear", "url": "https://trello.com/c/bear", "idList": "ready-list"},
+            {"id": "card-hoop", "name": "wedding_hoop", "shortLink": "hoop", "url": "https://trello.com/c/hoop", "idList": "ready-list"},
+        ]
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen.append((child_request.prompt, child_request.trello_card_id))
+            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ) as image_cards, patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        image_cards.assert_called_once_with("key", "token", "board123", "")
+        self.assertEqual([("bear prompt", "card-bear"), ("hoop prompt", "card-hoop")], seen)
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(2, saved.result["total"])
+        self.assertEqual(2, saved.result["completed"])
+        self.assertEqual("auto_trello", saved.result["trello_source_hint"]["mode"])
+        child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
+        self.assertEqual(["card-bear", "card-hoop"], [job.input["trello_card_id"] for job in child_jobs])
+
     async def test_generate_images_with_retry_reloads_project_after_recaptcha_error(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(type="image", prompt="meo de thuong", count=1, aspect="square")

@@ -688,6 +688,7 @@ const elements = {
   automationIncompleteRefreshButton: document.querySelector("#automationIncompleteRefreshButton"),
   automationUseStudioButton: document.querySelector("#automationUseStudioButton"),
   automationOpenFlowButton: document.querySelector("#automationOpenFlowButton"),
+  automationAutoRunButton: document.querySelector("#automationAutoRunButton"),
   automationRunButton: document.querySelector("#automationRunButton"),
   automationRunImageButton: document.querySelector("#automationRunImageButton"),
   automationRefreshButton: document.querySelector("#automationRefreshButton"),
@@ -2248,13 +2249,23 @@ function activePromptSourceItems({ limit = 40 } = {}) {
   return Number.isFinite(limit) ? normalizedItems.slice(0, Math.max(1, limit)) : normalizedItems;
 }
 
-function effectiveAutomationBatchLimit() {
-  return automationModuleEnabled("trello_source") ? 1 : 40;
+function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 500 })) {
+  if (!automationModuleEnabled("trello_source") || state.automation.sourceType !== "sheets" || !batchItems.length) {
+    return false;
+  }
+  const fixedCard = String(state.automation.trelloCardId || state.trello?.card_id || "").trim();
+  const board = String(state.automation.trelloBoardId || state.trello?.board_id || "").trim();
+  return Boolean(board && !fixedCard);
+}
+
+function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
+  return automationModuleEnabled("trello_source") && !autoTrello ? 1 : 40;
 }
 
 function renderEasyPanel(stats) {
   const batchItems = activePromptSourceItems();
-  const batchLimit = effectiveAutomationBatchLimit();
+  const autoTrelloReady = shouldAutoDiscoverTrello(batchItems);
+  const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoTrelloReady });
   const displayedBatchCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : batchItems.length;
   const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0;
   const projectReady = Boolean(state.config?.project_id);
@@ -2281,6 +2292,8 @@ function renderEasyPanel(stats) {
   if (runHint) {
     runHint.textContent = stats.active.length
       ? "Đang tạo ảnh"
+      : autoTrelloReady && flowReady
+        ? "Tự quét Trello rồi tạo"
       : batchItems.length > 1 && flowReady
         ? batchLimit === 1
           ? "Chạy 1 prompt/card Trello"
@@ -2288,10 +2301,16 @@ function renderEasyPanel(stats) {
         : promptReady && flowReady ? "Sẵn sàng chạy" : "Bấm để chạy";
   }
   if (elements.automationRunImageButton) {
-    elements.automationRunImageButton.textContent = batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
+    elements.automationRunImageButton.textContent = autoTrelloReady
+      ? `Auto ${displayedBatchCount} prompt`
+      : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
+  }
+  if (elements.automationAutoRunButton) {
+    elements.automationAutoRunButton.textContent = autoTrelloReady ? "Auto Trello" : "Auto Trello";
+    elements.automationAutoRunButton.disabled = stats.active.length > 0 || !batchItems.length;
   }
   if (elements.automationRunButton) {
-    elements.automationRunButton.textContent = batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
+    elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
   }
   elements.easyPromptButton?.classList.toggle("ready", promptReady);
   elements.easyFlowButton?.classList.toggle("ready", flowReady);
@@ -3859,12 +3878,13 @@ function automationImageJobPayload(prompt) {
   };
 }
 
-async function submitAutomationImage() {
+async function submitAutomationImage({ autoTrello = false } = {}) {
   if (automationSubmitInFlight) {
     return;
   }
   syncAutomationFromForm();
   const batchItems = activePromptSourceItems({ limit: 500 });
+  const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
   if (!state.config?.project_id) {
     state.setupOpen = true;
@@ -3888,27 +3908,36 @@ async function submitAutomationImage() {
     selectAutomationModuleByType("flow", { create: true });
     return;
   }
+  if (autoDiscoverTrello && !automationModuleEnabled("trello_source")) {
+    showMessage("Auto Trello cần bật cục Trello Image Source để tự tìm ảnh trong card.", "error");
+    selectAutomationModuleByType("trello_source", { create: true });
+    return;
+  }
 
   const payload = automationImageJobPayload(prompt);
-  const batchLimit = effectiveAutomationBatchLimit();
-  const queuedCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : 1;
+  const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello });
+  const queuedCount = batchItems.length > 1 || autoDiscoverTrello ? Math.min(batchItems.length, batchLimit) : 1;
 
   automationSubmitInFlight = true;
   elements.automationRunButton.disabled = true;
   elements.automationRunImageButton.disabled = true;
+  if (elements.automationAutoRunButton) {
+    elements.automationAutoRunButton.disabled = true;
+  }
   if (elements.easyRunButton) {
     elements.easyRunButton.disabled = true;
   }
   try {
-    if (batchItems.length > 1) {
+    if (batchItems.length > 1 || autoDiscoverTrello) {
       await api("/api/jobs/batch", {
         method: "POST",
         body: JSON.stringify({
-          title: `Chạy ${batchItems.length} prompt từ sheet`,
+          title: autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
           limit: batchLimit,
+          auto_trello: autoDiscoverTrello,
           job: {
             ...payload,
-            title: "Automation image from sheet row",
+            title: autoDiscoverTrello ? "Auto image from Trello card" : "Automation image from sheet row",
           },
           items: batchItems,
         }),
@@ -3924,7 +3953,9 @@ async function submitAutomationImage() {
     state.automation.enabled = true;
     saveAutomationConfig(state.automation);
     showMessage(
-      batchItems.length > 1
+      autoDiscoverTrello
+        ? `Đã xếp hàng auto Trello. App sẽ quét card có ảnh, lấy prompt khớp trong sheet, tạo tối đa ${queuedCount} ảnh rồi gửi Telegram duyệt.`
+        : batchItems.length > 1
         ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi gửi Telegram để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, luồng sẽ dừng ở bước duyệt Telegram/log để chủ nhân xử lý.",
       "success"
@@ -3936,6 +3967,9 @@ async function submitAutomationImage() {
     automationSubmitInFlight = false;
     elements.automationRunButton.disabled = false;
     elements.automationRunImageButton.disabled = false;
+    if (elements.automationAutoRunButton) {
+      elements.automationAutoRunButton.disabled = false;
+    }
     if (elements.easyRunButton) {
       elements.easyRunButton.disabled = false;
     }
@@ -4484,6 +4518,7 @@ elements.automationHistoryRefreshButton.addEventListener("click", () => loadStat
 elements.automationIncompleteRefreshButton.addEventListener("click", () => loadState());
 elements.automationRunButton.addEventListener("click", submitAutomationImage);
 elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
+elements.automationAutoRunButton?.addEventListener("click", () => submitAutomationImage({ autoTrello: true }));
 elements.automationUseStudioButton.addEventListener("click", useAutomationPromptInStudio);
 elements.automationExportButton.addEventListener("click", exportAutomationConfig);
 elements.automationImportButton.addEventListener("click", () => elements.automationImportFile.click());

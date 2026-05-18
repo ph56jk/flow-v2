@@ -361,6 +361,7 @@ class PromptBatchRequest(BaseModel):
     items: List[PromptBatchItemRequest] = Field(default_factory=list)
     title: str = ""
     limit: int = 40
+    auto_trello: bool = False
 
 
 class DownloadRequest(BaseModel):

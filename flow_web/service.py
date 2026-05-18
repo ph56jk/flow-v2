@@ -1656,8 +1656,18 @@ class FlowWebService:
         items = self._prompt_batch_items(request.items, max(limit, source_item_count))
         if not items:
             raise HTTPException(status_code=400, detail="Sheet chưa có dòng Active=TRUE nào có prompt để chạy.")
-        base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
-        if trello_source_hint.get("card_id") and len(items) > 1:
+        if request.auto_trello:
+            base_request, items, trello_source_hint = await self._expand_prompt_batch_with_trello_images(
+                base_request,
+                items,
+                limit,
+            )
+        else:
+            base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
+
+        if not items:
+            raise HTTPException(status_code=400, detail="Không tìm thấy card Trello có ảnh khớp với prompt Active trong sheet.")
+        if not request.auto_trello and trello_source_hint.get("card_id") and len(items) > 1:
             items = items[:1]
         items = items[:limit]
         batch_key = self._prompt_batch_key(base_request, items, trello_source_hint)
@@ -1669,7 +1679,16 @@ class FlowWebService:
         validation_payload["prompt"] = items[0]["prompt"]
         self._validate_job_request(CreateJobRequest(**validation_payload))
 
-        title = f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}" if trello_source_hint.get("card_name") else str(request.title or "").strip() or f"Chạy batch {len(items)} prompt từ sheet"
+        title = (
+            str(request.title or "").strip()
+            or (
+                f"Auto Trello: tạo {len(items)} ảnh từ card có ảnh"
+                if request.auto_trello
+                else f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}"
+                if trello_source_hint.get("card_name")
+                else f"Chạy batch {len(items)} prompt từ sheet"
+            )
+        )
         batch_job = JobRecord(
             type="batch_image",
             status="queued",
@@ -1758,7 +1777,48 @@ class FlowWebService:
             payload["trello_list_id"] = payload.get("trello_list_id") or str(source_hint.get("list_id") or "")
         return CreateJobRequest(**payload), matched, source_hint
 
+    async def _expand_prompt_batch_with_trello_images(
+        self,
+        base_request: CreateJobRequest,
+        items: List[Dict[str, Any]],
+        limit: int,
+    ) -> tuple[CreateJobRequest, List[Dict[str, Any]], Dict[str, Any]]:
+        graph = self._automation_graph_payload(base_request)
+        module = next(
+            (
+                item
+                for item in graph["modules"]
+                if item["enabled"] and item["type"] == "trello_source"
+            ),
+            None,
+        )
+        if module is None:
+            raise HTTPException(status_code=400, detail="Auto Trello cần bật cục Trello Image Source.")
+
+        module_request = self._request_with_automation_module_settings(base_request, module)
+        try:
+            expanded_items, discovery = await asyncio.to_thread(
+                self._trello_prompt_items_for_image_cards,
+                module_request,
+                items,
+                limit,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
+
+        payload = _model_dump(base_request)
+        if discovery.get("board_id"):
+            payload["trello_board_id"] = payload.get("trello_board_id") or str(discovery.get("board_id") or "")
+        if discovery.get("list_id"):
+            payload["trello_list_id"] = payload.get("trello_list_id") or str(discovery.get("list_id") or "")
+        return CreateJobRequest(**payload), expanded_items, discovery
+
     def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
+        item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
+        source_card_id = self._normalize_trello_card_id(str(source_hint.get("card_id") or ""))
+        if item_card_id:
+            return bool(source_card_id and item_card_id == source_card_id)
+
         source_terms = [source_hint.get("card_name")]
         source_text = " ".join(self._compact_match_text(value) for value in source_terms if value)
         if not source_text:
@@ -1789,7 +1849,8 @@ class FlowWebService:
         list_id = str(trello_source_hint.get("list_id") or request.trello_list_id or "").strip()
         rows = ",".join(str(item.get("row") or "") for item in items)
         prompt_keys = ",".join(str(item.get("product_key") or item.get("product") or "") for item in items)
-        return "|".join([card_id, list_id, rows, prompt_keys]).strip("|")
+        item_card_ids = ",".join(str(item.get("trello_card_id") or "") for item in items)
+        return "|".join([card_id, list_id, rows, prompt_keys, item_card_ids]).strip("|")
 
     def _active_prompt_batch_by_key(self, batch_key: str) -> JobRecord | None:
         if not batch_key:
@@ -5165,17 +5226,93 @@ exit 1
                     return card
         return {}
 
-    def _trello_first_image_card_on_board(
+    def _trello_prompt_items_for_image_cards(
+        self,
+        request: CreateJobRequest,
+        items: List[Dict[str, Any]],
+        limit: int,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise RuntimeError("Auto Trello cần API key/token Trello để quét card có ảnh.")
+
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id
+            or trello_config.board_id
+            or os.getenv("TRELLO_BOARD_ID", "")
+        )
+        if not board_id:
+            raise RuntimeError("Auto Trello cần Board URL/Board ID để tìm card có ảnh.")
+
+        list_id = self._normalize_trello_id(
+            request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
+        )
+        max_items = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(limit or self.MAX_PROMPT_BATCH_ITEMS)))
+        cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
+        expanded: List[Dict[str, Any]] = []
+        used_pairs: set[tuple[str, int, str]] = set()
+
+        for card in cards:
+            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not card_id:
+                continue
+            card_list_id = self._normalize_trello_id(str(card.get("idList") or list_id or ""))
+            hint = {
+                "card_id": card_id,
+                "card_name": str(card.get("name") or "").strip(),
+                "card_short_link": str(card.get("shortLink") or "").strip(),
+                "card_url": str(card.get("url") or "").strip(),
+                "list_id": card_list_id,
+            }
+            for item in items:
+                if not self._prompt_batch_item_matches_trello_source(item, hint):
+                    continue
+                item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
+                if item_key in used_pairs:
+                    continue
+                used_pairs.add(item_key)
+                expanded.append(
+                    {
+                        **item,
+                        "trello_card_id": card_id,
+                        "trello_list_id": card_list_id,
+                        "trello_card_name": hint["card_name"],
+                        "trello_card_url": hint["card_url"],
+                    }
+                )
+                if len(expanded) >= max_items:
+                    break
+            if len(expanded) >= max_items:
+                break
+
+        if not expanded:
+            raise RuntimeError(
+                "Auto Trello chưa tìm thấy card nào có attachment ảnh khớp Product_Key/Product_Name trong sheet."
+            )
+
+        discovery = {
+            "mode": "auto_trello",
+            "board_id": board_id,
+            "list_id": list_id,
+            "matched_cards": len({item.get("trello_card_id") for item in expanded if item.get("trello_card_id")}),
+            "matched_items": len(expanded),
+        }
+        return expanded, discovery
+
+    def _trello_image_cards_on_board(
         self,
         key: str,
         token: str,
         board_id: str,
         list_id: str = "",
-    ) -> Dict[str, Any]:
+    ) -> List[Dict[str, Any]]:
         board_id = self._normalize_trello_board_id(board_id)
         list_id = self._normalize_trello_id(list_id)
         if not board_id:
-            return {}
+            return []
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
             key,
@@ -5183,6 +5320,7 @@ exit 1
             fields={"fields": "id,name,shortLink,url,idList,closed", "filter": "open"},
         )
         cards = payload if isinstance(payload, list) else []
+        image_cards: List[Dict[str, Any]] = []
         for card in cards:
             if not isinstance(card, dict) or card.get("closed"):
                 continue
@@ -5199,8 +5337,18 @@ exit 1
             )
             attachments = attachments_payload if isinstance(attachments_payload, list) else []
             if any(self._trello_attachment_is_image(item) for item in attachments if isinstance(item, dict)):
-                return card
-        return {}
+                image_cards.append(card)
+        return image_cards
+
+    def _trello_first_image_card_on_board(
+        self,
+        key: str,
+        token: str,
+        board_id: str,
+        list_id: str = "",
+    ) -> Dict[str, Any]:
+        cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
+        return cards[0] if cards else {}
 
     def _trello_attachment_is_image(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").lower()
