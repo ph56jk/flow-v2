@@ -22,7 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 from xml.etree import ElementTree as ET
 
 from fastapi import HTTPException, UploadFile
@@ -331,22 +331,47 @@ class FlowWebService:
         return self._integration_config_snapshot(saved)
 
     def _integration_config_snapshot(self, config: IntegrationConfig) -> Dict[str, Any]:
-        gemini_api_key = str(config.gemini_api_key or "").strip()
-        telegram_bot_token = str(config.telegram_bot_token or "").strip()
+        # Same .env.local fallback rationale as _trello_config_snapshot: chủ
+        # nhân set 1 lần qua .env.local thì UI vẫn báo "Đã lưu" dù
+        # data/state.json bị reset.
+        state_gemini_api_key = str(config.gemini_api_key or "").strip()
+        gemini_api_key = state_gemini_api_key
+        if not gemini_api_key:
+            for env_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"):
+                env_value = os.getenv(env_name, "").strip()
+                if env_value:
+                    gemini_api_key = env_value
+                    break
+
+        state_telegram_bot_token = str(config.telegram_bot_token or "").strip()
+        telegram_bot_token = state_telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+        state_telegram_chat_id = str(config.telegram_chat_id or "").strip()
+        telegram_chat_id = state_telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
         gemini_model = self._sanitize_gemini_model(config.gemini_model or self.GEMINI_DEFAULT_MODEL)
-        telegram_chat_id = str(config.telegram_chat_id or "").strip()
         playwright_browsers_path = str(config.playwright_browsers_path or "").strip()
         runtime_playwright_path = playwright_browsers_path or os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+
+        gemini_source = "env" if (gemini_api_key and not state_gemini_api_key) else ("state" if gemini_api_key else "")
+        telegram_source = (
+            "env"
+            if (telegram_bot_token and telegram_chat_id and not (state_telegram_bot_token and state_telegram_chat_id))
+            else ("state" if telegram_bot_token and telegram_chat_id else "")
+        )
+
         return {
             "gemini": {
                 "configured": bool(gemini_api_key),
                 "api_key_saved": bool(gemini_api_key),
+                "credentials_source": gemini_source,
                 "model": gemini_model,
             },
             "telegram": {
                 "configured": bool(telegram_bot_token and telegram_chat_id),
                 "bot_token_saved": bool(telegram_bot_token),
                 "chat_id": telegram_chat_id,
+                "credentials_source": telegram_source,
             },
             "runtime": {
                 "playwright_browsers_path": runtime_playwright_path,
@@ -367,38 +392,143 @@ class FlowWebService:
         if upload_mode not in {"file", "url"}:
             upload_mode = "file"
 
+        board_id = self._normalize_trello_board_id(request.board_id)
+        card_id = self._normalize_trello_card_id(request.card_id)
+        list_id = self._normalize_trello_id(request.list_id)
+
         config = TrelloConfig(
             api_key=api_key,
             token=token,
-            board_id=self._normalize_trello_board_id(request.board_id),
-            card_id=self._normalize_trello_card_id(request.card_id),
-            list_id=self._normalize_trello_id(request.list_id),
+            board_id=board_id,
+            card_id=card_id,
+            list_id=list_id,
             upload_mode=upload_mode,
             set_cover=request.set_cover,
+            upscale_to_2k=bool(request.upscale_to_2k),
             updated_at=utc_now(),
         )
         saved = await self.store.replace_trello_config(config)
-        return self._trello_config_snapshot(saved)
+
+        persist_result: Dict[str, Any] = {"persisted_to_env": False}
+        if request.persist_to_env and not request.clear_credentials:
+            persist_payload = {
+                "TRELLO_API_KEY": api_key,
+                "TRELLO_TOKEN": token,
+                "TRELLO_BOARD_ID": board_id,
+                "TRELLO_CARD_ID": card_id,
+                "TRELLO_LIST_ID": list_id,
+            }
+            persist_result = self._persist_env_local(
+                {key: value for key, value in persist_payload.items() if value}
+            )
+
+        snapshot = self._trello_config_snapshot(saved)
+        snapshot.update(persist_result)
+        return snapshot
+
+    def _persist_env_local(self, values: Dict[str, str]) -> Dict[str, Any]:
+        """Write or update ``values`` into ``.env.local`` at repo root.
+
+        Preserves any unrelated lines (other keys, comments, blank lines).
+        Returns ``{"persisted_to_env": bool, "persist_error": str, "env_file": str}``
+        so the UI can confirm the one-time setup succeeded.
+
+        Also mirrors the values into ``os.environ`` immediately so the running
+        process picks them up without a restart.
+        """
+        from .main import ENV_FILE  # imported lazily to avoid circular import
+
+        env_path = Path(ENV_FILE)
+        try:
+            existing_lines: List[str] = []
+            if env_path.exists():
+                existing_lines = env_path.read_text(encoding="utf-8").splitlines()
+
+            updated_lines: List[str] = []
+            keys_seen: set[str] = set()
+            for raw_line in existing_lines:
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    updated_lines.append(raw_line)
+                    continue
+                key_part, _ = stripped.split("=", 1)
+                key_name = key_part.strip()
+                if key_name in values:
+                    updated_lines.append(f"{key_name}={values[key_name]}")
+                    keys_seen.add(key_name)
+                else:
+                    updated_lines.append(raw_line)
+
+            appended_any = False
+            for key_name, value in values.items():
+                if key_name in keys_seen:
+                    continue
+                if not appended_any and updated_lines and updated_lines[-1].strip():
+                    updated_lines.append("")
+                if not appended_any:
+                    updated_lines.append("# Added by Flow v2 setup wizard")
+                    appended_any = True
+                updated_lines.append(f"{key_name}={value}")
+
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
+        except OSError as exc:
+            log.warning("Failed to persist Trello creds to %s: %s", env_path, exc)
+            return {
+                "persisted_to_env": False,
+                "persist_error": str(exc),
+                "env_file": str(env_path),
+            }
+
+        for key_name, value in values.items():
+            os.environ[key_name] = value
+
+        return {
+            "persisted_to_env": True,
+            "persist_error": "",
+            "env_file": str(env_path),
+        }
 
     def _trello_config_snapshot(self, config: TrelloConfig) -> Dict[str, Any]:
-        api_key = str(config.api_key or "").strip()
-        token = str(config.token or "").strip()
-        board_id = self._normalize_trello_board_id(config.board_id)
-        card_id = self._normalize_trello_card_id(config.card_id)
-        list_id = self._normalize_trello_id(config.list_id)
-        upload_mode = str(config.upload_mode or "file").strip().lower()
+        # Fall back to environment variables (loaded from `.env.local` on
+        # startup) so the UI's "Đã lưu / Cần thiết lập" badges reflect
+        # credentials that live outside ``data/state.json``. This lets chủ
+        # nhân set up Trello once via .env.local and skip re-entering creds
+        # every time state.json is reset.
+        api_key = str(config.api_key or "").strip() or os.getenv("TRELLO_API_KEY", "").strip()
+        token = str(config.token or "").strip() or os.getenv("TRELLO_TOKEN", "").strip()
+        board_id = self._normalize_trello_board_id(
+            str(config.board_id or "").strip() or os.getenv("TRELLO_BOARD_ID", "").strip()
+        )
+        card_id = self._normalize_trello_card_id(
+            str(config.card_id or "").strip() or os.getenv("TRELLO_CARD_ID", "").strip()
+        )
+        list_id = self._normalize_trello_id(
+            str(config.list_id or "").strip() or os.getenv("TRELLO_LIST_ID", "").strip()
+        )
+        upload_mode = (
+            str(config.upload_mode or "").strip().lower()
+            or os.getenv("TRELLO_UPLOAD_MODE", "").strip().lower()
+            or "file"
+        )
         if upload_mode not in {"file", "url"}:
             upload_mode = "file"
+        env_credentials_used = (
+            (not str(config.api_key or "").strip() and bool(api_key))
+            or (not str(config.token or "").strip() and bool(token))
+        )
         return {
             "configured": bool(api_key and token and (board_id or card_id or list_id)),
             "credentials_saved": bool(api_key and token),
             "api_key_saved": bool(api_key),
             "token_saved": bool(token),
+            "credentials_source": "env" if env_credentials_used else ("state" if api_key and token else ""),
             "board_id": board_id,
             "card_id": card_id,
             "list_id": list_id,
             "upload_mode": upload_mode,
             "set_cover": config.set_cover is not False,
+            "upscale_to_2k": bool(getattr(config, "upscale_to_2k", True)),
             "updated_at": config.updated_at,
         }
 
@@ -4862,9 +4992,14 @@ exit 1
         upload_mode = (trello_config.upload_mode or os.getenv("TRELLO_UPLOAD_MODE", "file")).strip().lower()
         if upload_mode not in {"file", "url"}:
             upload_mode = "file"
+        # 2K upscaling requires re-uploading bytes, which only the "file" mode
+        # supports. When the user has explicitly chosen URL mode we keep that
+        # choice and skip upscaling instead of surprising them with a switch.
+        upscale_2k = bool(getattr(trello_config, "upscale_to_2k", True)) and upload_mode == "file"
         stored = 0
         failed = 0
         attachments: List[Dict[str, Any]] = []
+        upscale_announced = False
         for index, artifact in enumerate(artifacts):
             artifact_url = str(artifact.url or artifact.public_url or "").strip()
             if not artifact_url:
@@ -4884,17 +5019,50 @@ exit 1
                         set_cover and index == 0,
                     )
                 else:
+                    upscaled_bytes: Optional[bytes] = None
+                    upscaled_mime = ""
+                    if upscale_2k:
+                        try:
+                            upscaled_bytes, upscaled_mime = await self._upsample_artifact_bytes(
+                                artifact,
+                                artifact_url,
+                            )
+                        except Exception as up_exc:
+                            await self.store.append_log(
+                                job_id,
+                                f"Không nâng được ảnh {index + 1} lên 2K (giữ bản gốc): {humanize_flow_error(str(up_exc))}",
+                            )
+                            upscaled_bytes = None
+                        else:
+                            if upscaled_bytes and not upscale_announced:
+                                await self.store.append_log(
+                                    job_id,
+                                    "Đã nâng cấp ảnh lên 2K trước khi upload lên Trello.",
+                                )
+                                upscale_announced = True
                     try:
-                        attachment_payload = await asyncio.to_thread(
-                            self._trello_attach_file_from_url,
-                            key,
-                            token,
-                            card_id,
-                            artifact_url,
-                            name,
-                            artifact.mime_type or "image/jpeg",
-                            set_cover and index == 0,
-                        )
+                        if upscaled_bytes:
+                            attachment_payload = await asyncio.to_thread(
+                                self._trello_attach_file_bytes,
+                                key,
+                                token,
+                                card_id,
+                                upscaled_bytes,
+                                upscaled_mime or artifact.mime_type or "image/jpeg",
+                                name,
+                                set_cover and index == 0,
+                            )
+                        else:
+                            attachment_payload = await asyncio.to_thread(
+                                self._trello_attach_file_from_url,
+                                key,
+                                token,
+                                card_id,
+                                artifact_url,
+                                name,
+                                artifact.mime_type or "image/jpeg",
+                                set_cover and index == 0,
+                            )
                     except Exception as file_exc:
                         await self.store.append_log(
                             job_id,
@@ -5462,6 +5630,27 @@ exit 1
     ) -> Dict[str, Any]:
         file_bytes, detected_mime = self._read_remote_file(artifact_url)
         mime = detected_mime or mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
+        return self._trello_attach_file_bytes(
+            key,
+            token,
+            card_id,
+            file_bytes,
+            mime,
+            name,
+            set_cover,
+        )
+
+    def _trello_attach_file_bytes(
+        self,
+        key: str,
+        token: str,
+        card_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+        name: str,
+        set_cover: bool,
+    ) -> Dict[str, Any]:
+        mime = mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
         body, content_type = self._multipart_form_data(
             fields={
                 "name": name,
@@ -5483,6 +5672,101 @@ exit 1
         if isinstance(payload, list):
             return payload[0] if payload else {}
         return payload if isinstance(payload, dict) else {}
+
+    # ── Flow image upsampler (POST /v1/flow/upsampleImage) ──────────────────
+    # Confirmed via captured DevTools request (2026-05): the endpoint accepts
+    # ``{"encodedImage": <base64 JPEG>}`` and returns an upscaled JPEG in the
+    # same field. The response is treated defensively in ``_extract_encoded_image``
+    # so wrapping objects like ``{"image": {"encodedImage": ...}}`` also work.
+
+    async def _upsample_image_via_flow(self, client: Any, jpeg_bytes: bytes) -> bytes:
+        """Call POST /v1/flow/upsampleImage and return the upscaled JPEG bytes.
+
+        Returns the original bytes on any failure so the caller can still
+        upload the source image.
+        """
+        if not jpeg_bytes:
+            return jpeg_bytes
+        try:
+            import base64 as _b64
+            encoded_in = _b64.b64encode(jpeg_bytes).decode("ascii")
+            data = await client._api._fetch(
+                "POST",
+                "flow/upsampleImage",
+                {"encodedImage": encoded_in},
+            )
+        except Exception as exc:
+            log.warning("flow/upsampleImage failed: %s", self._flow_error_detail(exc))
+            return jpeg_bytes
+        encoded_out = self._extract_encoded_image(data)
+        if not encoded_out:
+            log.warning(
+                "flow/upsampleImage: response missing encodedImage field (keys=%s)",
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            )
+            return jpeg_bytes
+        try:
+            return _b64.b64decode(encoded_out)
+        except Exception as exc:
+            log.warning("flow/upsampleImage: base64 decode failed: %s", exc)
+            return jpeg_bytes
+
+    def _extract_encoded_image(self, payload: Any) -> str:
+        """Recursively find the first ``encodedImage`` string in a JSON tree."""
+        if isinstance(payload, dict):
+            candidate = payload.get("encodedImage")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+            for value in payload.values():
+                found = self._extract_encoded_image(value)
+                if found:
+                    return found
+        elif isinstance(payload, list):
+            for item in payload:
+                found = self._extract_encoded_image(item)
+                if found:
+                    return found
+        return ""
+
+    async def _upsample_artifact_bytes(
+        self,
+        artifact: JobArtifact,
+        artifact_url: str,
+    ) -> tuple[Optional[bytes], str]:
+        """Fetch an artifact and upsample it via flow/upsampleImage.
+
+        Returns ``(upscaled_bytes, mime)`` on success, or ``(None, "")`` if the
+        source bytes could not be fetched. JPEG is preferred since the Flow
+        upsampler expects an encoded JPEG payload.
+        """
+        local_path = str(artifact.local_path or "").strip()
+        source_bytes: bytes = b""
+        source_mime = str(artifact.mime_type or "").strip()
+        if local_path and Path(local_path).expanduser().is_file():
+            try:
+                source_bytes = Path(local_path).expanduser().read_bytes()
+                if not source_mime:
+                    source_mime = mimetypes.guess_type(local_path)[0] or "image/jpeg"
+            except Exception:
+                source_bytes = b""
+        if not source_bytes:
+            source_bytes, detected_mime = await asyncio.to_thread(
+                self._read_remote_file, artifact_url
+            )
+            source_mime = source_mime or detected_mime or "image/jpeg"
+        if not source_bytes:
+            return None, ""
+
+        workflow_id = str(artifact.workflow_id or "").strip()
+
+        async def _go(client: Any) -> bytes:
+            return await self._upsample_image_via_flow(client, source_bytes)
+
+        upscaled = await self._with_client(_go, workflow_id=workflow_id)
+        if not upscaled or upscaled == source_bytes:
+            return None, ""
+        # The Flow upsampler returns JPEG bytes regardless of input mime.
+        return upscaled, "image/jpeg"
 
     def _read_remote_file(self, url: str) -> tuple[bytes, str]:
         request = Request(url, headers={"User-Agent": "FlowWebUI/0.1"})

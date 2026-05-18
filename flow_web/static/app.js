@@ -514,11 +514,13 @@ function defaultTrelloState() {
     credentials_saved: false,
     api_key_saved: false,
     token_saved: false,
+    credentials_source: "",
     board_id: "",
     card_id: "",
     list_id: "",
     upload_mode: "file",
     set_cover: true,
+    upscale_to_2k: true,
     updated_at: "",
   };
 }
@@ -526,17 +528,22 @@ function defaultTrelloState() {
 function normalizeTrelloState(value = {}) {
   const payload = value && typeof value === "object" ? value : {};
   const uploadMode = ["file", "url"].includes(payload.upload_mode) ? payload.upload_mode : "file";
+  const credentialsSource = ["state", "env"].includes(payload.credentials_source)
+    ? payload.credentials_source
+    : "";
   return {
     ...defaultTrelloState(),
     configured: Boolean(payload.configured),
     credentials_saved: Boolean(payload.credentials_saved),
     api_key_saved: Boolean(payload.api_key_saved),
     token_saved: Boolean(payload.token_saved),
+    credentials_source: credentialsSource,
     board_id: String(payload.board_id || ""),
     card_id: String(payload.card_id || ""),
     list_id: String(payload.list_id || ""),
     upload_mode: uploadMode,
     set_cover: payload.set_cover !== false,
+    upscale_to_2k: payload.upscale_to_2k !== false,
     updated_at: String(payload.updated_at || ""),
   };
 }
@@ -725,10 +732,19 @@ const elements = {
   automationTrelloKeyInput: document.querySelector("#automationTrelloKeyInput"),
   automationTrelloTokenInput: document.querySelector("#automationTrelloTokenInput"),
   automationTrelloUploadMode: document.querySelector("#automationTrelloUploadMode"),
+  automationTrelloUpscale2KInput: document.querySelector("#automationTrelloUpscale2KInput"),
   automationTrelloStatus: document.querySelector("#automationTrelloStatus"),
   automationTrelloSaveButton: document.querySelector("#automationTrelloSaveButton"),
   automationTrelloClearButton: document.querySelector("#automationTrelloClearButton"),
   automationTrelloSection: document.querySelector("#automationTrelloSection"),
+  trelloSetupWizard: document.querySelector("#trelloSetupWizard"),
+  trelloWizardKeyInput: document.querySelector("#trelloWizardKeyInput"),
+  trelloWizardTokenInput: document.querySelector("#trelloWizardTokenInput"),
+  trelloWizardBoardInput: document.querySelector("#trelloWizardBoardInput"),
+  trelloWizardSaveButton: document.querySelector("#trelloWizardSaveButton"),
+  trelloWizardLaterButton: document.querySelector("#trelloWizardLaterButton"),
+  trelloWizardStatus: document.querySelector("#trelloWizardStatus"),
+  trelloWizardCloseTriggers: Array.from(document.querySelectorAll("[data-trello-wizard-close]")),
   automationEnvStatus: document.querySelector("#automationEnvStatus"),
   automationGeminiKeyInput: document.querySelector("#automationGeminiKeyInput"),
   automationGeminiModelInput: document.querySelector("#automationGeminiModelInput"),
@@ -1849,6 +1865,9 @@ function renderAutomationInspector(stats) {
   if (document.activeElement !== elements.automationTrelloUploadMode) {
     elements.automationTrelloUploadMode.value = state.trello?.upload_mode || "file";
   }
+  if (elements.automationTrelloUpscale2KInput && document.activeElement !== elements.automationTrelloUpscale2KInput) {
+    elements.automationTrelloUpscale2KInput.checked = state.trello?.upscale_to_2k !== false;
+  }
   if (elements.automationGeminiModelInput && document.activeElement !== elements.automationGeminiModelInput) {
     elements.automationGeminiModelInput.value = state.integrations?.gemini?.model || "gemini-2.5-flash";
   }
@@ -1890,11 +1909,16 @@ function renderAutomationInspector(stats) {
   elements.automationRunningStatus.dataset.state = stats.active.length ? "ready" : "pending";
 
   if (elements.automationTrelloStatus) {
+    const envBased = state.trello?.credentials_source === "env";
     if (state.trello?.configured) {
-      elements.automationTrelloStatus.textContent = "Đã sẵn sàng";
+      elements.automationTrelloStatus.textContent = envBased
+        ? "Đã sẵn sàng (.env.local)"
+        : "Đã sẵn sàng";
       elements.automationTrelloStatus.dataset.state = "ready";
     } else if (state.trello?.credentials_saved) {
-      elements.automationTrelloStatus.textContent = "Thiếu board/card/list";
+      elements.automationTrelloStatus.textContent = envBased
+        ? "Thiếu board/card/list (key/token từ .env.local)"
+        : "Thiếu board/card/list";
       elements.automationTrelloStatus.dataset.state = "pending";
     } else if (state.trello?.board_id || state.trello?.card_id || state.trello?.list_id) {
       elements.automationTrelloStatus.textContent = "Thiếu key/token";
@@ -3241,6 +3265,7 @@ async function loadState({ silent = false } = {}) {
 
     renderAll();
     maybeAutoPreviewPromptSource();
+    maybeShowTrelloWizard();
     if (isReady() && !state.modelOptionsLoaded) {
       void loadModelOptions();
     }
@@ -3573,6 +3598,10 @@ async function saveTrelloConfig({ clearCredentials = false } = {}) {
     list_id: elements.automationTrelloListInput?.value?.trim() || "",
     upload_mode: elements.automationTrelloUploadMode?.value || state.trello?.upload_mode || "file",
     set_cover: state.automation.trelloSetCover !== false,
+    upscale_to_2k:
+      elements.automationTrelloUpscale2KInput
+        ? Boolean(elements.automationTrelloUpscale2KInput.checked)
+        : state.trello?.upscale_to_2k !== false,
     clear_credentials: clearCredentials,
   };
 
@@ -3619,6 +3648,171 @@ async function saveTrelloConfig({ clearCredentials = false } = {}) {
     }
     if (elements.automationTrelloClearButton) {
       elements.automationTrelloClearButton.disabled = false;
+    }
+  }
+}
+
+// ── Trello first-run setup wizard ──────────────────────────────────
+// Pops a modal the first time chủ nhân opens the app without Trello creds,
+// then writes the 3 values straight into `.env.local` so the next launches
+// don't need any setup. Dismissed state lives in sessionStorage so a fresh
+// browser tab still gets the nudge.
+const TRELLO_WIZARD_DISMISS_KEY = "flow.v2.trelloWizard.dismissedThisSession";
+
+function isTrelloWizardDismissedForSession() {
+  try {
+    return window.sessionStorage?.getItem(TRELLO_WIZARD_DISMISS_KEY) === "1";
+  } catch (error) {
+    return false;
+  }
+}
+
+function rememberTrelloWizardDismissal() {
+  try {
+    window.sessionStorage?.setItem(TRELLO_WIZARD_DISMISS_KEY, "1");
+  } catch (error) {
+    // sessionStorage may be blocked; the wizard will simply reappear next
+    // load, which is the safer default for a setup nudge.
+  }
+}
+
+function showTrelloWizardStatus(message, tone = "info") {
+  const node = elements.trelloWizardStatus;
+  if (!node) {
+    return;
+  }
+  if (!message) {
+    node.hidden = true;
+    node.textContent = "";
+    node.removeAttribute("data-tone");
+    return;
+  }
+  node.hidden = false;
+  node.textContent = message;
+  node.dataset.tone = tone;
+}
+
+function openTrelloWizard() {
+  const wizard = elements.trelloSetupWizard;
+  if (!wizard) {
+    return;
+  }
+  wizard.hidden = false;
+  wizard.setAttribute("aria-hidden", "false");
+  showTrelloWizardStatus("");
+  // Focus first empty input so the user can paste immediately.
+  const inputs = [
+    elements.trelloWizardKeyInput,
+    elements.trelloWizardTokenInput,
+    elements.trelloWizardBoardInput,
+  ];
+  const firstEmpty = inputs.find((input) => input && !input.value.trim()) || inputs[0];
+  setTimeout(() => firstEmpty?.focus(), 30);
+  document.body.style.overflow = "hidden";
+}
+
+function closeTrelloWizard({ remember = true } = {}) {
+  const wizard = elements.trelloSetupWizard;
+  if (!wizard) {
+    return;
+  }
+  wizard.hidden = true;
+  wizard.setAttribute("aria-hidden", "true");
+  document.body.style.overflow = "";
+  if (remember) {
+    rememberTrelloWizardDismissal();
+  }
+}
+
+function maybeShowTrelloWizard() {
+  if (!elements.trelloSetupWizard) {
+    return;
+  }
+  if (state.trello?.credentials_saved && state.trello?.configured) {
+    closeTrelloWizard({ remember: false });
+    return;
+  }
+  if (state.trello?.credentials_saved && !state.trello?.configured) {
+    // Creds OK but board/card/list missing → user can fix inside the
+    // inspector, no need to block the dashboard with a modal.
+    return;
+  }
+  if (isTrelloWizardDismissedForSession()) {
+    return;
+  }
+  openTrelloWizard();
+}
+
+async function submitTrelloWizard() {
+  const key = elements.trelloWizardKeyInput?.value?.trim() || "";
+  const token = elements.trelloWizardTokenInput?.value?.trim() || "";
+  const board = elements.trelloWizardBoardInput?.value?.trim() || "";
+
+  if (!key || !token || !board) {
+    showTrelloWizardStatus("Cần điền đủ API key, token và Trello board URL.", "error");
+    return;
+  }
+
+  const saveButton = elements.trelloWizardSaveButton;
+  if (saveButton) {
+    saveButton.disabled = true;
+  }
+  showTrelloWizardStatus("Đang ghi creds vào .env.local…", "info");
+
+  try {
+    const response = await api("/api/integrations/trello", {
+      method: "PUT",
+      body: JSON.stringify({
+        api_key: key,
+        token,
+        board_id: board,
+        card_id: state.trello?.card_id || "",
+        list_id: state.trello?.list_id || "",
+        upload_mode: state.trello?.upload_mode || "file",
+        set_cover: state.automation?.trelloSetCover !== false,
+        upscale_to_2k: state.trello?.upscale_to_2k !== false,
+        clear_credentials: false,
+        persist_to_env: true,
+      }),
+    });
+
+    const nextTrello = normalizeTrelloState(response.trello || response || {});
+    state.trello = nextTrello;
+    state.automation.trelloBoardId = nextTrello.board_id || board;
+    saveAutomationConfig(state.automation);
+
+    const persisted = response?.persisted_to_env === true;
+    const persistError = String(response?.persist_error || "").trim();
+
+    if (persisted) {
+      showTrelloWizardStatus(
+        "Đã lưu vào .env.local. Lần sau chỉ việc chạy — không cần nhập lại.",
+        "success"
+      );
+      showMessage(
+        "Đã setup Trello vĩnh viễn vào .env.local. Auto Trello đã sẵn sàng.",
+        "success"
+      );
+    } else {
+      // Saved to state.json but couldn't touch .env.local (permissions /
+      // sandboxed FS). Surface the error so chủ nhân can copy values
+      // manually if needed.
+      const fallback = persistError
+        ? `Đã lưu vào app, nhưng không ghi được vào .env.local: ${persistError}. App vẫn dùng được trong phiên này.`
+        : "Đã lưu vào app, nhưng không ghi được vào .env.local. Hãy thêm thủ công để giữ qua các lần khởi động.";
+      showTrelloWizardStatus(fallback, "error");
+    }
+
+    renderAutomationDashboard();
+
+    if (persisted) {
+      setTimeout(() => closeTrelloWizard({ remember: false }), 1100);
+    }
+  } catch (error) {
+    showTrelloWizardStatus(error.message || "Lưu thất bại. Hãy kiểm tra creds.", "error");
+  } finally {
+    if (saveButton) {
+      saveButton.disabled = false;
     }
   }
 }
@@ -4601,6 +4795,28 @@ elements.automationSheetFileInput?.addEventListener("change", (event) => {
 });
 elements.automationTrelloSaveButton?.addEventListener("click", () => saveTrelloConfig());
 elements.automationTrelloClearButton?.addEventListener("click", () => saveTrelloConfig({ clearCredentials: true }));
+
+elements.trelloWizardSaveButton?.addEventListener("click", () => {
+  void submitTrelloWizard();
+});
+elements.trelloWizardCloseTriggers.forEach((node) => {
+  node.addEventListener("click", () => closeTrelloWizard({ remember: true }));
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") {
+    return;
+  }
+  const wizard = elements.trelloSetupWizard;
+  if (wizard && !wizard.hidden) {
+    closeTrelloWizard({ remember: true });
+  }
+});
+elements.automationTrelloUpscale2KInput?.addEventListener("change", (event) => {
+  if (!state.trello) {
+    state.trello = defaultTrelloState();
+  }
+  state.trello.upscale_to_2k = Boolean(event.target?.checked);
+});
 elements.automationEnvSaveButton?.addEventListener("click", () => saveIntegrationConfig());
 elements.automationEnvClearButton?.addEventListener("click", () => saveIntegrationConfig({ clearSecrets: true }));
 elements.automationViewButtons.forEach((button) => {

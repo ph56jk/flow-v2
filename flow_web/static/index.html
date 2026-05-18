@@ -331,6 +331,10 @@
                 <option value="url">Chỉ attach link ảnh</option>
               </select>
             </label>
+            <label class="field checkbox-field">
+              <input type="checkbox" id="automationTrelloUpscale2KInput" />
+              <span>Nâng cấp ảnh lên 2K trước khi upload (Flow upsampleImage)</span>
+            </label>
             <div class="customize-actions trello-actions">
               <button type="button" class="ghost-button card-button" id="automationTrelloSaveButton">Lưu Trello</button>
               <button type="button" class="ghost-button card-button" id="automationTrelloClearButton">Xóa key/token</button>
@@ -829,6 +833,56 @@
         </section>
       </main>
     </div>
-    <script type="module" src="/static/app.js?v=20260516e"></script>
+
+    <div id="trelloSetupWizard" class="setup-wizard" hidden aria-hidden="true" role="dialog" aria-labelledby="trelloSetupWizardTitle">
+      <div class="setup-wizard__backdrop" data-trello-wizard-close></div>
+      <div class="setup-wizard__panel" role="document">
+        <header class="setup-wizard__head">
+          <p class="eyebrow">Setup lần đầu</p>
+          <h2 id="trelloSetupWizardTitle">Kết nối Trello để Flow v2 tự lấy ảnh sản phẩm</h2>
+          <p class="setup-wizard__lead">
+            Điền 3 ô dưới đây 1 lần. App sẽ lưu vào <code>.env.local</code> ở thư mục dự án để giữ creds qua mọi lần khởi động — không cần nhập lại.
+          </p>
+        </header>
+
+        <div class="setup-wizard__body">
+          <label class="field">
+            <span>Trello API key</span>
+            <input type="password" id="trelloWizardKeyInput" autocomplete="off" placeholder="Dán API key Trello" />
+            <small class="field-hint">
+              Lấy tại
+              <a href="https://trello.com/power-ups/admin/" target="_blank" rel="noopener noreferrer">trello.com/power-ups/admin</a>
+              → "New" → tạo Power-Up → mở tab Generate, sao chép "API key".
+            </small>
+          </label>
+          <label class="field">
+            <span>Trello token</span>
+            <input type="password" id="trelloWizardTokenInput" autocomplete="off" placeholder="Dán token Trello" />
+            <small class="field-hint">
+              Trong cùng trang Generate, bấm "Token" → cấp quyền cho key → sao chép token trả về.
+            </small>
+          </label>
+          <label class="field">
+            <span>Trello board URL</span>
+            <input type="text" id="trelloWizardBoardInput" placeholder="https://trello.com/b/abc123/ten-board" />
+            <small class="field-hint">
+              Dán URL board chứa card có ảnh sản phẩm để Auto Trello quét.
+            </small>
+          </label>
+          <div class="setup-wizard__status" id="trelloWizardStatus" hidden></div>
+        </div>
+
+        <footer class="setup-wizard__actions">
+          <button type="button" class="ghost-button" id="trelloWizardLaterButton" data-trello-wizard-close>
+            Để sau
+          </button>
+          <button type="button" class="primary-button" id="trelloWizardSaveButton">
+            Lưu vĩnh viễn (.env.local)
+          </button>
+        </footer>
+      </div>
+    </div>
+
+    <script type="module" src="/static/app.js?v=20260518a"></script>
   </body>
 </html>

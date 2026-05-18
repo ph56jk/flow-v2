@@ -237,6 +237,92 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(0, result["failed"])
         self.assertEqual("abc123", result["card_id"])
 
+    def test_trello_archive_upsamples_image_to_2k_before_file_upload(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRELLO_API_KEY": "",
+                "TRELLO_TOKEN": "",
+                "TRELLO_CARD_ID": "",
+                "TRELLO_LIST_ID": "",
+                "TRELLO_UPLOAD_MODE": "file",
+            },
+            clear=False,
+        ), patch.object(
+            self.service,
+            "_upsample_artifact_bytes",
+            new=AsyncMock(return_value=(b"upscaled-jpeg-bytes", "image/jpeg")),
+        ) as upsample, patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_bytes, patch.object(
+            self.service,
+            "_trello_attach_file_from_url",
+        ) as attach_from_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        upsample.assert_awaited_once()
+        attach_bytes.assert_called_once()
+        attach_from_url.assert_not_called()
+        # Positional args: key, token, card_id, file_bytes, mime, name, set_cover
+        self.assertEqual(b"upscaled-jpeg-bytes", attach_bytes.call_args.args[3])
+        self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
+        self.assertEqual("abc123", attach_bytes.call_args.args[2])
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+
+    def test_trello_archive_skips_upsample_in_url_mode(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="url",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_upsample_artifact_bytes",
+            new=AsyncMock(return_value=(b"upscaled-jpeg-bytes", "image/jpeg")),
+        ) as upsample, patch.object(
+            self.service,
+            "_trello_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        # URL mode: respect the user's choice — no upsampling, no file upload.
+        upsample.assert_not_called()
+        attach_url.assert_called_once()
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["sent"])
+
     def test_update_trello_config_saves_without_exposing_credentials(self) -> None:
         result = asyncio.run(
             self.service.update_trello_config(
@@ -263,6 +349,142 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("token", saved.token)
         self.assertEqual("board123", saved.board_id)
         self.assertEqual("abc123", saved.card_id)
+
+    def test_update_trello_config_persists_creds_to_env_local_file(self) -> None:
+        env_file = self.temp_root / ".env.local"
+        with patch("flow_web.service.ENV_FILE", env_file) if False else patch(
+            "flow_web.main.ENV_FILE", env_file
+        ), patch.dict(
+            os.environ,
+            {
+                "TRELLO_API_KEY": "",
+                "TRELLO_TOKEN": "",
+                "TRELLO_BOARD_ID": "",
+                "TRELLO_CARD_ID": "",
+                "TRELLO_LIST_ID": "",
+            },
+            clear=False,
+        ):
+            result = asyncio.run(
+                self.service.update_trello_config(
+                    TrelloConfigUpdateRequest(
+                        api_key="wizard-key",
+                        token="wizard-token",
+                        board_id="https://trello.com/b/wizardboard/demo",
+                        persist_to_env=True,
+                    )
+                )
+            )
+            self.assertTrue(result["persisted_to_env"])
+            self.assertTrue(env_file.exists())
+            contents = env_file.read_text(encoding="utf-8")
+            self.assertIn("TRELLO_API_KEY=wizard-key", contents)
+            self.assertIn("TRELLO_TOKEN=wizard-token", contents)
+            self.assertIn("TRELLO_BOARD_ID=wizardboard", contents)
+            # Process env is also updated so the running app picks it up without restart.
+            self.assertEqual("wizard-key", os.environ.get("TRELLO_API_KEY", ""))
+
+    def test_update_trello_config_persist_preserves_unrelated_env_lines(self) -> None:
+        env_file = self.temp_root / ".env.local"
+        env_file.write_text(
+            "\n".join(
+                [
+                    "# preexisting comment",
+                    "OTHER_SECRET=keep-me",
+                    "TRELLO_API_KEY=old-key",
+                    "",
+                    "GEMINI_API_KEY=gem-keep",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patch("flow_web.main.ENV_FILE", env_file), patch.dict(
+            os.environ,
+            {"TRELLO_API_KEY": "", "TRELLO_TOKEN": ""},
+            clear=False,
+        ):
+            result = asyncio.run(
+                self.service.update_trello_config(
+                    TrelloConfigUpdateRequest(
+                        api_key="new-key",
+                        token="new-token",
+                        board_id="https://trello.com/b/newboard/demo",
+                        persist_to_env=True,
+                    )
+                )
+            )
+
+        self.assertTrue(result["persisted_to_env"])
+        contents = env_file.read_text(encoding="utf-8")
+        # Existing unrelated lines must be preserved verbatim.
+        self.assertIn("# preexisting comment", contents)
+        self.assertIn("OTHER_SECRET=keep-me", contents)
+        self.assertIn("GEMINI_API_KEY=gem-keep", contents)
+        # The previously stored TRELLO_API_KEY is overwritten in place,
+        # not duplicated at the end of the file.
+        self.assertNotIn("TRELLO_API_KEY=old-key", contents)
+        self.assertEqual(contents.count("TRELLO_API_KEY="), 1)
+        self.assertIn("TRELLO_API_KEY=new-key", contents)
+        # New keys that weren't in the file before are appended cleanly.
+        self.assertIn("TRELLO_TOKEN=new-token", contents)
+        self.assertIn("TRELLO_BOARD_ID=newboard", contents)
+
+    def test_trello_config_snapshot_falls_back_to_env_vars(self) -> None:
+        # Chủ nhân setup 1 lần qua .env.local: state.json rỗng nhưng env vars
+        # phải đủ để UI báo "Đã lưu" thay vì "Cần thiết lập".
+        empty_snapshot = self.service._trello_config_snapshot(self.store.snapshot().trello_config)
+        self.assertFalse(empty_snapshot["credentials_saved"])
+        self.assertEqual("", empty_snapshot["credentials_source"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRELLO_API_KEY": "env-key",
+                "TRELLO_TOKEN": "env-token",
+                "TRELLO_BOARD_ID": "https://trello.com/b/envboard/demo",
+                "TRELLO_CARD_ID": "https://trello.com/c/envcard/demo",
+                "TRELLO_LIST_ID": "envlist",
+                "TRELLO_UPLOAD_MODE": "url",
+            },
+            clear=False,
+        ):
+            envonly = self.service._trello_config_snapshot(self.store.snapshot().trello_config)
+
+        self.assertTrue(envonly["configured"])
+        self.assertTrue(envonly["credentials_saved"])
+        self.assertEqual("env", envonly["credentials_source"])
+        self.assertEqual("envboard", envonly["board_id"])
+        self.assertEqual("envcard", envonly["card_id"])
+        self.assertEqual("envlist", envonly["list_id"])
+        # upload_mode trong state.json mặc định "file" — env chỉ override khi
+        # state thực sự để trống, khớp với logic trong _archive_trello_artifacts.
+        self.assertIn(envonly["upload_mode"], {"file", "url"})
+        # Snapshot không bao giờ leak api_key/token raw
+        self.assertNotIn("api_key", envonly)
+        self.assertNotIn("token", envonly)
+
+    def test_trello_config_snapshot_prefers_state_over_env(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="state-key",
+                    token="state-token",
+                    board_id="https://trello.com/b/stateboard/demo",
+                )
+            )
+        )
+        with patch.dict(
+            os.environ,
+            {"TRELLO_API_KEY": "env-key", "TRELLO_TOKEN": "env-token"},
+            clear=False,
+        ):
+            snap = self.service._trello_config_snapshot(self.store.snapshot().trello_config)
+
+        # State vẫn ưu tiên trước env nên credentials_source = "state".
+        self.assertEqual("state", snap["credentials_source"])
+        self.assertTrue(snap["credentials_saved"])
+        self.assertEqual("stateboard", snap["board_id"])
 
     def test_trello_archive_uses_app_saved_config(self) -> None:
         asyncio.run(

@@ -313,6 +313,10 @@ class StateStore:
         upload_mode = str(payload.get("upload_mode") or "file").strip().lower()
         if upload_mode not in {"file", "url"}:
             upload_mode = "file"
+        # ``upscale_to_2k`` was added later; legacy state.json không có khoá này
+        # nên dùng default True, nhưng nếu user đã chọn False thì phải tôn
+        # trọng — không re-default lại True khi normalize.
+        raw_upscale = payload.get("upscale_to_2k", True)
         return TrelloConfig(
             api_key=str(payload.get("api_key") or "").strip(),
             token=str(payload.get("token") or "").strip(),
@@ -321,6 +325,7 @@ class StateStore:
             list_id=str(payload.get("list_id") or "").strip(),
             upload_mode=upload_mode,
             set_cover=payload.get("set_cover") is not False,
+            upscale_to_2k=raw_upscale is not False,
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
 

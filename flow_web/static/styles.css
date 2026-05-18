@@ -2678,3 +2678,141 @@ textarea:focus {
     margin-left: 420px;
   }
 }
+
+/* ── Setup wizard (first-run Trello credentials) ─────────────────── */
+.setup-wizard {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.setup-wizard[hidden] {
+  display: none;
+}
+
+.setup-wizard__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(17, 24, 39, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.setup-wizard__panel {
+  position: relative;
+  max-width: 540px;
+  width: 100%;
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  background: #fff;
+  border-radius: 18px;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.25);
+  padding: 28px 28px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.setup-wizard__head .eyebrow {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: #6366f1;
+  margin: 0 0 6px;
+  font-weight: 600;
+}
+
+.setup-wizard__head h2 {
+  margin: 0;
+  font-size: 20px;
+  color: #111827;
+  line-height: 1.25;
+}
+
+.setup-wizard__lead {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #4b5563;
+}
+
+.setup-wizard__lead code {
+  background: #f3f4f6;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.setup-wizard__body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.setup-wizard__body .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.setup-wizard__body .field > span {
+  font-weight: 600;
+  font-size: 13px;
+  color: #1f2937;
+}
+
+.setup-wizard__body .field input {
+  border: 1px solid #d1d5db;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.setup-wizard__body .field input:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+
+.setup-wizard__body .field-hint {
+  font-size: 12px;
+  color: #6b7280;
+  line-height: 1.4;
+}
+
+.setup-wizard__body .field-hint a {
+  color: #6366f1;
+  text-decoration: underline;
+}
+
+.setup-wizard__status {
+  font-size: 13px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+.setup-wizard__status[data-tone="success"] {
+  background: #d1fae5;
+  color: #065f46;
+  border-color: #a7f3d0;
+}
+
+.setup-wizard__status[data-tone="error"] {
+  background: #fee2e2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+
+.setup-wizard__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}

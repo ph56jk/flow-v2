@@ -32,6 +32,7 @@ class TrelloConfig(BaseModel):
     list_id: str = ""
     upload_mode: str = "file"
     set_cover: bool = True
+    upscale_to_2k: bool = True
     updated_at: str = ""
 
 
@@ -271,7 +272,9 @@ class TrelloConfigUpdateRequest(BaseModel):
     list_id: str = ""
     upload_mode: str = "file"
     set_cover: bool = True
+    upscale_to_2k: bool = True
     clear_credentials: bool = False
+    persist_to_env: bool = False  # also write to .env.local so creds survive state resets
 
 
 class IntegrationConfigUpdateRequest(BaseModel):
