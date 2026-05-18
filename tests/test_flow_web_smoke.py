@@ -525,6 +525,61 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
 
+    def test_trello_resolve_board_list_id_defaults_to_ready_for_ai(self) -> None:
+        lists = [
+            {"id": "ideas-list", "name": "Ideas"},
+            {"id": "ready-list", "name": "Ready for AI"},
+        ]
+
+        with patch.object(self.service, "_trello_board_lists", return_value=lists):
+            self.assertEqual(
+                "ready-list",
+                self.service._trello_resolve_board_list_id("key", "token", "board123", ""),
+            )
+            self.assertEqual(
+                "ideas-list",
+                self.service._trello_resolve_board_list_id("key", "token", "board123", "Ideas"),
+            )
+            self.assertEqual(
+                "ready-list",
+                self.service._trello_resolve_board_list_id("key", "token", "board123", "ready-list"),
+            )
+
+    def test_trello_image_card_scan_requires_list_scope(self) -> None:
+        with patch.object(self.service, "_trello_get_json") as get_json:
+            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "")
+
+        self.assertEqual([], cards)
+        get_json.assert_not_called()
+
+    def test_trello_matching_hint_defaults_to_ready_list(self) -> None:
+        request = CreateJobRequest(type="image", prompt="", trello_board_id="https://trello.com/b/board123/demo")
+        items = [{"product_key": "shirt", "product": "Shirt", "prompt": "prompt"}]
+        card = {"id": "ready-card", "name": "shirt", "shortLink": "ready", "url": "https://trello.com/c/ready", "idList": "ready-list"}
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "ideas-list", "name": "Ideas"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_matching_image_card_on_board",
+            return_value=card,
+        ) as match_card, patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ):
+            hint = self.service._trello_matching_image_card_hint(request, items)
+
+        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list")
+        self.assertEqual("ready-card", hint["card_id"])
+        self.assertEqual("ready-list", hint["list_id"])
+        self.assertEqual("Ready for AI", hint["list_name"])
+
     def test_update_integration_config_saves_without_exposing_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             result = asyncio.run(
@@ -2255,6 +2310,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=("key", "token"),
         ), patch.object(
             self.service,
+            "_trello_resolve_board_list_id",
+            return_value="list-1",
+        ), patch.object(
+            self.service,
             "_trello_first_image_card_id_on_board",
             return_value="card-from-board",
         ) as find_card, patch.object(
@@ -2655,7 +2714,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         child_job = self.store.get_job(saved.result["child_job_ids"][0])
         self.assertEqual("card123", child_job.input["trello_card_id"])
 
-    async def test_trello_prompt_batch_finds_matching_card_when_source_list_is_empty(self) -> None:
+    async def test_trello_prompt_batch_finds_matching_card_in_ready_list(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -2688,8 +2747,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             "card_id": "matched-card",
             "card_name": "gau_bong",
             "card_url": "https://trello.com/c/matched/gau-bong",
-            "list_id": "ideas-list",
-            "list_name": "Ideas",
+            "list_id": "ready-list",
+            "list_name": "Ready for AI",
         }
 
         async def fake_run_flow_job(job_id, child_request):
@@ -2719,7 +2778,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("matched-card", saved.result["trello_source_hint"]["card_id"])
         child_job = self.store.get_job(saved.result["child_job_ids"][0])
         self.assertEqual("matched-card", child_job.input["trello_card_id"])
-        self.assertEqual("ideas-list", child_job.input["trello_list_id"])
+        self.assertEqual("ready-list", child_job.input["trello_list_id"])
 
     async def test_auto_trello_prompt_batch_discovers_multiple_image_cards(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
@@ -2764,9 +2823,17 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=("key", "token"),
         ), patch.object(
             self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
             "_trello_image_cards_on_board",
             return_value=cards,
         ) as image_cards, patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
             self.service,
             "_run_flow_job",
             side_effect=fake_run_flow_job,
@@ -2774,13 +2841,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             batch = await self.service.enqueue_prompt_batch(request)
             await self.service._tasks[batch.id]
 
-        image_cards.assert_called_once_with("key", "token", "board123", "")
+        image_cards.assert_called_once_with("key", "token", "board123", "ready-list")
         self.assertEqual([("bear prompt", "card-bear"), ("hoop prompt", "card-hoop")], seen)
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
         self.assertEqual(2, saved.result["total"])
         self.assertEqual(2, saved.result["completed"])
         self.assertEqual("auto_trello", saved.result["trello_source_hint"]["mode"])
+        self.assertEqual("ready-list", saved.result["trello_source_hint"]["list_id"])
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
         self.assertEqual(["card-bear", "card-hoop"], [job.input["trello_card_id"] for job in child_jobs])
 

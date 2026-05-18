@@ -116,6 +116,7 @@ class FlowWebService:
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
     TRELLO_TIMEOUT_S = 30
+    DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
     DEFAULT_IMAGE_MODEL = "NARWHAL"
     IMAGE_MODEL_LABELS = {
@@ -4362,12 +4363,16 @@ exit 1
             or trello_config.card_id
             or os.getenv("TRELLO_CARD_ID", "")
         )
-        list_id = self._normalize_trello_id(
+        raw_list_id = self._normalize_trello_id(
             module_request.trello_list_id
             or request.trello_list_id
             or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
         )
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise RuntimeError("Trello Source cần API key/token Trello để lấy ảnh gốc từ card.")
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id) if board_id and not card_id else raw_list_id
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         try:
             limit = int(settings.get("trelloAttachmentLimit") or 1)
@@ -4383,9 +4388,6 @@ exit 1
             input_data={"board_id": board_id, "card_id": card_id, "list_id": list_id, "limit": limit},
         )
 
-        key, token = self._trello_credentials()
-        if not key or not token:
-            raise RuntimeError("Trello Source cần API key/token Trello để lấy ảnh gốc từ card.")
         if not card_id:
             if not board_id:
                 raise RuntimeError("Trello Source cần Card ID/link card hoặc Board URL Trello có card chứa attachment ảnh.")
@@ -4407,8 +4409,8 @@ exit 1
                     or f"dòng {request.prompt_source_row}"
                 )
                 raise RuntimeError(
-                    "Batch sheet chưa có Trello card cụ thể nên app đã dừng để tránh lấy nhầm card đầu tiên trên board. "
-                    f"Hãy dán link card ở cục Trello Source, chọn List lọc card, hoặc thêm cột Trello_Card/Card_URL cho {product_hint}."
+                    "Batch sheet chưa có Trello card cụ thể và app không tìm thấy cột Ready for AI để lọc ảnh nguồn. "
+                    f"Hãy chọn list Ready for AI ở cục Trello Source hoặc thêm cột Trello_Card/Card_URL cho {product_hint}."
                 )
             if not card_id:
                 card_id = await asyncio.to_thread(self._trello_first_image_card_id_on_board, key, token, board_id, list_id)
@@ -5252,31 +5254,26 @@ exit 1
         )
         if not board_id:
             return {}
-        list_id = self._normalize_trello_id(
+        raw_list_id = self._normalize_trello_id(
             request.trello_list_id
             or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
         )
-        scopes = [list_id] if list_id else []
-        scopes.append("")
-        checked_scopes: set[str] = set()
-        for scope in scopes:
-            if scope in checked_scopes:
-                continue
-            checked_scopes.add(scope)
-            card = self._trello_matching_image_card_on_board(key, token, board_id, items, scope)
-            if not card:
-                continue
-            card_list_id = self._normalize_trello_id(str(card.get("idList") or scope or ""))
-            return {
-                "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
-                "card_name": str(card.get("name") or "").strip(),
-                "card_short_link": str(card.get("shortLink") or "").strip(),
-                "card_url": str(card.get("url") or "").strip(),
-                "list_id": card_list_id,
-                "list_name": self._trello_list_name(key, token, card_list_id),
-            }
-        return {}
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
+        if not list_id:
+            return {}
+        card = self._trello_matching_image_card_on_board(key, token, board_id, items, list_id)
+        if not card:
+            return {}
+        card_list_id = self._normalize_trello_id(str(card.get("idList") or list_id or ""))
+        return {
+            "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+            "card_name": str(card.get("name") or "").strip(),
+            "card_short_link": str(card.get("shortLink") or "").strip(),
+            "card_url": str(card.get("url") or "").strip(),
+            "list_id": card_list_id,
+            "list_name": self._trello_list_name(key, token, card_list_id),
+        }
 
     def _trello_source_card_hint(self, request: CreateJobRequest) -> Dict[str, Any]:
         key, token = self._trello_credentials()
@@ -5293,11 +5290,12 @@ exit 1
             or trello_config.card_id
             or os.getenv("TRELLO_CARD_ID", "")
         )
-        list_id = self._normalize_trello_id(
+        raw_list_id = self._normalize_trello_id(
             request.trello_list_id
             or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
         )
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id) if board_id and not card_id else raw_list_id
         if card_id:
             card = self._trello_get_json(
                 f"cards/{quote(card_id, safe='')}",
@@ -5342,6 +5340,47 @@ exit 1
             return ""
         return str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
 
+    def _default_trello_source_list_name(self) -> str:
+        return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
+
+    def _trello_board_lists(self, key: str, token: str, board_id: str) -> List[Dict[str, Any]]:
+        board_id = self._normalize_trello_board_id(board_id)
+        if not board_id:
+            return []
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/lists",
+            key,
+            token,
+            fields={"fields": "id,name,closed", "filter": "open"},
+        )
+        return [item for item in payload if isinstance(item, dict) and not item.get("closed")] if isinstance(payload, list) else []
+
+    def _trello_resolve_board_list_id(self, key: str, token: str, board_id: str, list_value: str = "") -> str:
+        board_id = self._normalize_trello_board_id(board_id)
+        normalized_value = self._normalize_trello_id(list_value)
+        if not board_id:
+            return normalized_value
+
+        target_name = normalized_value or self._default_trello_source_list_name()
+        try:
+            lists = self._trello_board_lists(key, token, board_id)
+        except Exception:
+            return normalized_value
+
+        if normalized_value:
+            for item in lists:
+                list_id = self._normalize_trello_id(str(item.get("id") or ""))
+                if list_id and list_id == normalized_value:
+                    return list_id
+
+        target_key = self._compact_match_text(target_name)
+        for item in lists:
+            list_name = str(item.get("name") or "").strip()
+            if list_name and self._compact_match_text(list_name) == target_key:
+                return self._normalize_trello_id(str(item.get("id") or ""))
+
+        return normalized_value if normalized_value else ""
+
     def _trello_matching_image_card_on_board(
         self,
         key: str,
@@ -5352,7 +5391,7 @@ exit 1
     ) -> Dict[str, Any]:
         board_id = self._normalize_trello_board_id(board_id)
         list_id = self._normalize_trello_id(list_id)
-        if not board_id or not items:
+        if not board_id or not list_id or not items:
             return {}
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
@@ -5413,11 +5452,17 @@ exit 1
         if not board_id:
             raise RuntimeError("Auto Trello cần Board URL/Board ID để tìm card có ảnh.")
 
-        list_id = self._normalize_trello_id(
+        raw_list_id = self._normalize_trello_id(
             request.trello_list_id
             or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
         )
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
+        if not list_id:
+            raise RuntimeError(
+                f"Auto Trello chỉ quét cột {self._default_trello_source_list_name()}. "
+                "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
+            )
         max_items = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(limit or self.MAX_PROMPT_BATCH_ITEMS)))
         cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
         expanded: List[Dict[str, Any]] = []
@@ -5465,6 +5510,7 @@ exit 1
             "mode": "auto_trello",
             "board_id": board_id,
             "list_id": list_id,
+            "list_name": self._trello_list_name(key, token, list_id),
             "matched_cards": len({item.get("trello_card_id") for item in expanded if item.get("trello_card_id")}),
             "matched_items": len(expanded),
         }
@@ -5479,7 +5525,7 @@ exit 1
     ) -> List[Dict[str, Any]]:
         board_id = self._normalize_trello_board_id(board_id)
         list_id = self._normalize_trello_id(list_id)
-        if not board_id:
+        if not board_id or not list_id:
             return []
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
