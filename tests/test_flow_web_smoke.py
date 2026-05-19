@@ -1675,7 +1675,11 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             started.set()
             await asyncio.sleep(60)
 
-        with patch.object(self.service, "_run_flow_job", side_effect=fake_run_flow_job):
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
             job = await self.service.enqueue_job(request)
 
         saved = self.store.get_job(job.id)
