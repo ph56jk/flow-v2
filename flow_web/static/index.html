@@ -11,7 +11,7 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260516e" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260519a" />
   </head>
   <body class="flow-dashboard">
     <div class="app-shell">
@@ -202,7 +202,7 @@
         </div>
 
         <aside class="scenario-sidebar" aria-label="Scenario properties">
-	          <section class="inspector-section">
+          <section class="inspector-section">
             <div class="inspector-head">
               <p class="eyebrow">Scenario usage</p>
               <button type="button" class="ghost-button card-button" id="automationRefreshButton">Refresh</button>
@@ -213,7 +213,31 @@
             </div>
           </section>
 
-	          <section class="inspector-section" id="automationPromptSourceSection">
+          <section class="inspector-section assistant-section" id="userAssistantSection">
+            <div class="inspector-head">
+              <p class="eyebrow">AI trợ lý</p>
+              <span class="status-pill" id="userAssistantEngine">Nội bộ</span>
+            </div>
+            <div class="assistant-quick-row">
+              <button type="button" class="ghost-button card-button" data-assistant-question="Vì sao app lấy nhầm ảnh Trello?">Trello</button>
+              <button type="button" class="ghost-button card-button" data-assistant-question="Sheet prompt cần điền như nào để khớp card?">Sheet</button>
+              <button type="button" class="ghost-button card-button" data-assistant-question="Duyệt Telegram xong app lưu lại Trello ra sao?">Telegram</button>
+            </div>
+            <label class="field">
+              <span>Hỏi trợ lý</span>
+              <textarea
+                id="userAssistantQuestion"
+                rows="3"
+                placeholder="Ví dụ: vì sao nó không lấy ảnh trong Ready for AI?"
+              ></textarea>
+            </label>
+            <button type="button" class="secondary-button" id="userAssistantAskButton">Hỏi AI</button>
+            <div id="userAssistantAnswer" class="assistant-answer">
+              Hỏi lỗi Trello, Sheet, Flow hoặc Telegram tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.
+            </div>
+          </section>
+
+          <section class="inspector-section" id="automationPromptSourceSection">
             <div class="inspector-head">
               <p class="eyebrow">Prompt source</p>
               <span class="status-pill" id="automationSheetStatus">Chưa lấy</span>

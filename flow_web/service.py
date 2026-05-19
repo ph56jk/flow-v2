@@ -67,6 +67,7 @@ from .schemas import (
     StoryboardScene,
     TrelloConfig,
     TrelloConfigUpdateRequest,
+    UserAssistantRequest,
     WorkspaceJobCounts,
     WorkspaceSnapshot,
     canonical_project_url,
@@ -112,6 +113,8 @@ class FlowWebService:
     GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
     GEMINI_TIMEOUT_S = 30
+    USER_ASSISTANT_CONTEXT_LIMIT = 1200
+    USER_ASSISTANT_ANSWER_LIMIT = 1400
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
@@ -2220,6 +2223,316 @@ class FlowWebService:
             "engine": "local",
             "engine_label": "Nội bộ",
             "model": "",
+        }
+
+    def _user_assistant_context_snapshot(self) -> Dict[str, Any]:
+        snapshot = self.store.snapshot()
+        config = self._normalized_config(snapshot.config)
+        trello = self._trello_config_snapshot(snapshot.trello_config)
+        integrations = self._integration_config_snapshot(snapshot.integration_config)
+        try:
+            auth = self.get_auth_status()
+        except Exception:
+            auth = AuthStatus(authenticated=False)
+
+        jobs = list(snapshot.jobs or [])
+        active_jobs = [job for job in jobs if job.status in {"queued", "running", "polling"}]
+        completed_jobs = [job for job in jobs if job.status == "completed"]
+        failed_jobs = [job for job in jobs if job.status in {"failed", "interrupted"}]
+        latest_job = next(iter(self._sorted_jobs_by_activity(jobs)), None) if jobs else None
+        latest_failed = next(iter(self._sorted_jobs_by_activity(failed_jobs)), None) if failed_jobs else None
+
+        return {
+            "flow": {
+                "project_set": bool(config.project_id),
+                "project_name": config.project_name or "",
+                "workflow_set": bool(config.active_workflow_id),
+                "authenticated": bool(auth.authenticated),
+            },
+            "trello": {
+                "configured": bool(trello.get("configured")),
+                "credentials_saved": bool(trello.get("credentials_saved")),
+                "board_id_set": bool(trello.get("board_id")),
+                "card_id_set": bool(trello.get("card_id")),
+                "list_id_set": bool(trello.get("list_id")),
+                "upload_mode": trello.get("upload_mode") or "file",
+                "upscale_to_2k": trello.get("upscale_to_2k") is not False,
+            },
+            "telegram": {
+                "configured": bool(integrations.get("telegram", {}).get("configured")),
+                "chat_id_set": bool(integrations.get("telegram", {}).get("chat_id")),
+            },
+            "gemini": {
+                "configured": bool(integrations.get("gemini", {}).get("configured")),
+                "model": integrations.get("gemini", {}).get("model") or self.GEMINI_DEFAULT_MODEL,
+            },
+            "jobs": {
+                "total": len(jobs),
+                "active": len(active_jobs),
+                "completed": len(completed_jobs),
+                "failed": len(failed_jobs),
+                "latest_status": str(getattr(latest_job, "status", "") or ""),
+                "latest_type": str(getattr(latest_job, "type", "") or ""),
+                "latest_title": str(getattr(latest_job, "title", "") or "")[:120],
+                "latest_failed_category": str(getattr(getattr(latest_failed, "error_snapshot", None), "category", "") or ""),
+                "latest_failed_title": str(getattr(getattr(latest_failed, "error_snapshot", None), "title", "") or "")[:140],
+            },
+        }
+
+    def _format_user_assistant_context(self, context: Dict[str, Any], ui_context: str = "") -> str:
+        flow = context.get("flow", {})
+        trello = context.get("trello", {})
+        telegram = context.get("telegram", {})
+        gemini = context.get("gemini", {})
+        jobs = context.get("jobs", {})
+        lines = [
+            f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, workflow {'đã chọn' if flow.get('workflow_set') else 'chưa chọn'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}.",
+            f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
+            f"Telegram: {'đã cấu hình duyệt' if telegram.get('configured') else 'chưa đủ bot/chat để duyệt'}.",
+            f"AI: {'Gemini ' + str(gemini.get('model') or '') if gemini.get('configured') else 'trợ lý nội bộ'}.",
+            f"Jobs: {jobs.get('active', 0)} đang chạy, {jobs.get('completed', 0)} xong, {jobs.get('failed', 0)} lỗi; job mới nhất {jobs.get('latest_type') or 'chưa có'} / {jobs.get('latest_status') or 'chưa có'}.",
+        ]
+        cleaned_ui_context = re.sub(r"\s+", " ", str(ui_context or "").strip())
+        if cleaned_ui_context:
+            lines.append(f"Ngữ cảnh UI: {cleaned_ui_context[: self.USER_ASSISTANT_CONTEXT_LIMIT]}")
+        return "\n".join(lines)
+
+    def _user_assistant_suggested_actions(self, question: str, context: Dict[str, Any]) -> List[Dict[str, str]]:
+        normalized = self._normalize_skill_token(question)
+        flow = context.get("flow", {})
+        trello = context.get("trello", {})
+        telegram = context.get("telegram", {})
+        actions: List[Dict[str, str]] = []
+
+        if not flow.get("project_set") or not flow.get("authenticated"):
+            actions.append(
+                {
+                    "label": "Kiểm tra Flow",
+                    "detail": "Lưu project Flow rồi đăng nhập Google Flow một lần trước khi chạy auto.",
+                }
+            )
+        if not trello.get("credentials_saved") or not trello.get("board_id_set"):
+            actions.append(
+                {
+                    "label": "Lưu Trello",
+                    "detail": "Dán API key, token và board URL trong Trello storage để app lấy ảnh và upload lại đúng card.",
+                }
+            )
+        if not telegram.get("configured"):
+            actions.append(
+                {
+                    "label": "Lưu Telegram",
+                    "detail": "Dán bot token và chat id để ảnh tạo xong được gửi sang Telegram chờ duyệt.",
+                }
+            )
+
+        if any(term in normalized for term in ("trello", "ready", "card", "list", "anh", "nham")):
+            actions.append(
+                {
+                    "label": "Soát Ready for AI",
+                    "detail": "Chỉ để card cần chạy trong list Ready for AI; ảnh nguồn phải nằm trong attachment của chính card đó.",
+                }
+            )
+        if any(term in normalized for term in ("sheet", "prompt", "active", "product", "loc")):
+            actions.append(
+                {
+                    "label": "Soát prompt sheet",
+                    "detail": "Prompt cần Active=TRUE và khớp Product_Key/Product_Name hoặc có Trello_Card/Card_URL rõ ràng.",
+                }
+            )
+        if any(term in normalized for term in ("duyet", "telegram", "approve", "chap_thuan")):
+            actions.append(
+                {
+                    "label": "Đồng bộ duyệt",
+                    "detail": "Sau khi bấm duyệt trên Telegram, app sẽ đồng bộ approval rồi upload ảnh đã duyệt về đúng card Trello.",
+                }
+            )
+
+        if not actions:
+            actions.append(
+                {
+                    "label": "Chạy Auto Trello",
+                    "detail": "Khi Flow, Trello, Sheet và Telegram đều sẵn sàng, bấm Auto Trello để app tự tìm card và chạy hàng loạt.",
+                }
+            )
+
+        unique: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        for action in actions:
+            label = action.get("label", "")
+            if label in seen:
+                continue
+            seen.add(label)
+            unique.append(action)
+        return unique[:4]
+
+    def _local_user_assistant_reply(self, question: str, context: Dict[str, Any], ui_context: str = "") -> str:
+        normalized = self._normalize_skill_token(f"{question} {ui_context}")
+        context_summary = self._format_user_assistant_context(context, ui_context="")
+        parts: List[str] = []
+
+        if any(term in normalized for term in ("trello", "ready", "card", "list", "attachment", "anh", "nham")):
+            parts.append(
+                "Luồng Trello chuẩn là: app chỉ quét list Ready for AI, lấy ảnh attachment nằm trên chính card đó, dùng prompt khớp trong Sheet để tạo ảnh bằng Flow, gửi Telegram duyệt, rồi upload ảnh đã duyệt về lại đúng card nguồn."
+            )
+            parts.append(
+                "Nếu thấy lấy nhầm ảnh, hãy kiểm tra card có còn nằm trong Ready for AI không, card đó có attachment ảnh thật không, và Sheet có Product_Key/Product_Name hoặc Trello_Card/Card_URL trỏ đúng card không."
+            )
+        elif any(term in normalized for term in ("sheet", "prompt", "active", "product", "loc")):
+            parts.append(
+                "Prompt trong Sheet cần có Active=TRUE. App ưu tiên khớp Product_Key/Product_Name với tên card hoặc bộ lọc sản phẩm; nếu muốn chắc tuyệt đối thì thêm Trello_Card hoặc Card_URL cho từng dòng prompt."
+            )
+            parts.append(
+                "Các dòng đã dùng nên được đánh dấu Used/Used_At nếu sheet có cột đó, để vòng lặp không chạy lại cùng prompt."
+            )
+        elif any(term in normalized for term in ("telegram", "duyet", "approve", "chap_thuan")):
+            parts.append(
+                "Ảnh tạo xong sẽ được gửi qua Telegram bằng bot đã lưu. Người dùng bấm duyệt, app đồng bộ quyết định đó, rồi mới upload ảnh được duyệt về Trello."
+            )
+            parts.append(
+                "Nếu không thấy nút duyệt hoạt động, kiểm tra bot token, chat id, và bấm refresh/đồng bộ approval trong app."
+            )
+        elif any(term in normalized for term in ("flow", "google", "dang_nhap", "project", "recaptcha", "tao_anh", "edit")):
+            parts.append(
+                "Flow vẫn là nơi tạo/chỉnh ảnh chính. App mở project Flow bằng phiên trình duyệt đã đăng nhập, đẩy prompt và ảnh nguồn vào Flow, rồi chờ kết quả tải về."
+            )
+            parts.append(
+                "Nếu Flow tạo ảnh mới thay vì chỉnh ảnh đã chọn, hãy kiểm tra module Trello Image Source có lấy được attachment không và chế độ tạo ảnh đang nhận reference image từ card."
+            )
+        elif any(term in normalized for term in ("windows", "mac", "ubuntu", "cai", "install", "chay")):
+            parts.append(
+                "App là web local nên chạy được trên macOS, Windows và Ubuntu nếu có Python 3.11+, Node để kiểm tra frontend, và Playwright browser được cài đúng thư mục."
+            )
+            parts.append(
+                "Trên Windows nên chạy bằng PowerShell/venv, không phụ thuộc biến env thủ công vì Trello, Telegram và Gemini đều lưu được trong giao diện app."
+            )
+        else:
+            parts.append(
+                "Mình có thể hỗ trợ ngay trong app về Trello, Google Sheet, Google Flow, Telegram duyệt, lỗi vòng lặp và cách chạy hàng loạt."
+            )
+            parts.append(
+                "Để chạy đúng luồng, cần có card ở Ready for AI, ảnh attachment trên card, prompt Active trong Sheet, Flow đã đăng nhập, Telegram bot đã lưu, rồi bấm Auto Trello."
+            )
+
+        parts.append(f"Trạng thái app hiện tại: {context_summary}")
+        return "\n\n".join(parts)
+
+    def _gemini_user_assistant_request(self, question: str, context_summary: str, fallback_answer: str) -> Dict[str, Any]:
+        prompt_text = "\n".join(
+            [
+                "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
+                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, lấy prompt từ Google Sheet, tạo/chỉnh ảnh bằng Google Flow, gửi Telegram duyệt, rồi lưu lại đúng card Trello.",
+                "Không yêu cầu người dùng dán secret vào chat. Không in API key, token, cookie hay biến môi trường.",
+                "Trả lời ngắn, thực dụng, ưu tiên các bước người dùng bấm được trong giao diện.",
+                "Nếu người dùng hỏi lỗi lấy nhầm ảnh, nhấn mạnh Ready for AI và attachment phải nằm trên chính card nguồn.",
+                "Nếu trạng thái cho thấy thiếu cấu hình, nói rõ thiếu phần nào.",
+                "Không dùng markdown bảng. Có thể dùng các dòng ngắn.",
+                "",
+                "Trạng thái app đã được lọc secret:",
+                context_summary,
+                "",
+                "Câu hỏi người dùng:",
+                question,
+                "",
+                "Bản trả lời nội bộ để tham khảo:",
+                fallback_answer,
+            ]
+        )
+        return {
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {
+                "temperature": 0.35,
+                "topP": 0.9,
+                "maxOutputTokens": 768,
+            },
+        }
+
+    def _generate_user_assistant_with_gemini(self, question: str, context_summary: str, fallback_answer: str) -> str:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Chưa cấu hình Gemini.")
+
+        model = self._gemini_model()
+        payload = self._gemini_user_assistant_request(question, context_summary, fallback_answer)
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(model, safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=self.GEMINI_TIMEOUT_S) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
+
+        answer = self._extract_gemini_text(body)
+        if not answer:
+            raise RuntimeError("Gemini không trả về nội dung trợ lý.")
+        return answer
+
+    def _trim_user_assistant_answer(self, answer: str) -> str:
+        text = re.sub(r"\n{3,}", "\n\n", str(answer or "").strip())
+        if len(text) <= self.USER_ASSISTANT_ANSWER_LIMIT:
+            return text
+        clipped = text[: self.USER_ASSISTANT_ANSWER_LIMIT]
+        boundary = max(clipped.rfind("\n"), clipped.rfind(". "), clipped.rfind("; "))
+        if boundary > 500:
+            return clipped[:boundary].rstrip(" .;") + "."
+        return clipped.rstrip(" .;") + "."
+
+    async def answer_user_assistant(self, request: UserAssistantRequest) -> Dict[str, Any]:
+        question = re.sub(r"\s+", " ", str(request.question or "").strip())
+        if not question:
+            raise HTTPException(status_code=400, detail="Hãy nhập câu hỏi để trợ lý hỗ trợ.")
+        question = question[:1000]
+        ui_context = re.sub(r"\s+", " ", str(request.context or "").strip())[: self.USER_ASSISTANT_CONTEXT_LIMIT]
+
+        context = self._user_assistant_context_snapshot()
+        context_summary = self._format_user_assistant_context(context, ui_context)
+        local_answer = self._local_user_assistant_reply(question, context, ui_context)
+        actions = self._user_assistant_suggested_actions(question, context)
+
+        engine = "local"
+        engine_label = "Nội bộ"
+        model = ""
+        answer = local_answer
+        fallback_reason = ""
+
+        if self._gemini_api_key():
+            model = self._gemini_model()
+            try:
+                answer = await asyncio.to_thread(
+                    self._generate_user_assistant_with_gemini,
+                    question,
+                    context_summary,
+                    local_answer,
+                )
+                engine = "gemini"
+                engine_label = "Gemini"
+            except Exception as exc:
+                fallback_reason = str(exc)[:180]
+                model = ""
+
+        return {
+            "answer": self._trim_user_assistant_answer(answer),
+            "engine": engine,
+            "engine_label": engine_label,
+            "model": model,
+            "suggested_actions": actions,
+            "context_summary": context_summary,
+            "fallback_reason": fallback_reason,
         }
 
     def _gemini_api_key(self) -> str:

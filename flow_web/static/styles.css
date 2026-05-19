@@ -2354,6 +2354,62 @@ textarea:focus {
   font-size: 1.4rem;
 }
 
+.assistant-section {
+  background: #ffffff;
+}
+
+.assistant-quick-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.assistant-quick-row .card-button,
+.assistant-section .secondary-button {
+  width: 100%;
+}
+
+.assistant-answer {
+  display: grid;
+  gap: 10px;
+  min-height: 84px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #faf9fd;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.assistant-answer p {
+  margin: 0;
+}
+
+.assistant-action-list {
+  display: grid;
+  gap: 8px;
+}
+
+.assistant-action-item {
+  display: grid;
+  gap: 3px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.assistant-action-item strong {
+  color: var(--text);
+  font-size: 0.86rem;
+}
+
+.assistant-action-item span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
 .sidebar-detail-grid {
   grid-template-columns: 1fr;
   padding: 0;

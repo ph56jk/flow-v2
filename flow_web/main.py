@@ -23,6 +23,7 @@ from .schemas import (
     ReplayCleanupRequest,
     StoryboardPlanRequest,
     TrelloConfigUpdateRequest,
+    UserAssistantRequest,
 )
 from .service import FlowWebService
 from .store import StateStore
@@ -208,6 +209,11 @@ async def sync_media_skills(request: Request) -> Dict[str, Any]:
 @app.post("/api/prompt-ai/generate")
 async def generate_prompt_ai(request: Request, payload: PromptCreateRequest) -> Dict[str, Any]:
     return await service(request).generate_prompt_draft(payload)
+
+
+@app.post("/api/assistant/help")
+async def assistant_help(request: Request, payload: UserAssistantRequest) -> Dict[str, Any]:
+    return await service(request).answer_user_assistant(payload)
 
 
 @app.post("/api/storyboard/plan")

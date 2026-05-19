@@ -28,6 +28,7 @@ from flow_web.schemas import (
     StateSnapshot,
     StoryboardPlanRequest,
     TrelloConfigUpdateRequest,
+    UserAssistantRequest,
 )
 from flow_web.service import FlowWebService
 from flow_web.store import StateStore
@@ -648,6 +649,42 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(engine["configured"])
         self.assertEqual("gemini", engine["engine"])
         self.assertEqual("gemini-2.5-pro", engine["model"])
+
+    def test_user_assistant_local_answer_explains_trello_ready_flow(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
+            result = asyncio.run(
+                self.service.answer_user_assistant(
+                    UserAssistantRequest(question="Trello đang lấy nhầm ảnh từ card khác thì xử lý sao?")
+                )
+            )
+
+        self.assertEqual("local", result["engine"])
+        self.assertIn("Ready for AI", result["answer"])
+        self.assertIn("attachment", result["answer"].lower())
+        self.assertTrue(result["suggested_actions"])
+        self.assertNotIn("gem-key", result["context_summary"])
+
+    def test_user_assistant_uses_gemini_when_configured(self) -> None:
+        asyncio.run(
+            self.service.update_integration_config(
+                IntegrationConfigUpdateRequest(
+                    gemini_api_key="gem-key",
+                    gemini_model="gemini-2.5-flash",
+                )
+            )
+        )
+
+        with patch.object(self.service, "_generate_user_assistant_with_gemini", return_value="Gemini hướng dẫn trong app."):
+            result = asyncio.run(
+                self.service.answer_user_assistant(
+                    UserAssistantRequest(question="Sheet prompt cần điền như nào?", context="đang ở Auto Trello")
+                )
+            )
+
+        self.assertEqual("gemini", result["engine"])
+        self.assertEqual("Gemini", result["engine_label"])
+        self.assertEqual("gemini-2.5-flash", result["model"])
+        self.assertEqual("Gemini hướng dẫn trong app.", result["answer"])
 
     def test_telegram_review_pack_uses_app_saved_config(self) -> None:
         asyncio.run(

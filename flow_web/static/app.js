@@ -623,6 +623,10 @@ const state = {
   position: "center",
   resolution: "1080p",
   promptAssistant: null,
+  userAssistant: {
+    busy: false,
+    last: null,
+  },
   promptSourcePreview: null,
   integrations: defaultIntegrationState(),
   trello: defaultTrelloState(),
@@ -699,6 +703,11 @@ const elements = {
   automationRunButton: document.querySelector("#automationRunButton"),
   automationRunImageButton: document.querySelector("#automationRunImageButton"),
   automationRefreshButton: document.querySelector("#automationRefreshButton"),
+  userAssistantEngine: document.querySelector("#userAssistantEngine"),
+  userAssistantQuestion: document.querySelector("#userAssistantQuestion"),
+  userAssistantAskButton: document.querySelector("#userAssistantAskButton"),
+  userAssistantAnswer: document.querySelector("#userAssistantAnswer"),
+  userAssistantQuickButtons: Array.from(document.querySelectorAll("[data-assistant-question]")),
   automationBrandEyebrow: document.querySelector("#automationBrandEyebrow"),
   automationBrandTitle: document.querySelector("#automationBrandTitle"),
   automationPromptInput: document.querySelector("#automationPromptInput"),
@@ -2768,6 +2777,69 @@ function renderPromptAssistant() {
   renderPromptAiResult();
 }
 
+function userAssistantContextSummary() {
+  const config = state.config || {};
+  const trello = state.trello || defaultTrelloState();
+  const integrations = state.integrations || defaultIntegrationState();
+  const promptRows = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items.length : 0;
+  const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
+  const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
+  return [
+    `Màn hình đang ở chế độ ${state.mode}`,
+    `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
+    `đăng nhập ${state.auth?.authenticated ? "đã có" : "chưa thấy"}`,
+    `Trello ${trello.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
+    `Telegram ${integrations.telegram?.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
+    `Gemini ${integrations.gemini?.configured ? "đã bật" : "chưa bật"}`,
+    `prompt preview ${promptRows} dòng`,
+    `${activeJobs} job đang chạy`,
+    `${failedJobs} job lỗi`,
+  ].join("; ");
+}
+
+function renderUserAssistant() {
+  if (!elements.userAssistantEngine || !elements.userAssistantAnswer) {
+    return;
+  }
+  const last = state.userAssistant?.last || null;
+  const gemini = state.integrations?.gemini || {};
+  const engineLabel = last?.engine_label || (gemini.configured ? "Gemini" : "Nội bộ");
+  const modelLabel = last?.model ? ` · ${last.model}` : "";
+  elements.userAssistantEngine.textContent = `${engineLabel}${modelLabel}`;
+  elements.userAssistantEngine.dataset.state = gemini.configured || last?.engine === "gemini" ? "ready" : "pending";
+  if (elements.userAssistantAskButton) {
+    elements.userAssistantAskButton.disabled = Boolean(state.userAssistant?.busy);
+    elements.userAssistantAskButton.textContent = state.userAssistant?.busy ? "Đang hỏi..." : "Hỏi AI";
+  }
+
+  if (!last?.answer) {
+    elements.userAssistantAnswer.textContent =
+      "Hỏi lỗi Trello, Sheet, Flow hoặc Telegram tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.";
+    return;
+  }
+
+  const paragraphs = String(last.answer || "")
+    .split(/\n{2,}/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `<p>${escapeHtml(line)}</p>`)
+    .join("");
+  const actions = Array.isArray(last.suggested_actions) ? last.suggested_actions.filter(Boolean) : [];
+  const actionHtml = actions.length
+    ? `<div class="assistant-action-list">${actions
+        .map(
+          (action) => `
+            <div class="assistant-action-item">
+              <strong>${escapeHtml(action.label || "Việc cần làm")}</strong>
+              <span>${escapeHtml(action.detail || "")}</span>
+            </div>
+          `
+        )
+        .join("")}</div>`
+    : "";
+  elements.userAssistantAnswer.innerHTML = `${paragraphs}${actionHtml}`;
+}
+
 function renderStoryboardResult() {
   const plan = state.storyboardPlan;
   const items = Array.isArray(plan?.items) ? plan.items : [];
@@ -3243,6 +3315,7 @@ function renderLatestStatus() {
 function renderAll() {
   renderTopbar();
   renderAutomationDashboard();
+  renderUserAssistant();
   renderComposer();
   renderLatestStatus();
 }
@@ -4341,6 +4414,38 @@ function usePromptAiResult() {
   elements.promptInput.focus();
 }
 
+async function askUserAssistant(questionOverride = "") {
+  const question = String(questionOverride || elements.userAssistantQuestion?.value || "").trim();
+  if (!question) {
+    showMessage("Nhập câu hỏi cho trợ lý trước đã.", "error");
+    elements.userAssistantQuestion?.focus();
+    return;
+  }
+  if (elements.userAssistantQuestion && questionOverride) {
+    elements.userAssistantQuestion.value = question;
+  }
+
+  state.userAssistant.busy = true;
+  renderUserAssistant();
+  try {
+    const payload = await api("/api/assistant/help", {
+      method: "POST",
+      body: JSON.stringify({
+        question,
+        context: userAssistantContextSummary(),
+      }),
+    });
+    state.userAssistant.last = payload;
+    renderUserAssistant();
+    showMessage("Trợ lý đã trả lời.", "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    state.userAssistant.busy = false;
+    renderUserAssistant();
+  }
+}
+
 async function requestStoryboardPlan() {
   syncStoryboardDraftFromForm();
   const script = String(state.storyboardDraft.script || "").trim();
@@ -4816,6 +4921,16 @@ elements.automationTrelloUpscale2KInput?.addEventListener("change", (event) => {
     state.trello = defaultTrelloState();
   }
   state.trello.upscale_to_2k = Boolean(event.target?.checked);
+});
+elements.userAssistantAskButton?.addEventListener("click", () => askUserAssistant());
+elements.userAssistantQuestion?.addEventListener("keydown", (event) => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+    event.preventDefault();
+    void askUserAssistant();
+  }
+});
+elements.userAssistantQuickButtons.forEach((button) => {
+  button.addEventListener("click", () => askUserAssistant(button.dataset.assistantQuestion || ""));
 });
 elements.automationEnvSaveButton?.addEventListener("click", () => saveIntegrationConfig());
 elements.automationEnvClearButton?.addEventListener("click", () => saveIntegrationConfig({ clearSecrets: true }));

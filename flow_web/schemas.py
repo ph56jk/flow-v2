@@ -436,6 +436,11 @@ class StoryboardPlanRequest(BaseModel):
     scene_count: int = 0
 
 
+class UserAssistantRequest(BaseModel):
+    question: str = ""
+    context: str = ""
+
+
 class StoryboardScene(BaseModel):
     index: int = 1
     title: str = ""
