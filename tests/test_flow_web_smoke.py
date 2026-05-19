@@ -580,6 +580,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("ready-list", hint["list_id"])
         self.assertEqual("Ready for AI", hint["list_name"])
 
+    def test_trello_source_card_hint_ignores_explicit_card_outside_ready_list(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="https://trello.com/b/board123/demo",
+            trello_card_id="wrong-card",
+        )
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "other-list", "name": "Done"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_card_hint_by_id",
+            return_value={"card_id": "wrong-card", "card_name": "wrong", "list_id": "other-list"},
+        ):
+            hint = self.service._trello_source_card_hint(request)
+
+        self.assertEqual({}, hint)
+
     def test_update_integration_config_saves_without_exposing_credentials(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             result = asyncio.run(
@@ -2347,6 +2371,57 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         trello_source_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["id"] == "trello-source-1")
         self.assertEqual("board123", trello_source_node["output"]["board_id"])
         self.assertEqual("card-from-board", trello_source_node["output"]["card_id"])
+
+    async def test_trello_source_rejects_explicit_card_outside_ready_list(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="make a product image from Trello",
+            count=1,
+            trello_board_id="https://trello.com/b/board123/demo-board",
+            trello_card_id="wrong-card",
+            automation_graph={
+                "modules": [
+                    {
+                        "id": "trello-source-1",
+                        "type": "trello_source",
+                        "title": "Trello Image Source",
+                        "settings": {
+                            "trelloBoard": "https://trello.com/b/board123/demo-board",
+                            "trelloCard": "https://trello.com/c/wrong-card/wrong",
+                        },
+                    },
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                ]
+            },
+        )
+        job = JobRecord(type="image", status="running", title="test", input=request.model_dump(mode="json"))
+        await self.store.add_job(job)
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "other-list", "name": "Done"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_card_hint_by_id",
+            return_value={"card_id": "wrong-card", "card_name": "wrong", "list_id": "other-list"},
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_download_trello_card_image_attachments",
+        ) as download_images:
+            with self.assertRaises(RuntimeError) as ctx:
+                await self.service._request_with_trello_source_images(job.id, request)
+
+        self.assertIn("không nằm trong cột Ready for AI", str(ctx.exception))
+        download_images.assert_not_called()
 
     async def test_approval_module_pauses_and_resumes_downstream_modules(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

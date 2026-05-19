@@ -4372,7 +4372,7 @@ exit 1
         key, token = self._trello_credentials()
         if not key or not token:
             raise RuntimeError("Trello Source cần API key/token Trello để lấy ảnh gốc từ card.")
-        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id) if board_id and not card_id else raw_list_id
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id) if board_id else raw_list_id
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         try:
             limit = int(settings.get("trelloAttachmentLimit") or 1)
@@ -4417,6 +4417,16 @@ exit 1
             if not card_id:
                 scope = f" trong list {list_id}" if list_id else ""
                 raise RuntimeError(f"Board Trello này chưa có card nào{scope} chứa attachment ảnh để làm ảnh tham chiếu.")
+        elif list_id:
+            card_hint = await asyncio.to_thread(self._trello_card_hint_by_id, key, token, card_id)
+            if not card_hint:
+                raise RuntimeError("Card Trello đã chọn không còn tồn tại hoặc không đọc được.")
+            card_list_id = self._normalize_trello_id(str(card_hint.get("list_id") or ""))
+            if card_list_id != list_id:
+                ready_name = self._trello_list_name(key, token, list_id) or self._default_trello_source_list_name()
+                raise RuntimeError(
+                    f"Card Trello đã chọn không nằm trong cột {ready_name}; app đã dừng để tránh lấy nhầm ảnh từ cột khác."
+                )
 
         paths = await asyncio.to_thread(self._download_trello_card_image_attachments, key, token, card_id, job_id, limit)
         if not paths:
@@ -5295,16 +5305,15 @@ exit 1
             or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
         )
-        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id) if board_id and not card_id else raw_list_id
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id) if board_id else raw_list_id
         if card_id:
-            card = self._trello_get_json(
-                f"cards/{quote(card_id, safe='')}",
-                key,
-                token,
-                fields={"fields": "id,name,shortLink,url,idList,closed"},
-            )
-            if not isinstance(card, dict) or card.get("closed"):
+            hint = self._trello_card_hint_by_id(key, token, card_id)
+            if not hint:
                 return {}
+            card_list_id = self._normalize_trello_id(str(hint.get("list_id") or ""))
+            if list_id and card_list_id and card_list_id != list_id:
+                return {}
+            return hint
         elif board_id and list_id:
             card = self._trello_first_image_card_on_board(key, token, board_id, list_id)
         else:
@@ -5339,6 +5348,31 @@ exit 1
         except Exception:
             return ""
         return str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+
+    def _trello_card_hint_by_id(self, key: str, token: str, card_id: str) -> Dict[str, Any]:
+        card_id = self._normalize_trello_card_id(card_id)
+        if not card_id:
+            return {}
+        card = self._trello_get_json(
+            f"cards/{quote(card_id, safe='')}",
+            key,
+            token,
+            fields={"fields": "id,name,shortLink,url,idList,closed"},
+        )
+        if not isinstance(card, dict) or card.get("closed"):
+            return {}
+        resolved_card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+        if not resolved_card_id:
+            return {}
+        card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+        return {
+            "card_id": resolved_card_id,
+            "card_name": str(card.get("name") or "").strip(),
+            "card_short_link": str(card.get("shortLink") or "").strip(),
+            "card_url": str(card.get("url") or "").strip(),
+            "list_id": card_list_id,
+            "list_name": self._trello_list_name(key, token, card_list_id),
+        }
 
     def _default_trello_source_list_name(self) -> str:
         return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
