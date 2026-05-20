@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .paths import DOWNLOADS_DIR, STATIC_DIR, UPLOADS_DIR, ensure_app_dirs
@@ -116,6 +116,16 @@ async def update_config(request: Request, payload: ConfigUpdateRequest) -> Dict[
 @app.put("/api/integrations/trello")
 async def update_trello_config(request: Request, payload: TrelloConfigUpdateRequest) -> Dict[str, Any]:
     return {"trello": await service(request).update_trello_config(payload)}
+
+
+@app.get("/api/trello/cards/{card_id}/attachments/{attachment_id}/preview")
+async def trello_attachment_preview(request: Request, card_id: str, attachment_id: str) -> Response:
+    payload = await service(request).trello_attachment_preview(card_id, attachment_id)
+    return Response(
+        content=payload["content"],
+        media_type=payload["media_type"],
+        headers={"Cache-Control": "private, max-age=300"},
+    )
 
 
 @app.put("/api/integrations/settings")

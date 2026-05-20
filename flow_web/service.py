@@ -3013,6 +3013,7 @@ class FlowWebService:
                     "in_ready_list": in_ready_list,
                     "image_count": len(image_attachments),
                     "image_names": [str(item.get("name") or "").strip() for item in image_attachments[:3] if str(item.get("name") or "").strip()],
+                    "image_previews": self._trello_candidate_image_previews(str(card.get("id") or "").strip(), image_attachments),
                     "_score": score,
                 }
             )
@@ -3022,6 +3023,36 @@ class FlowWebService:
         for item in candidates[: max(1, min(12, int(limit or 8)))]:
             cleaned.append({key: value for key, value in item.items() if not key.startswith("_")})
         return cleaned
+
+    def _trello_candidate_image_previews(
+        self,
+        card_id: str,
+        image_attachments: List[Dict[str, Any]],
+        limit: int = 4,
+    ) -> List[Dict[str, str]]:
+        previews: List[Dict[str, str]] = []
+        normalized_card_id = self._normalize_trello_card_id(card_id)
+        for attachment in image_attachments[: max(1, min(6, int(limit or 4)))]:
+            if not isinstance(attachment, dict):
+                continue
+            attachment_id = str(attachment.get("id") or "").strip()
+            url = str(attachment.get("url") or "").strip()
+            preview_url = url
+            if normalized_card_id and attachment_id:
+                preview_url = (
+                    f"/api/trello/cards/{quote(normalized_card_id, safe='')}/attachments/"
+                    f"{quote(attachment_id, safe='')}/preview"
+                )
+            previews.append(
+                {
+                    "id": attachment_id,
+                    "name": str(attachment.get("name") or "").strip(),
+                    "url": url,
+                    "preview_url": preview_url,
+                    "mime_type": str(attachment.get("mimeType") or "").strip(),
+                }
+            )
+        return previews
 
     def _tokenize_match_words(self, value: Any) -> List[str]:
         stripped = self._strip_accents(str(value or "")).lower()
@@ -3098,21 +3129,21 @@ class FlowWebService:
         if not candidates:
             notice = (
                 f"Trello scan: app chưa tìm thấy card có attachment ảnh khớp '{query}' trên board. "
-                "App sẽ không chạy Auto Trello cho tới khi có card đúng trong Ready for AI hoặc chủ nhân dán link card rõ ràng."
+                "App sẽ không chạy Auto Trello cho tới khi có card đúng trong Ready for AI hoặc chủ nhân chọn/dán link card rõ ràng."
             )
         elif ready:
             ready_names = ", ".join(str(item.get("name") or item.get("short_link") or "").strip() for item in ready[:3] if item)
             notice = (
                 f"Trello scan: app tìm thấy {len(ready)} card khớp '{query}' đang ở Ready for AI"
                 + (f": {ready_names}." if ready_names else ".")
-                + " Có thể ghim card đúng trước khi chạy để chắc chắn lấy đúng ảnh."
+                + " Có thể bấm chọn card/ảnh đúng trước khi chạy để chắc chắn lấy đúng sản phẩm."
             )
         else:
             first = candidates[0]
             notice = (
                 f"Trello scan: app tìm thấy card khớp '{query}' là {first.get('name') or first.get('short_link')} "
-                f"nhưng nó đang ở list {first.get('list_name') or 'khác'}, chưa ở Ready for AI. "
-                "App sẽ không tự chạy từ card này để tránh lấy nhầm ảnh; hãy kéo đúng card vào Ready for AI hoặc dán link card rõ ràng rồi chạy lại."
+                f"đang ở list {first.get('list_name') or 'khác'}. "
+                "Chủ nhân có thể bấm chọn card này ngay trong app; sau khi chọn, Auto Trello sẽ chạy đúng card đó mà không cần kéo list."
             )
         if notice in answer:
             return answer
@@ -3141,31 +3172,26 @@ class FlowWebService:
             refined.append(
                 {
                     "label": f"Chưa thấy card: {query}" if query else "Chưa thấy card Trello",
-                    "detail": "AI đã quét Trello nhưng chưa thấy card có ảnh khớp. Hãy kéo/dán đúng card vào Ready for AI trước khi chạy.",
+                    "detail": "AI đã quét Trello nhưng chưa thấy card có ảnh khớp. Hãy nhập tên sản phẩm rõ hơn hoặc dán link card Trello cụ thể.",
                 }
             )
             return refined[:10]
 
-        for item in ready[:3]:
+        for item in candidates[:5]:
             value = str(item.get("short_link") or item.get("card_id") or item.get("url") or "").strip()
             if not value:
                 continue
+            in_ready = bool(item.get("in_ready_list"))
             refined.append(
                 {
-                    "label": f"Ghim card: {item.get('name') or value}",
-                    "detail": f"Card này đang ở Ready for AI và có {item.get('image_count') or 0} ảnh attachment.",
+                    "label": f"Chọn card: {item.get('name') or value}",
+                    "detail": (
+                        f"Card có {item.get('image_count') or 0} ảnh attachment; "
+                        + ("đang ở Ready for AI." if in_ready else "app sẽ chạy trực tiếp card đã chọn, không tự lấy card khác.")
+                    ),
                     "action": "set_trello_card",
                     "payload": {"value": value},
                     "requires_confirmation": False,
-                }
-            )
-
-        if not ready:
-            first = candidates[0]
-            refined.append(
-                {
-                    "label": f"Tìm thấy ở {first.get('list_name') or 'list khác'}",
-                    "detail": "Card khớp từ khóa nhưng chưa nằm trong Ready for AI, nên app tạm dừng để không lấy nhầm ảnh.",
                 }
             )
         return refined[:10]
@@ -6424,6 +6450,39 @@ exit 1
             paths.append(str(target))
         return paths
 
+    async def trello_attachment_preview(self, card_id: str, attachment_id: str) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
+        normalized_card_id = self._normalize_trello_card_id(card_id)
+        normalized_attachment_id = self._normalize_trello_id(attachment_id)
+        if not normalized_card_id or not normalized_attachment_id:
+            raise HTTPException(status_code=404, detail="Không tìm thấy attachment Trello.")
+        try:
+            attachment = await asyncio.to_thread(
+                self._trello_get_json,
+                f"cards/{quote(normalized_card_id, safe='')}/attachments/{quote(normalized_attachment_id, safe='')}",
+                key,
+                token,
+                fields={"fields": "id,name,url,mimeType"},
+            )
+            if not isinstance(attachment, dict) or not attachment:
+                raise HTTPException(status_code=404, detail="Không tìm thấy attachment Trello.")
+            if not self._trello_attachment_is_image(attachment):
+                raise HTTPException(status_code=415, detail="Attachment Trello không phải ảnh.")
+            data, media_type = await asyncio.to_thread(
+                self._trello_download_attachment_bytes,
+                key,
+                token,
+                normalized_card_id,
+                attachment,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
+        return {"content": data, "media_type": media_type or str(attachment.get("mimeType") or "image/jpeg")}
+
     def _trello_first_image_card_id_on_board(
         self,
         key: str,
@@ -6560,6 +6619,39 @@ exit 1
             "list_name": self._trello_list_name(key, token, card_list_id),
         }
 
+    def _trello_image_card_by_id(self, key: str, token: str, card_id: str) -> Dict[str, Any]:
+        card_id = self._normalize_trello_card_id(card_id)
+        if not card_id:
+            return {}
+        card = self._trello_get_json(
+            f"cards/{quote(card_id, safe='')}",
+            key,
+            token,
+            fields={
+                "fields": "id,name,desc,shortLink,url,idList,closed",
+                "attachments": "true",
+                "attachment_fields": "id,name,url,mimeType",
+            },
+        )
+        if not isinstance(card, dict) or card.get("closed"):
+            return {}
+        attachments = card.get("attachments") if isinstance(card.get("attachments"), list) else []
+        if not attachments:
+            attachments_payload = self._trello_get_json(
+                f"cards/{quote(card_id, safe='')}/attachments",
+                key,
+                token,
+                fields={"fields": "id,name,url,mimeType"},
+            )
+            attachments = attachments_payload if isinstance(attachments_payload, list) else []
+        image_attachments = [
+            item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
+        ]
+        if not image_attachments:
+            return {}
+        card["_image_attachments"] = image_attachments
+        return card
+
     def _default_trello_source_list_name(self) -> str:
         return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
 
@@ -6677,27 +6769,28 @@ exit 1
             or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
         )
+        explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
         list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
         if not list_id:
-            raise RuntimeError(
-                f"Auto Trello chỉ quét cột {self._default_trello_source_list_name()}. "
-                "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
-            )
-        max_items = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(limit or self.MAX_PROMPT_BATCH_ITEMS)))
-        cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
-        explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
-        if explicit_card_id:
-            cards = [
-                card
-                for card in cards
-                if self._normalize_trello_card_id(str(card.get("id") or "")) == explicit_card_id
-                or self._normalize_trello_card_id(str(card.get("shortLink") or "")) == explicit_card_id
-            ]
-            if not cards:
+            if not explicit_card_id:
                 raise RuntimeError(
-                    "Card Trello đã chọn không nằm trong list Ready for AI hoặc chưa có attachment ảnh. "
+                    f"Auto Trello chỉ quét cột {self._default_trello_source_list_name()}. "
+                    "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
+                )
+        max_items = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(limit or self.MAX_PROMPT_BATCH_ITEMS)))
+        if explicit_card_id:
+            selected_card = self._trello_image_card_by_id(key, token, explicit_card_id)
+            if not selected_card:
+                raise RuntimeError(
+                    "Card Trello đã chọn chưa có attachment ảnh hoặc app không đọc được card đó. "
                     "App đã dừng để tránh lấy nhầm ảnh từ card khác."
                 )
+            cards = [selected_card]
+            card_list_id = self._normalize_trello_id(str(selected_card.get("idList") or ""))
+            if card_list_id:
+                list_id = card_list_id
+        else:
+            cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
         expanded: List[Dict[str, Any]] = []
         used_pairs: set[tuple[str, int, str]] = set()
 
@@ -6706,7 +6799,7 @@ exit 1
             if not expanded:
                 raise RuntimeError(
                     "Auto Trello chưa tìm thấy card ảnh phù hợp để AI tự viết prompt. "
-                    "Hãy kéo card cần chạy vào Ready for AI hoặc điền Lọc sản phẩm rõ hơn."
+                    "Hãy chọn card trong trợ lý, dán link card Trello, hoặc điền Lọc sản phẩm rõ hơn."
                 )
             discovery = {
                 "mode": "auto_trello",

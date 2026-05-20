@@ -2958,19 +2958,39 @@ function renderUserAssistant() {
         ${trelloCandidates
           .map((candidate) => {
             const inReady = Boolean(candidate.in_ready_list);
-            const status = inReady ? "Đúng Ready for AI" : "Chưa ở Ready for AI";
+            const status = inReady ? "Đúng Ready for AI" : "Có thể chọn trực tiếp";
             const value = candidate.short_link || candidate.card_id || candidate.url || "";
+            const previews = Array.isArray(candidate.image_previews) ? candidate.image_previews.filter(Boolean).slice(0, 4) : [];
+            const previewHtml = previews.length
+              ? `<div class="assistant-candidate-thumbs" aria-label="Ảnh trong card Trello">
+                  ${previews
+                    .map((preview, index) => {
+                      const src = String(preview.preview_url || preview.url || "").trim();
+                      if (!src) return "";
+                      const label = preview.name || `Ảnh ${index + 1}`;
+                      return `<button type="button" class="assistant-candidate-thumb" data-assistant-card-value="${escapeHtml(
+                        value,
+                      )}" ${state.userAssistant?.executing || !value ? "disabled" : ""} title="${escapeHtml(
+                        `Chọn ${candidate.name || "card Trello"}`,
+                      )}">
+                        <img src="${escapeHtml(src)}" alt="${escapeHtml(label)}" loading="lazy">
+                      </button>`;
+                    })
+                    .join("")}
+                </div>`
+              : "";
             const pinButton =
-              inReady && value
+              value
                 ? `<button type="button" class="ghost-button card-button assistant-candidate-pin" data-assistant-card-value="${escapeHtml(
                     value,
-                  )}" ${state.userAssistant?.executing ? "disabled" : ""}>Ghim</button>`
-                : `<span class="assistant-candidate-wait">Kéo vào Ready</span>`;
+                  )}" ${state.userAssistant?.executing ? "disabled" : ""}>${inReady ? "Chọn" : "Chọn card này"}</button>`
+                : "";
             return `
               <div class="assistant-candidate-item" data-ready="${inReady ? "true" : "false"}">
-                <div>
+                <div class="assistant-candidate-main">
                   <strong>${escapeHtml(candidate.name || candidate.short_link || "Card Trello")}</strong>
                   <span>${escapeHtml(candidate.list_name || "Không rõ list")} · ${Number(candidate.image_count || 0)} ảnh · ${status}</span>
+                  ${previewHtml}
                   ${
                     candidate.url
                       ? `<a href="${escapeHtml(candidate.url)}" target="_blank" rel="noreferrer">Mở card</a>`
