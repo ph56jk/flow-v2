@@ -801,6 +801,80 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         self.assertIn("Ready for AI", pin_action["detail"])
 
+    def test_user_assistant_searches_child_shirt_candidates_by_synonym(self) -> None:
+        asyncio.run(
+            self.store.replace_trello_config(
+                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            )
+        )
+        cards_payload = [
+            {
+                "id": "card-shirt",
+                "name": "T_050421_C1_010_D3_L1_4",
+                "shortLink": "shirt1",
+                "url": "https://trello.com/c/shirt1",
+                "idList": "shirt-list",
+                "attachments": [{"name": "youth-model.jpg", "mimeType": "image/jpeg"}],
+            }
+        ]
+
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
+            clear=False,
+        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "shirt-list", "name": "T-Shirt"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            return_value=cards_payload,
+        ):
+            result = asyncio.run(
+                self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về áo trẻ em"))
+            )
+
+        self.assertEqual(1, len(result["trello_candidates"]))
+        self.assertEqual("T-Shirt", result["trello_candidates"][0]["list_name"])
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertIn("apply_product_filter", action_names)
+        self.assertNotIn("run_auto_trello", action_names)
+        self.assertIn("chưa ở Ready for AI", result["answer"])
+
+    def test_user_assistant_removes_run_auto_when_no_trello_candidate(self) -> None:
+        asyncio.run(
+            self.store.replace_trello_config(
+                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
+            clear=False,
+        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[{"id": "ready-list", "name": "Ready for AI"}],
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            return_value=[],
+        ):
+            result = asyncio.run(
+                self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về đồ chơi gỗ"))
+            )
+
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertIn("apply_product_filter", action_names)
+        self.assertNotIn("run_auto_trello", action_names)
+        self.assertIn("chưa tìm thấy card", result["answer"])
+        self.assertIn("chưa thấy card", result["context_summary"])
+
     def test_user_assistant_uses_gemini_when_configured(self) -> None:
         asyncio.run(
             self.service.update_integration_config(

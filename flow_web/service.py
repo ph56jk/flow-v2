@@ -2521,21 +2521,28 @@ class FlowWebService:
         )
         cards = payload if isinstance(payload, list) else []
         query_key = self._compact_match_text(query)
+        query_groups = self._user_assistant_trello_query_groups(query)
         candidates: List[Dict[str, Any]] = []
 
-        def candidate_score(card: Dict[str, Any], image_attachments: List[Dict[str, Any]], in_ready_list: bool) -> int:
+        def candidate_score(
+            card: Dict[str, Any],
+            image_attachments: List[Dict[str, Any]],
+            in_ready_list: bool,
+            list_name: str,
+        ) -> int:
             card_name_key = self._compact_match_text(card.get("name"))
-            card_text_key = self._compact_match_text(
-                " ".join(
-                    str(value or "")
-                    for value in (
-                        card.get("name"),
-                        card.get("desc"),
-                        card.get("url"),
-                        " ".join(str(item.get("name") or "") for item in image_attachments),
-                    )
+            haystack_raw = " ".join(
+                str(value or "")
+                for value in (
+                    card.get("name"),
+                    card.get("desc"),
+                    card.get("url"),
+                    list_name,
+                    " ".join(str(item.get("name") or "") for item in image_attachments),
                 )
             )
+            card_text_key = self._compact_match_text(haystack_raw)
+            haystack_tokens = set(self._tokenize_match_words(haystack_raw))
             score = 0
             if query_key and card_name_key == query_key:
                 score += 100
@@ -2543,6 +2550,9 @@ class FlowWebService:
                 score += 80
             elif query_key and query_key in card_text_key:
                 score += 60
+            for group in query_groups:
+                if group and all(token in haystack_tokens for token in group):
+                    score += 30 + (len(group) * 12)
             if in_ready_list:
                 score += 25
             score += min(10, len(image_attachments))
@@ -2559,11 +2569,13 @@ class FlowWebService:
             if not image_attachments:
                 continue
             card["_image_attachments"] = image_attachments
-            if not self._trello_card_matches_query(card, query):
-                continue
 
             card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+            list_name = list_names.get(card_list_id) or card_list_id or "Không rõ list"
             in_ready_list = bool(ready_list_id and card_list_id == ready_list_id)
+            score = candidate_score(card, image_attachments, in_ready_list, list_name)
+            if score <= min(10, len(image_attachments)):
+                continue
             candidates.append(
                 {
                     "card_id": str(card.get("id") or "").strip(),
@@ -2571,11 +2583,11 @@ class FlowWebService:
                     "name": str(card.get("name") or "").strip(),
                     "url": str(card.get("url") or "").strip(),
                     "list_id": card_list_id,
-                    "list_name": list_names.get(card_list_id) or card_list_id or "Không rõ list",
+                    "list_name": list_name,
                     "in_ready_list": in_ready_list,
                     "image_count": len(image_attachments),
                     "image_names": [str(item.get("name") or "").strip() for item in image_attachments[:3] if str(item.get("name") or "").strip()],
-                    "_score": candidate_score(card, image_attachments, in_ready_list),
+                    "_score": score,
                 }
             )
 
@@ -2585,9 +2597,53 @@ class FlowWebService:
             cleaned.append({key: value for key, value in item.items() if not key.startswith("_")})
         return cleaned
 
+    def _tokenize_match_words(self, value: Any) -> List[str]:
+        stripped = self._strip_accents(str(value or "")).lower()
+        return [token for token in re.findall(r"[a-z0-9]+", stripped) if token]
+
+    def _user_assistant_trello_query_groups(self, query: str) -> List[List[str]]:
+        tokens = [token for token in self._tokenize_match_words(query) if len(token) > 1]
+        groups: List[List[str]] = []
+        if tokens:
+            groups.append(tokens)
+
+        token_set = set(tokens)
+        compact = self._compact_match_text(query)
+        wants_shirt = "ao" in token_set or "shirt" in token_set or "tshirt" in token_set or "tee" in token_set
+        wants_child = bool({"tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"} & token_set) or "treem" in compact
+        if wants_shirt:
+            groups.extend([["shirt"], ["tshirt"], ["tee"]])
+        if wants_shirt and wants_child:
+            groups.extend(
+                [
+                    ["shirt", "kids"],
+                    ["shirt", "kid"],
+                    ["shirt", "baby"],
+                    ["shirt", "child"],
+                    ["shirt", "children"],
+                    ["shirt", "youth"],
+                    ["shirt", "toddler"],
+                    ["tshirt", "kids"],
+                    ["tshirt", "baby"],
+                    ["tee", "kids"],
+                    ["tee", "baby"],
+                ]
+            )
+
+        unique: List[List[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for group in groups:
+            cleaned = [token for token in group if token and len(token) > 1]
+            key = tuple(cleaned)
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            unique.append(cleaned)
+        return unique
+
     def _format_user_assistant_trello_candidate_context(self, candidates: List[Dict[str, Any]], query: str) -> str:
         if not candidates:
-            return ""
+            return f"Trello scan theo '{query}': chưa thấy card có attachment ảnh khớp trên board."
         ready = [item for item in candidates if item.get("in_ready_list")]
         lines = [
             f"Trello scan theo '{query}': tìm thấy {len(candidates)} card có ảnh; {len(ready)} card đang ở Ready for AI.",
@@ -2602,12 +2658,23 @@ class FlowWebService:
             )
         return "\n".join(lines)
 
-    def _append_user_assistant_trello_candidate_notice(self, answer: str, candidates: List[Dict[str, Any]], query: str) -> str:
-        if not candidates:
+    def _append_user_assistant_trello_candidate_notice(
+        self,
+        answer: str,
+        candidates: List[Dict[str, Any]],
+        query: str,
+        *,
+        scan_attempted: bool = False,
+    ) -> str:
+        if not query or (not candidates and not scan_attempted):
             return answer
         ready = [item for item in candidates if item.get("in_ready_list")]
-        first = candidates[0]
-        if ready:
+        if not candidates:
+            notice = (
+                f"Trello scan: app chưa tìm thấy card có attachment ảnh khớp '{query}' trên board. "
+                "App sẽ không chạy Auto Trello cho tới khi có card đúng trong Ready for AI hoặc chủ nhân dán link card rõ ràng."
+            )
+        elif ready:
             ready_names = ", ".join(str(item.get("name") or item.get("short_link") or "").strip() for item in ready[:3] if item)
             notice = (
                 f"Trello scan: app tìm thấy {len(ready)} card khớp '{query}' đang ở Ready for AI"
@@ -2615,6 +2682,7 @@ class FlowWebService:
                 + " Có thể ghim card đúng trước khi chạy để chắc chắn lấy đúng ảnh."
             )
         else:
+            first = candidates[0]
             notice = (
                 f"Trello scan: app tìm thấy card khớp '{query}' là {first.get('name') or first.get('short_link')} "
                 f"nhưng nó đang ở list {first.get('list_name') or 'khác'}, chưa ở Ready for AI. "
@@ -2629,8 +2697,11 @@ class FlowWebService:
         actions: List[Dict[str, Any]],
         candidates: List[Dict[str, Any]],
         trello_card_hint: str,
+        *,
+        scan_attempted: bool = False,
+        query: str = "",
     ) -> List[Dict[str, Any]]:
-        if not candidates:
+        if not candidates and not scan_attempted:
             return actions
         ready = [item for item in candidates if item.get("in_ready_list")]
         refined: List[Dict[str, Any]] = []
@@ -2639,6 +2710,15 @@ class FlowWebService:
                 if not ready or len(ready) > 1:
                     continue
             refined.append(action)
+
+        if not candidates:
+            refined.append(
+                {
+                    "label": f"Chưa thấy card: {query}" if query else "Chưa thấy card Trello",
+                    "detail": "AI đã quét Trello nhưng chưa thấy card có ảnh khớp. Hãy kéo/dán đúng card vào Ready for AI trước khi chạy.",
+                }
+            )
+            return refined[:10]
 
         for item in ready[:3]:
             value = str(item.get("short_link") or item.get("card_id") or item.get("url") or "").strip()
@@ -2804,17 +2884,24 @@ class FlowWebService:
         trello_card_hint = self._extract_user_assistant_trello_card_hint(question)
         trello_candidates: List[Dict[str, Any]] = []
         trello_candidate_error = ""
-        if product_filter and context.get("trello", {}).get("configured"):
+        trello_candidate_scan_attempted = bool(product_filter and context.get("trello", {}).get("configured"))
+        if trello_candidate_scan_attempted:
             try:
                 trello_candidates = await asyncio.to_thread(self._user_assistant_trello_candidates, product_filter)
             except Exception as exc:
                 trello_candidate_error = str(exc)[:180]
-        if trello_candidates:
+        if trello_candidate_scan_attempted:
             context["trello_candidate_scan"] = self._format_user_assistant_trello_candidate_context(trello_candidates, product_filter)
         context_summary = self._format_user_assistant_context(context, ui_context)
         local_answer = self._local_user_assistant_reply(question, context, ui_context)
         actions = self._user_assistant_suggested_actions(question, context)
-        actions = self._refine_user_assistant_actions_for_trello_candidates(actions, trello_candidates, trello_card_hint)
+        actions = self._refine_user_assistant_actions_for_trello_candidates(
+            actions,
+            trello_candidates,
+            trello_card_hint,
+            scan_attempted=trello_candidate_scan_attempted,
+            query=product_filter,
+        )
 
         engine = "local"
         engine_label = "Nội bộ"
@@ -2836,7 +2923,12 @@ class FlowWebService:
             except Exception as exc:
                 fallback_reason = str(exc)[:180]
                 model = ""
-        answer = self._append_user_assistant_trello_candidate_notice(answer, trello_candidates, product_filter)
+        answer = self._append_user_assistant_trello_candidate_notice(
+            answer,
+            trello_candidates,
+            product_filter,
+            scan_attempted=trello_candidate_scan_attempted,
+        )
 
         return {
             "answer": self._trim_user_assistant_answer(answer),

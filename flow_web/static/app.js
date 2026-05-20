@@ -4511,6 +4511,7 @@ async function askUserAssistant(questionOverride = "") {
       }),
     });
     state.userAssistant.last = payload;
+    applyAssistantImmediateHints(payload);
     renderUserAssistant();
     showMessage("Trợ lý đã trả lời.", "success");
   } catch (error) {
@@ -4518,6 +4519,21 @@ async function askUserAssistant(questionOverride = "") {
   } finally {
     state.userAssistant.busy = false;
     renderUserAssistant();
+  }
+}
+
+function applyAssistantImmediateHints(payload) {
+  const actions = Array.isArray(payload?.suggested_actions) ? payload.suggested_actions : [];
+  const productAction = actions.find((action) => action?.action === "apply_product_filter" && action?.requires_confirmation !== true);
+  const productValue = String(productAction?.payload?.value || "").trim();
+  if (productValue && productValue !== String(state.automation.promptProductFilter || "").trim()) {
+    setAssistantProductFilter(productValue);
+  }
+
+  const cardAction = actions.find((action) => action?.action === "set_trello_card" && action?.requires_confirmation !== true);
+  const cardValue = String(cardAction?.payload?.value || "").trim();
+  if (cardValue && cardValue !== String(state.automation.trelloCardId || "").trim()) {
+    setAssistantTrelloCard(cardValue);
   }
 }
 
