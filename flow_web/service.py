@@ -2543,16 +2543,19 @@ class FlowWebService:
             )
             card_text_key = self._compact_match_text(haystack_raw)
             haystack_tokens = set(self._tokenize_match_words(haystack_raw))
-            score = 0
+            match_score = 0
             if query_key and card_name_key == query_key:
-                score += 100
+                match_score += 100
             elif query_key and query_key in card_name_key:
-                score += 80
+                match_score += 80
             elif query_key and query_key in card_text_key:
-                score += 60
+                match_score += 60
             for group in query_groups:
                 if group and all(token in haystack_tokens for token in group):
-                    score += 30 + (len(group) * 12)
+                    match_score += 30 + (len(group) * 12)
+            if match_score <= 0:
+                return 0
+            score = match_score
             if in_ready_list:
                 score += 25
             score += min(10, len(image_attachments))
@@ -2611,7 +2614,7 @@ class FlowWebService:
         compact = self._compact_match_text(query)
         wants_shirt = "ao" in token_set or "shirt" in token_set or "tshirt" in token_set or "tee" in token_set
         wants_child = bool({"tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"} & token_set) or "treem" in compact
-        if wants_shirt:
+        if wants_shirt and not wants_child:
             groups.extend([["shirt"], ["tshirt"], ["tee"]])
         if wants_shirt and wants_child:
             groups.extend(
@@ -6398,16 +6401,19 @@ exit 1
         query_key = self._compact_match_text(query)
         if not query_key:
             return False
+        query_groups = self._user_assistant_trello_query_groups(query)
         for value in (
             item.get("product_key"),
             item.get("product_name"),
             item.get("product"),
             item.get("notes"),
             item.get("trello_card_id"),
-            item.get("prompt"),
         ):
             candidate = self._compact_match_text(value)
             if candidate and (query_key in candidate or candidate in query_key):
+                return True
+            candidate_tokens = set(self._tokenize_match_words(value))
+            if candidate_tokens and any(group and all(token in candidate_tokens for token in group) for group in query_groups):
                 return True
         return False
 

@@ -845,6 +845,58 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("run_auto_trello", action_names)
         self.assertIn("chưa ở Ready for AI", result["answer"])
 
+    def test_user_assistant_does_not_match_generic_shirt_for_child_shirt_query(self) -> None:
+        asyncio.run(
+            self.store.replace_trello_config(
+                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            )
+        )
+        cards_payload = [
+            {
+                "id": "card-shirt",
+                "name": "Adult T-Shirt Mockup",
+                "shortLink": "shirt1",
+                "url": "https://trello.com/c/shirt1",
+                "idList": "shirt-list",
+                "attachments": [{"name": "black-shirt.jpg", "mimeType": "image/jpeg"}],
+            }
+        ]
+
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
+            clear=False,
+        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "shirt-list", "name": "T-Shirt"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            return_value=cards_payload,
+        ):
+            result = asyncio.run(
+                self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về áo trẻ em"))
+            )
+
+        self.assertEqual([], result["trello_candidates"])
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertNotIn("run_auto_trello", action_names)
+        self.assertIn("chưa tìm thấy card", result["answer"])
+
+    def test_auto_trello_keyword_prompt_match_ignores_prompt_body(self) -> None:
+        item = {
+            "product_key": "adult_shirt",
+            "product": "Adult Shirt",
+            "notes": "",
+            "prompt": "Create a kids shirt scene but this row is not tagged as child shirt.",
+        }
+
+        self.assertFalse(self.service._prompt_batch_item_matches_query(item, "áo trẻ em"))
+
     def test_user_assistant_removes_run_auto_when_no_trello_candidate(self) -> None:
         asyncio.run(
             self.store.replace_trello_config(

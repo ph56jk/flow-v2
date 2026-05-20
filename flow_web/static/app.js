@@ -2251,7 +2251,7 @@ function activePromptSourceItems({ limit = 40, ignoreFilter = false } = {}) {
     return [];
   }
   const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
-  const filter = ignoreFilter ? "" : String(state.automation.promptProductFilter || "").trim().toLowerCase();
+  const filter = ignoreFilter ? "" : String(state.automation.promptProductFilter || "").trim();
   const normalizedItems = items
     .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
     .filter((item) => item?.used !== true)
@@ -2259,13 +2259,13 @@ function activePromptSourceItems({ limit = 40, ignoreFilter = false } = {}) {
       if (!filter) {
         return true;
       }
-      const haystack = [
+      const haystackValues = [
         item.product,
         item.product_key,
         item.product_name,
         item.notes,
-      ].map((value) => String(value || "").toLowerCase()).join(" ");
-      return haystack.includes(filter);
+      ];
+      return productFilterMatches(haystackValues, filter);
     })
     .map((item) => ({
       row: Number(item.row || 0),
@@ -2281,6 +2281,74 @@ function activePromptSourceItems({ limit = 40, ignoreFilter = false } = {}) {
       trello_list_id: String(item.trello_list_id || "").trim(),
     }));
   return Number.isFinite(limit) ? normalizedItems.slice(0, Math.max(1, limit)) : normalizedItems;
+}
+
+function normalizeMatchText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function matchTokens(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .match(/[a-z0-9]+/g) || [];
+}
+
+function productFilterGroups(filter) {
+  const tokens = matchTokens(filter).filter((token) => token.length > 1);
+  const groups = tokens.length ? [tokens] : [];
+  const tokenSet = new Set(tokens);
+  const compact = normalizeMatchText(filter);
+  const wantsShirt = tokenSet.has("ao") || tokenSet.has("shirt") || tokenSet.has("tshirt") || tokenSet.has("tee");
+  const wantsChild =
+    ["tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"].some((token) => tokenSet.has(token)) ||
+    compact.includes("treem");
+  if (wantsShirt && !wantsChild) {
+    groups.push(["shirt"], ["tshirt"], ["tee"]);
+  }
+  if (wantsShirt && wantsChild) {
+    groups.push(
+      ["shirt", "kids"],
+      ["shirt", "kid"],
+      ["shirt", "baby"],
+      ["shirt", "child"],
+      ["shirt", "children"],
+      ["shirt", "youth"],
+      ["shirt", "toddler"],
+      ["tshirt", "kids"],
+      ["tshirt", "baby"],
+      ["tee", "kids"],
+      ["tee", "baby"],
+    );
+  }
+  const seen = new Set();
+  return groups.filter((group) => {
+    const key = group.join("|");
+    if (!group.length || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function productFilterMatches(values, filter) {
+  const query = normalizeMatchText(filter);
+  if (!query) {
+    return true;
+  }
+  const haystack = values.map((value) => String(value || "")).join(" ");
+  const haystackCompact = normalizeMatchText(haystack);
+  if (query && haystackCompact && (haystackCompact.includes(query) || query.includes(haystackCompact))) {
+    return true;
+  }
+  const tokenSet = new Set(matchTokens(haystack));
+  return productFilterGroups(filter).some((group) => group.length && group.every((token) => tokenSet.has(token)));
 }
 
 function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 500 })) {
@@ -4223,9 +4291,6 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
   syncAutomationFromForm();
   let batchItems = activePromptSourceItems({ limit: 500 });
   const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
-  if (!batchItems.length && trelloSearchQuery) {
-    batchItems = activePromptSourceItems({ limit: 500, ignoreFilter: true });
-  }
   const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
   if (!state.config?.project_id) {
@@ -4241,7 +4306,12 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     return;
   }
   if (!prompt) {
-    showMessage("Hãy dán prompt hoặc để nguồn prompt lấy được dữ liệu trước khi chạy.", "error");
+    showMessage(
+      trelloSearchQuery
+        ? `Sheet chưa có prompt active khớp bộ lọc "${trelloSearchQuery}". App đã dừng để không lấy nhầm prompt.`
+        : "Hãy dán prompt hoặc để nguồn prompt lấy được dữ liệu trước khi chạy.",
+      "error",
+    );
     elements.automationPromptInput.focus();
     return;
   }
