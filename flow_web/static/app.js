@@ -2246,12 +2246,12 @@ function renderAutomationViewPanels(stats) {
     : `<div class="scenario-panel-empty">Không có execution nào cần xử lý.</div>`;
 }
 
-function activePromptSourceItems({ limit = 40 } = {}) {
+function activePromptSourceItems({ limit = 40, ignoreFilter = false } = {}) {
   if (state.automation.sourceType !== "sheets") {
     return [];
   }
   const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
-  const filter = String(state.automation.promptProductFilter || "").trim().toLowerCase();
+  const filter = ignoreFilter ? "" : String(state.automation.promptProductFilter || "").trim().toLowerCase();
   const normalizedItems = items
     .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
     .filter((item) => item?.used !== true)
@@ -4177,6 +4177,9 @@ function automationImageJobPayload(prompt) {
     trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
     trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
     trello_set_cover: state.automation.trelloSetCover !== false,
+    prompt_product: state.automation.promptProductFilter || "",
+    prompt_product_key: state.automation.promptProductFilter || "",
+    prompt_notes: state.automation.promptProductFilter ? `Trello search: ${state.automation.promptProductFilter}` : "",
   };
 }
 
@@ -4185,7 +4188,11 @@ async function submitAutomationImage({ autoTrello = false } = {}) {
     return;
   }
   syncAutomationFromForm();
-  const batchItems = activePromptSourceItems({ limit: 500 });
+  let batchItems = activePromptSourceItems({ limit: 500 });
+  const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
+  if (!batchItems.length && trelloSearchQuery) {
+    batchItems = activePromptSourceItems({ limit: 500, ignoreFilter: true });
+  }
   const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
   if (!state.config?.project_id) {

@@ -1971,7 +1971,8 @@ class FlowWebService:
         return False
 
     def _compact_match_text(self, value: Any) -> str:
-        return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+        stripped = self._strip_accents(str(value or "")).strip().lower()
+        return re.sub(r"[^a-z0-9]+", "", stripped)
 
     def _prompt_batch_key(
         self,
@@ -2312,15 +2313,22 @@ class FlowWebService:
             return ""
 
         patterns = [
-            r"(?:product[_\s-]*key|product|sản phẩm|san pham|lọc|loc)\s*(?:là|la|=|:)?\s*([a-zA-Z0-9_ -]{2,48})",
-            r"(?:tạo|tao|chạy|chay|làm|lam)\s+(?:ảnh|anh)?\s*(?:cho|sản phẩm|san pham)?\s*([a-zA-Z0-9_ -]{2,48})",
+            r"(?:tìm|tim).*?(?:ảnh|anh).*?(?:về|ve|cho)\s+([^\n,.;]{2,48})",
+            r"(?:ảnh|anh)\s*(?:về|ve|cho)\s+([^\n,.;]{2,48})",
+            r"(?:product[_\s-]*key|product|sản phẩm|san pham|lọc|loc)\s*(?:là|la|=|:)?\s*([^\n,.;]{2,48})",
+            r"(?:tạo|tao|chạy|chay|làm|lam)\s+(?:ảnh|anh)?\s*(?:cho|sản phẩm|san pham)?\s*([^\n,.;]{2,48})",
         ]
         for pattern in patterns:
             match = re.search(pattern, raw, flags=re.IGNORECASE)
             if not match:
                 continue
             value = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;\"'")
-            value = re.sub(r"\b(?:rồi|roi|xong|nhé|nhe|giúp|giup|đi|di|auto|trello|flow|telegram|sheet)\b.*$", "", value, flags=re.IGNORECASE).strip()
+            value = re.sub(
+                r"\b(?:cho tôi|cho toi|của tôi|cua toi|rồi|roi|xong|nhé|nhe|giúp|giup|đi|di|auto|trello|flow|telegram|sheet)\b.*$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip()
             if 2 <= len(value) <= 48:
                 return value
 
@@ -2329,6 +2337,7 @@ class FlowWebService:
             ("tshirt", "tshirt"),
             ("t_shirt", "t_shirt"),
             ("shirt", "shirt"),
+            ("gau", "gấu"),
             ("ao_thun", "ao thun"),
             ("ao", "ao"),
             ("hoodie", "hoodie"),
@@ -5928,8 +5937,11 @@ exit 1
                 break
 
         if not expanded:
+            expanded = self._trello_prompt_items_for_keyword_image_cards(cards, items, request, max_items)
+
+        if not expanded:
             raise RuntimeError(
-                "Auto Trello chưa tìm thấy card nào có attachment ảnh khớp Product_Key/Product_Name trong sheet."
+                "Auto Trello chưa tìm thấy card nào có attachment ảnh khớp Product_Key/Product_Name hoặc từ khóa tìm Trello."
             )
 
         discovery = {
@@ -5939,8 +5951,97 @@ exit 1
             "list_name": self._trello_list_name(key, token, list_id),
             "matched_cards": len({item.get("trello_card_id") for item in expanded if item.get("trello_card_id")}),
             "matched_items": len(expanded),
+            "match_mode": "keyword" if any(item.get("trello_match_mode") == "keyword" for item in expanded) else "product",
         }
         return expanded, discovery
+
+    def _trello_prompt_items_for_keyword_image_cards(
+        self,
+        cards: List[Dict[str, Any]],
+        items: List[Dict[str, Any]],
+        request: CreateJobRequest,
+        max_items: int,
+    ) -> List[Dict[str, Any]]:
+        query = self._trello_auto_search_query(request)
+        if not query or not cards or not items:
+            return []
+
+        matched_cards = [card for card in cards if self._trello_card_matches_query(card, query)]
+        if not matched_cards:
+            return []
+
+        expanded: List[Dict[str, Any]] = []
+        used_pairs: set[tuple[str, int, str]] = set()
+        for card in matched_cards:
+            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not card_id:
+                continue
+            card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+            item = self._best_prompt_item_for_trello_keyword_card(card, items, used_pairs)
+            if not item:
+                continue
+            used_pairs.add((card_id, int(item.get("row") or 0), str(item.get("index") or "")))
+            expanded.append(
+                {
+                    **item,
+                    "trello_card_id": card_id,
+                    "trello_list_id": card_list_id,
+                    "trello_card_name": str(card.get("name") or "").strip(),
+                    "trello_card_url": str(card.get("url") or "").strip(),
+                    "trello_match_mode": "keyword",
+                    "trello_search_query": query,
+                }
+            )
+            if len(expanded) >= max_items:
+                break
+        return expanded
+
+    def _trello_auto_search_query(self, request: CreateJobRequest) -> str:
+        for value in (
+            request.prompt_product_key,
+            request.prompt_product,
+            request.prompt_notes,
+            request.title,
+        ):
+            cleaned = str(value or "").strip()
+            if cleaned:
+                return cleaned[:80]
+        return ""
+
+    def _trello_card_matches_query(self, card: Dict[str, Any], query: str) -> bool:
+        normalized_query = self._compact_match_text(query)
+        if not normalized_query:
+            return False
+        haystack_values = [
+            card.get("name"),
+            card.get("desc"),
+            card.get("url"),
+        ]
+        for attachment in card.get("_image_attachments") or []:
+            if isinstance(attachment, dict):
+                haystack_values.extend([attachment.get("name"), attachment.get("url")])
+        haystack = self._compact_match_text(" ".join(str(value or "") for value in haystack_values))
+        return bool(normalized_query and (normalized_query in haystack or haystack in normalized_query))
+
+    def _best_prompt_item_for_trello_keyword_card(
+        self,
+        card: Dict[str, Any],
+        items: List[Dict[str, Any]],
+        used_pairs: set[tuple[str, int, str]],
+    ) -> Dict[str, Any]:
+        card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+        for item in items:
+            item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
+            if item_key in used_pairs:
+                continue
+            hint = {"card_id": card_id, "card_name": str(card.get("name") or "").strip()}
+            if self._prompt_batch_item_matches_trello_source(item, hint):
+                return item
+        for item in items:
+            item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
+            if item_key not in used_pairs:
+                return item
+        return {}
 
     def _trello_image_cards_on_board(
         self,
@@ -5957,7 +6058,7 @@ exit 1
             f"boards/{quote(board_id, safe='')}/cards",
             key,
             token,
-            fields={"fields": "id,name,shortLink,url,idList,closed", "filter": "open"},
+            fields={"fields": "id,name,desc,shortLink,url,idList,closed", "filter": "open"},
         )
         cards = payload if isinstance(payload, list) else []
         image_cards: List[Dict[str, Any]] = []
@@ -5976,7 +6077,11 @@ exit 1
                 fields={"fields": "id,name,url,mimeType"},
             )
             attachments = attachments_payload if isinstance(attachments_payload, list) else []
-            if any(self._trello_attachment_is_image(item) for item in attachments if isinstance(item, dict)):
+            image_attachments = [
+                item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            ]
+            if image_attachments:
+                card["_image_attachments"] = image_attachments
                 image_cards.append(card)
         return image_cards
 
