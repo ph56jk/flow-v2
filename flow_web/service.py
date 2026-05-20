@@ -2952,6 +2952,11 @@ class FlowWebService:
         )
         cards = payload if isinstance(payload, list) else []
         query_key = self._compact_match_text(query)
+        query_alias_keys = [
+            self._compact_match_text(alias)
+            for alias in self._trello_query_aliases(query)
+            if self._compact_match_text(alias)
+        ]
         query_groups = self._user_assistant_trello_query_groups(query)
         candidates: List[Dict[str, Any]] = []
 
@@ -2981,6 +2986,15 @@ class FlowWebService:
                 match_score += 80
             elif query_key and query_key in card_text_key:
                 match_score += 60
+            for alias_key in query_alias_keys:
+                if not alias_key or alias_key == query_key:
+                    continue
+                if card_name_key == alias_key:
+                    match_score += 85
+                elif alias_key in card_name_key:
+                    match_score += 70
+                elif alias_key in card_text_key:
+                    match_score += 55
             for group in query_groups:
                 if group and all(token in haystack_tokens for token in group):
                     match_score += 30 + (len(group) * 12)
@@ -3076,6 +3090,15 @@ class FlowWebService:
         compact = self._compact_match_text(query)
         wants_shirt = "ao" in token_set or "shirt" in token_set or "tshirt" in token_set or "tee" in token_set
         wants_child = bool({"tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"} & token_set) or "treem" in compact
+        wants_doll = (
+            "doll" in token_set
+            or "bupbe" in compact
+            or ("bup" in token_set and "be" in token_set)
+            or "babydoll" in compact
+            or "bda" in token_set
+        )
+        if wants_doll:
+            groups.extend([["doll"], ["baby", "doll"], ["bda"]])
         if wants_shirt and not wants_child:
             groups.extend([["shirt"], ["tshirt"], ["tee"]])
         if wants_shirt and wants_child:
@@ -7203,14 +7226,25 @@ exit 1
         aliases = [str(query or "").strip()]
         normalized = self._normalize_skill_token(query)
         compact = self._compact_match_text(query)
+        tokens = set(self._tokenize_match_words(query))
+        is_child_shirt_query = (
+            ("ao" in tokens or "shirt" in tokens or "tshirt" in tokens or "tee" in tokens)
+            and (
+                bool({"tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"} & tokens)
+                or "treem" in compact
+            )
+        )
         alias_groups = [
             (("tap_de", "tapde", "apron"), ("apron", "baking apron", "kitchen apron", "tap de")),
             (("theu", "embroider", "embroidery"), ("embroidered", "embroidery", "hand embroidered", "handmade")),
             (("gau", "gau_bong", "gaubong"), ("bear", "teddy bear", "plush", "stuffed toy")),
+            (("bup_be", "bupbe", "doll", "baby_doll", "babydoll", "bda"), ("doll", "baby doll", "BDA", "doll dress", "baby doll dress")),
             (("ao_tre_em", "aotreem"), ("kids shirt", "children shirt", "baby shirt", "youth tee")),
             (("ao", "shirt", "tshirt"), ("shirt", "tshirt", "tee")),
         ]
         for triggers, values in alias_groups:
+            if is_child_shirt_query and triggers == ("ao", "shirt", "tshirt"):
+                continue
             if any(trigger in normalized or trigger in compact for trigger in triggers):
                 aliases.extend(values)
         unique: List[str] = []
