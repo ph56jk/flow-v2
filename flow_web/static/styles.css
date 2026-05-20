@@ -2360,7 +2360,7 @@ textarea:focus {
 
 .assistant-quick-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -2388,6 +2388,65 @@ textarea:focus {
 .assistant-action-list {
   display: grid;
   gap: 8px;
+}
+
+.assistant-flow-plan {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(112, 55, 224, 0.22);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.assistant-flow-plan-head {
+  display: grid;
+  gap: 3px;
+}
+
+.assistant-flow-plan-head strong,
+.assistant-flow-step strong {
+  color: var(--text);
+}
+
+.assistant-flow-plan-head span,
+.assistant-flow-step span,
+.assistant-flow-prompt {
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.assistant-flow-steps {
+  display: grid;
+  gap: 6px;
+}
+
+.assistant-flow-step {
+  display: grid;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #faf9fd;
+}
+
+.assistant-flow-step em {
+  justify-self: start;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.assistant-flow-prompt {
+  max-height: 150px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7f7fb;
+  white-space: pre-wrap;
 }
 
 .assistant-candidate-list {

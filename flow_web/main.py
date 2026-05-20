@@ -17,6 +17,7 @@ from .schemas import (
     ConfigUpdateRequest,
     CreateJobRequest,
     DownloadRequest,
+    FlowOperatorRequest,
     IntegrationConfigUpdateRequest,
     PromptBatchRequest,
     PromptCreateRequest,
@@ -214,6 +215,11 @@ async def generate_prompt_ai(request: Request, payload: PromptCreateRequest) -> 
 @app.post("/api/assistant/help")
 async def assistant_help(request: Request, payload: UserAssistantRequest) -> Dict[str, Any]:
     return await service(request).answer_user_assistant(payload)
+
+
+@app.post("/api/flow-ai/plan")
+async def plan_flow_ai_operator(request: Request, payload: FlowOperatorRequest) -> Dict[str, Any]:
+    return await service(request).plan_flow_operator(payload)
 
 
 @app.post("/api/storyboard/plan")

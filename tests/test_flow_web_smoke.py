@@ -19,6 +19,7 @@ from flow_web.schemas import (
     AppConfig,
     AuthStatus,
     CreateJobRequest,
+    FlowOperatorRequest,
     IntegrationConfigUpdateRequest,
     JobArtifact,
     JobRecord,
@@ -948,6 +949,83 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("Gemini", result["engine_label"])
         self.assertEqual("gemini-2.5-flash", result["model"])
         self.assertEqual("Gemini hướng dẫn trong app.", result["answer"])
+
+    def test_flow_operator_plan_builds_actionable_automation_plan(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
+            result = asyncio.run(
+                self.service.plan_flow_operator(
+                    FlowOperatorRequest(
+                        instruction="Dùng AI của Flow làm automation tạo ảnh về áo trẻ em rồi gửi Telegram duyệt",
+                        run_mode="auto",
+                    )
+                )
+            )
+
+        self.assertEqual("local", result["engine"])
+        self.assertEqual("áo trẻ em", result["product_filter"])
+        self.assertIn("Trello", result["summary"])
+        self.assertIn("selected Trello attachment", result["flow_prompt"])
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertIn("apply_product_filter", action_names)
+        self.assertIn("apply_flow_ai_prompt", action_names)
+        self.assertIn("open_flow_project", action_names)
+        self.assertIn("run_auto_trello", action_names)
+        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_trello")
+        self.assertTrue(run_action["requires_confirmation"])
+        self.assertNotIn("gem-key", result["context_summary"])
+
+    def test_user_assistant_attaches_flow_operator_plan_when_requested(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
+            result = asyncio.run(
+                self.service.answer_user_assistant(
+                    UserAssistantRequest(question="Tích hợp AI của Flow để tự thao tác thành hệ thống automation")
+                )
+            )
+
+        self.assertIn("Flow AI Operator", result["answer"])
+        self.assertTrue(result["flow_operator_plan"])
+        self.assertEqual("Flow AI Operator", result["flow_operator_plan"]["title"])
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertIn("apply_flow_ai_prompt", action_names)
+        self.assertIn("plan_flow_ai_operator", action_names)
+        self.assertEqual("", result["flow_operator_plan"]["product_filter"])
+
+    def test_user_assistant_does_not_extract_shirt_from_thao_tac_or_automation(self) -> None:
+        product = self.service._extract_user_assistant_product_filter(
+            "Tích hợp AI của Flow để tự thao tác thành hệ thống automation"
+        )
+
+        self.assertEqual("", product)
+
+    def test_flow_operator_uses_gemini_json_when_configured(self) -> None:
+        asyncio.run(
+            self.service.update_integration_config(
+                IntegrationConfigUpdateRequest(
+                    gemini_api_key="gem-key",
+                    gemini_model="gemini-2.5-flash",
+                )
+            )
+        )
+        gemini_plan = {
+            "title": "Flow AI Gemini",
+            "summary": "Gemini đã lập kế hoạch operator.",
+            "product_filter": "gấu bông",
+            "flow_prompt": "Use the selected Trello attachment as the exact teddy bear product reference, preserve the original product identity, create a photorealistic commercial product image with cozy nursery styling, soft daylight, clean composition, realistic fabric texture, and no extra text or watermark.",
+            "steps": [{"label": "Tìm ảnh", "detail": "Dùng card Ready for AI.", "status": "sẵn sàng"}],
+            "safety_notes": ["Không chạy nếu chưa thấy card đúng."],
+        }
+
+        with patch.object(self.service, "_generate_flow_operator_plan_with_gemini", return_value=gemini_plan):
+            result = asyncio.run(
+                self.service.plan_flow_operator(
+                    FlowOperatorRequest(instruction="Dùng Flow AI tạo ảnh về gấu bông")
+                )
+            )
+
+        self.assertEqual("gemini", result["engine"])
+        self.assertEqual("Flow AI Gemini", result["title"])
+        self.assertEqual("gấu bông", result["product_filter"])
+        self.assertIn("apply_flow_ai_prompt", [action.get("action") for action in result["suggested_actions"]])
 
     def test_telegram_review_pack_uses_app_saved_config(self) -> None:
         asyncio.run(

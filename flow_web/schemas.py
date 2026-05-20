@@ -441,6 +441,12 @@ class UserAssistantRequest(BaseModel):
     context: str = ""
 
 
+class FlowOperatorRequest(BaseModel):
+    instruction: str = ""
+    context: str = ""
+    run_mode: str = "plan"
+
+
 class StoryboardScene(BaseModel):
     index: int = 1
     title: str = ""

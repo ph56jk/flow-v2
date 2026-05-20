@@ -40,6 +40,7 @@ from .schemas import (
     ConfigUpdateRequest,
     CreateJobRequest,
     DownloadRequest,
+    FlowOperatorRequest,
     IntegrationConfig,
     IntegrationConfigUpdateRequest,
     InterruptedReplayGroup,
@@ -2226,6 +2227,408 @@ class FlowWebService:
             "model": "",
         }
 
+    def _flow_operator_requested(self, text: str) -> bool:
+        normalized = self._normalize_skill_token(text)
+        if not normalized:
+            return False
+        if "ai" in normalized and "flow" in normalized:
+            return True
+        return any(
+            term in normalized
+            for term in (
+                "flow_ai",
+                "ai_flow",
+                "ai_cua_flow",
+                "operator",
+                "automation",
+                "he_thong_tu_dong",
+                "dieu_khien_flow",
+                "thao_tac_voi_ai",
+                "tu_lam_theo_yeu_cau",
+            )
+        )
+
+    def _flow_operator_wants_run(self, instruction: str, run_mode: str = "") -> bool:
+        normalized = self._normalize_skill_token(f"{instruction} {run_mode}")
+        return any(
+            term in normalized
+            for term in (
+                "auto",
+                "automation",
+                "chay",
+                "run",
+                "tao_luon",
+                "lam_luon",
+                "bat_dau",
+                "hang_loat",
+                "xu_ly",
+            )
+        )
+
+    def _flow_operator_brief(self, instruction: str, product_filter: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(instruction or "").strip())
+        if product_filter:
+            return (
+                f"Dựa trên ảnh sản phẩm nguồn từ Trello card, tạo/chỉnh ảnh thương mại về {product_filter}. "
+                "Giữ sản phẩm gốc đúng hình dáng, chất liệu và chi tiết chính; chỉ thay bối cảnh, styling, ánh sáng và bố cục theo prompt."
+            )
+        if cleaned:
+            return (
+                f"Dựa trên ảnh sản phẩm nguồn từ Trello card, thực hiện yêu cầu: {cleaned}. "
+                "Giữ sản phẩm gốc đúng nhận diện, tạo ảnh mới bằng Google Flow theo phong cách thương mại rõ ràng."
+            )
+        return "Dựa trên ảnh sản phẩm nguồn từ Trello card, tạo ảnh thương mại sạch, thật, dễ duyệt và sẵn sàng lưu lại Trello."
+
+    def _local_flow_operator_prompt(self, instruction: str, product_filter: str) -> str:
+        request = PromptCreateRequest(
+            mode="image",
+            brief=self._flow_operator_brief(instruction, product_filter),
+            style="photorealistic commercial product image, clean composition, realistic lighting",
+            must_include=(
+                "use the selected Trello attachment as the exact source product, preserve product identity, "
+                "make the edited/generated result look like a real product photo"
+            ),
+            avoid="wrong product, random unrelated item, extra text, watermark, distorted logo, mismatched design",
+            audience="Telegram approval and Trello product archive",
+            aspect="square",
+        )
+        selected = self._select_prompt_skills("image", request.brief, request.style, request.must_include)
+        baseline = self._compose_prompt_draft(request, selected)
+        prompt, _ = self._ensure_prompt_detail(baseline, baseline, "image")
+        return prompt
+
+    def _flow_operator_steps(
+        self,
+        context: Dict[str, Any],
+        product_filter: str,
+        trello_candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        flow = context.get("flow", {})
+        trello = context.get("trello", {})
+        telegram = context.get("telegram", {})
+        ready_candidates = [item for item in trello_candidates if item.get("in_ready_list")]
+        source_detail = (
+            f"Đã thấy {len(ready_candidates)} card khớp trong Ready for AI."
+            if ready_candidates
+            else "Chỉ lấy attachment ảnh từ card ở Ready for AI hoặc card đã ghim rõ ràng."
+        )
+        return [
+            {
+                "label": "Tìm ảnh Trello",
+                "detail": source_detail,
+                "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
+            },
+            {
+                "label": "Lọc prompt Sheet",
+                "detail": (
+                    f"Lọc bằng '{product_filter}', ưu tiên Product_Key/Product_Name/Card_URL."
+                    if product_filter
+                    else "Dùng prompt Active và ưu tiên dòng có Trello_Card/Card_URL để tránh nhầm sản phẩm."
+                ),
+                "status": "sẵn sàng",
+            },
+            {
+                "label": "Điều khiển Flow AI",
+                "detail": "AI operator viết prompt, đổ vào Flow, mở project Flow và chạy bằng ảnh nguồn đã chọn.",
+                "status": "sẵn sàng" if flow.get("project_set") and flow.get("authenticated") else "cần mở Flow",
+            },
+            {
+                "label": "Duyệt Telegram",
+                "detail": "Ảnh tạo xong gửi sang Telegram; chỉ ảnh được duyệt mới được lưu lại Trello.",
+                "status": "sẵn sàng" if telegram.get("configured") else "cần Telegram",
+            },
+            {
+                "label": "Lưu lại Trello",
+                "detail": "Ảnh được duyệt upload về đúng card nguồn, không lưu sang card khác.",
+                "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
+            },
+        ]
+
+    def _dedupe_assistant_actions(self, actions: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+        unique: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for action in actions:
+            label = str(action.get("label") or "")
+            action_name = str(action.get("action") or "")
+            payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+            payload_key = json.dumps(payload, sort_keys=True, ensure_ascii=True)[:240] if payload else ""
+            action_key = f"{action_name}:{label}:{payload_key}"
+            if action_key in seen:
+                continue
+            seen.add(action_key)
+            unique.append(action)
+        return unique[: max(1, int(limit or 10))]
+
+    def _flow_operator_actions(
+        self,
+        instruction: str,
+        flow_prompt: str,
+        product_filter: str,
+        *,
+        run_mode: str = "plan",
+    ) -> List[Dict[str, Any]]:
+        actions: List[Dict[str, Any]] = [
+            {
+                "label": "Áp dụng prompt Flow AI",
+                "detail": "Đổ prompt AI operator vào ô tạo ảnh và ô chạy thử Flow để dùng ngay.",
+                "action": "apply_flow_ai_prompt",
+                "payload": {"prompt": flow_prompt},
+                "requires_confirmation": False,
+            },
+            {
+                "label": "Kiểm tra nguồn ảnh Trello",
+                "detail": "Mở cục Trello Image Source để chắc chắn ảnh lấy từ attachment của đúng card.",
+                "action": "select_trello_source",
+                "requires_confirmation": False,
+            },
+            {
+                "label": "Soát prompt Sheet",
+                "detail": "Đọc preview prompt Active sau bộ lọc trước khi chạy Flow.",
+                "action": "preview_prompt_source",
+                "requires_confirmation": False,
+            },
+            {
+                "label": "Mở Flow",
+                "detail": "Mở project Google Flow đã lưu để AI operator thao tác trên phiên đăng nhập hiện tại.",
+                "action": "open_flow_project",
+                "requires_confirmation": False,
+            },
+        ]
+        if product_filter:
+            actions.insert(
+                0,
+                {
+                    "label": f"Lọc sản phẩm: {product_filter}",
+                    "detail": "Gắn bộ lọc này trước khi quét Trello/Sheet để giảm rủi ro lấy nhầm ảnh.",
+                    "action": "apply_product_filter",
+                    "payload": {"value": product_filter},
+                    "requires_confirmation": False,
+                },
+            )
+        if self._flow_operator_wants_run(instruction, run_mode):
+            actions.append(
+                {
+                    "label": "Chạy automation Flow",
+                    "detail": "Quét Ready for AI, lấy ảnh đúng card, dùng prompt Sheet/Flow AI, gửi Telegram duyệt rồi lưu lại Trello.",
+                    "action": "run_auto_trello",
+                    "payload": {"limit": 1, "test_mode": True} if "test" in self._normalize_skill_token(instruction) else {},
+                    "requires_confirmation": True,
+                }
+            )
+        actions.append(
+            {
+                "label": "Đồng bộ duyệt Telegram",
+                "detail": "Kiểm tra các ảnh đã được người dùng duyệt rồi đẩy kết quả về Trello.",
+                "action": "sync_telegram_approvals",
+                "requires_confirmation": False,
+            }
+        )
+        return self._dedupe_assistant_actions(actions, limit=10)
+
+    def _local_flow_operator_plan(
+        self,
+        instruction: str,
+        context: Dict[str, Any],
+        trello_candidates: List[Dict[str, Any]],
+        *,
+        run_mode: str = "plan",
+    ) -> Dict[str, Any]:
+        product_filter = self._extract_user_assistant_product_filter(instruction)
+        flow_prompt = self._local_flow_operator_prompt(instruction, product_filter)
+        return {
+            "title": "Flow AI Operator",
+            "summary": (
+                "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, viết prompt cho Google Flow, "
+                "gửi Telegram duyệt và chỉ lưu ảnh đã duyệt về đúng card Trello."
+            ),
+            "intent": "trello_sheet_flow_telegram_automation",
+            "product_filter": product_filter,
+            "mode": "image",
+            "flow_prompt": flow_prompt,
+            "steps": self._flow_operator_steps(context, product_filter, trello_candidates),
+            "suggested_actions": self._flow_operator_actions(instruction, flow_prompt, product_filter, run_mode=run_mode),
+            "requires_confirmation": self._flow_operator_wants_run(instruction, run_mode),
+        }
+
+    def _gemini_flow_operator_request(
+        self,
+        instruction: str,
+        context_summary: str,
+        local_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        prompt_text = "\n".join(
+            [
+                "Bạn là Flow AI Operator trong app Flow v2.",
+                "Nhiệm vụ: biến yêu cầu người dùng thành kế hoạch automation có thể thao tác Google Flow.",
+                "Quy trình bắt buộc: Trello Ready for AI attachment -> Google Sheet prompt Active -> Google Flow tạo/chỉnh ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
+                "Bạn không được yêu cầu secret trong chat và không in API key/token/cookie.",
+                "Trả về duy nhất JSON object, không markdown.",
+                "Schema JSON:",
+                '{"title": str, "summary": str, "product_filter": str, "flow_prompt": str, "steps": [{"label": str, "detail": str, "status": str}], "safety_notes": [str]}',
+                "flow_prompt phải là prompt ảnh chi tiết có thể dán vào Google Flow, nhấn mạnh dùng selected Trello attachment/reference image và giữ đúng sản phẩm gốc.",
+                "steps dùng tiếng Việt rất dễ hiểu, tối đa 5 bước.",
+                "",
+                "Trạng thái app đã lọc secret:",
+                context_summary,
+                "",
+                "Yêu cầu người dùng:",
+                instruction,
+                "",
+                "Kế hoạch nội bộ để tham khảo:",
+                json.dumps(local_plan, ensure_ascii=False)[:2500],
+            ]
+        )
+        return {
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {
+                "temperature": 0.35,
+                "topP": 0.9,
+                "maxOutputTokens": 1400,
+            },
+        }
+
+    def _generate_flow_operator_plan_with_gemini(
+        self,
+        instruction: str,
+        context_summary: str,
+        local_plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Chưa cấu hình Gemini.")
+
+        model = self._gemini_model()
+        payload = self._gemini_flow_operator_request(instruction, context_summary, local_plan)
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(model, safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=self.GEMINI_TIMEOUT_S) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
+
+        text = self._extract_gemini_text(body)
+        parsed = self._parse_json_candidate(text)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini không trả về kế hoạch Flow AI hợp lệ.")
+        return parsed
+
+    def _normalize_flow_operator_plan(
+        self,
+        raw_plan: Dict[str, Any],
+        local_plan: Dict[str, Any],
+        instruction: str,
+        *,
+        run_mode: str = "plan",
+    ) -> Dict[str, Any]:
+        product_filter = str(raw_plan.get("product_filter") or local_plan.get("product_filter") or "").strip()
+        flow_prompt = self._clean_prompt_text(str(raw_plan.get("flow_prompt") or local_plan.get("flow_prompt") or ""))
+        if len(flow_prompt) < 160:
+            flow_prompt = str(local_plan.get("flow_prompt") or flow_prompt).strip()
+        raw_steps = raw_plan.get("steps") if isinstance(raw_plan.get("steps"), list) else local_plan.get("steps", [])
+        steps: List[Dict[str, Any]] = []
+        for item in raw_steps[:5]:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            detail = str(item.get("detail") or "").strip()
+            if not label and not detail:
+                continue
+            steps.append(
+                {
+                    "label": label or "Bước automation",
+                    "detail": detail,
+                    "status": str(item.get("status") or "sẵn sàng").strip()[:60],
+                }
+            )
+        if not steps:
+            steps = list(local_plan.get("steps") or [])
+        plan = {
+            **local_plan,
+            "title": str(raw_plan.get("title") or local_plan.get("title") or "Flow AI Operator").strip(),
+            "summary": str(raw_plan.get("summary") or local_plan.get("summary") or "").strip(),
+            "product_filter": product_filter,
+            "flow_prompt": flow_prompt,
+            "steps": steps,
+            "safety_notes": [str(item).strip() for item in raw_plan.get("safety_notes", [])[:4] if str(item).strip()]
+            if isinstance(raw_plan.get("safety_notes"), list)
+            else [],
+        }
+        plan["suggested_actions"] = self._flow_operator_actions(instruction, flow_prompt, product_filter, run_mode=run_mode)
+        plan["requires_confirmation"] = self._flow_operator_wants_run(instruction, run_mode)
+        return plan
+
+    async def plan_flow_operator(self, request: FlowOperatorRequest, *, use_gemini: bool = True) -> Dict[str, Any]:
+        instruction = re.sub(r"\s+", " ", str(request.instruction or "").strip())
+        if not instruction:
+            raise HTTPException(status_code=400, detail="Hãy nhập yêu cầu để Flow AI operator lập kế hoạch.")
+        instruction = instruction[:1000]
+        ui_context = re.sub(r"\s+", " ", str(request.context or "").strip())[: self.USER_ASSISTANT_CONTEXT_LIMIT]
+        run_mode = self._normalize_skill_token(str(request.run_mode or "plan")) or "plan"
+
+        context = self._user_assistant_context_snapshot()
+        product_filter = self._extract_user_assistant_product_filter(instruction)
+        trello_candidates: List[Dict[str, Any]] = []
+        trello_candidate_error = ""
+        trello_candidate_scan_attempted = bool(product_filter and context.get("trello", {}).get("configured"))
+        if trello_candidate_scan_attempted:
+            try:
+                trello_candidates = await asyncio.to_thread(self._user_assistant_trello_candidates, product_filter)
+            except Exception as exc:
+                trello_candidate_error = str(exc)[:180]
+        if trello_candidate_scan_attempted:
+            context["trello_candidate_scan"] = self._format_user_assistant_trello_candidate_context(trello_candidates, product_filter)
+        context_summary = self._format_user_assistant_context(context, ui_context)
+
+        local_plan = self._local_flow_operator_plan(instruction, context, trello_candidates, run_mode=run_mode)
+        plan = local_plan
+        engine = "local"
+        engine_label = "Nội bộ"
+        model = ""
+        fallback_reason = ""
+
+        if use_gemini and self._gemini_api_key():
+            model = self._gemini_model()
+            try:
+                raw_plan = await asyncio.to_thread(
+                    self._generate_flow_operator_plan_with_gemini,
+                    instruction,
+                    context_summary,
+                    local_plan,
+                )
+                plan = self._normalize_flow_operator_plan(raw_plan, local_plan, instruction, run_mode=run_mode)
+                engine = "gemini"
+                engine_label = "Gemini"
+            except Exception as exc:
+                fallback_reason = str(exc)[:180]
+                model = ""
+
+        return {
+            **plan,
+            "engine": engine,
+            "engine_label": engine_label,
+            "model": model,
+            "trello_candidates": trello_candidates,
+            "trello_candidates_error": trello_candidate_error,
+            "context_summary": context_summary,
+            "fallback_reason": fallback_reason,
+        }
+
     def _user_assistant_context_snapshot(self) -> Dict[str, Any]:
         snapshot = self.store.snapshot()
         config = self._normalized_config(snapshot.config)
@@ -2338,6 +2741,8 @@ class FlowWebService:
                 return value
 
         normalized = self._normalize_skill_token(raw)
+        tokens = set(self._tokenize_match_words(raw))
+        compact = self._compact_match_text(raw)
         common_products = (
             ("tshirt", "tshirt"),
             ("t_shirt", "t_shirt"),
@@ -2352,7 +2757,13 @@ class FlowWebService:
             ("hoops_with_photos", "hoops_with_photos"),
         )
         for token, value in common_products:
-            if token in normalized:
+            normalized_token = self._normalize_skill_token(token)
+            compact_token = normalized_token.replace("_", "")
+            if "_" in normalized_token:
+                matched = normalized_token in normalized or bool(compact_token and compact_token in compact)
+            else:
+                matched = normalized_token in tokens
+            if matched:
                 return value
         return ""
 
@@ -2382,6 +2793,16 @@ class FlowWebService:
         test_run = any(term in normalized for term in ("test", "thu", "kiem_tra", "demo", "mot_san_pham", "1_san_pham"))
         actions: List[Dict[str, Any]] = []
 
+        if self._flow_operator_requested(question):
+            actions.append(
+                {
+                    "label": "Lập kế hoạch Flow AI",
+                    "detail": "AI operator sẽ viết prompt, chọn nguồn Trello/Sheet và đưa các nút thao tác Flow theo đúng quy trình.",
+                    "action": "plan_flow_ai_operator",
+                    "payload": {"instruction": question},
+                    "requires_confirmation": False,
+                }
+            )
         if not flow.get("project_set") or not flow.get("authenticated"):
             actions.append(
                 {
@@ -2479,16 +2900,7 @@ class FlowWebService:
                 }
             )
 
-        unique: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for action in actions:
-            label = action.get("label", "")
-            action_key = f"{action.get('action', '')}:{label}"
-            if action_key in seen:
-                continue
-            seen.add(action_key)
-            unique.append(action)
-        return unique[:8]
+        return self._dedupe_assistant_actions(actions, limit=8)
 
     def _user_assistant_trello_candidates(self, query: str, limit: int = 8) -> List[Dict[str, Any]]:
         query = re.sub(r"\s+", " ", str(query or "").strip())
@@ -2752,7 +3164,14 @@ class FlowWebService:
         context_summary = self._format_user_assistant_context(context, ui_context="")
         parts: List[str] = []
 
-        if any(term in normalized for term in ("trello", "ready", "card", "list", "attachment", "anh", "nham")):
+        if self._flow_operator_requested(f"{question} {ui_context}"):
+            parts.append(
+                "Flow AI Operator là lớp AI trong app dùng để hiểu yêu cầu của chủ nhân, viết prompt cho Google Flow, mở đúng project Flow và sắp thứ tự các bước Trello -> Sheet -> Flow -> Telegram -> Trello."
+            )
+            parts.append(
+                "Nó không tự lấy secret từ chat. Khi cần tạo thật, app vẫn yêu cầu xác nhận trước khi chạy Auto Trello để tránh lấy nhầm card hoặc tạo hàng loạt ngoài ý muốn."
+            )
+        elif any(term in normalized for term in ("trello", "ready", "card", "list", "attachment", "anh", "nham")):
             parts.append(
                 "Luồng Trello chuẩn là: app chỉ quét list Ready for AI, lấy ảnh attachment nằm trên chính card đó, dùng prompt khớp trong Sheet để tạo ảnh bằng Flow, gửi Telegram duyệt, rồi upload ảnh đã duyệt về lại đúng card nguồn."
             )
@@ -2803,6 +3222,7 @@ class FlowWebService:
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
                 "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, lấy prompt từ Google Sheet, tạo/chỉnh ảnh bằng Google Flow, gửi Telegram duyệt, rồi lưu lại đúng card Trello.",
+                "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, viết prompt cho Google Flow và đưa các nút thao tác thật trong app.",
                 "Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list Ready for AI. Prompt nằm ở Google Sheet/CSV/paste, thường khớp bằng Product_Key/Product_Name/Card_URL.",
                 "Nếu người dùng yêu cầu app làm việc gì, hãy nói app sẽ dùng các nút hành động kèm theo câu trả lời; không bịa hành động ngoài khả năng hiện có.",
                 "Không yêu cầu người dùng dán secret vào chat. Không in API key, token, cookie hay biến môi trường.",
@@ -2867,6 +3287,9 @@ class FlowWebService:
 
     def _trim_user_assistant_answer(self, answer: str) -> str:
         text = re.sub(r"\n{3,}", "\n\n", str(answer or "").strip())
+        text = re.sub(r"(?i)^\s*draft\s*:\s*\*?\s*", "", text)
+        text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+        text = re.sub(r"(?m)^\s*[*-]\s+", "", text)
         if len(text) <= self.USER_ASSISTANT_ANSWER_LIMIT:
             return text
         clipped = text[: self.USER_ASSISTANT_ANSWER_LIMIT]
@@ -2905,6 +3328,27 @@ class FlowWebService:
             scan_attempted=trello_candidate_scan_attempted,
             query=product_filter,
         )
+        flow_operator_plan: Dict[str, Any] = {}
+        if self._flow_operator_requested(question):
+            try:
+                flow_operator_plan = await self.plan_flow_operator(
+                    FlowOperatorRequest(
+                        instruction=question,
+                        context=ui_context,
+                        run_mode="auto" if self._flow_operator_wants_run(question) else "plan",
+                    ),
+                    use_gemini=False,
+                )
+                plan_actions = flow_operator_plan.get("suggested_actions") if isinstance(flow_operator_plan, dict) else []
+                if isinstance(plan_actions, list):
+                    actions = self._dedupe_assistant_actions([*plan_actions, *actions], limit=10)
+            except Exception as exc:
+                flow_operator_plan = {
+                    "title": "Flow AI Operator",
+                    "summary": f"Chưa lập được kế hoạch operator: {str(exc)[:160]}",
+                    "steps": [],
+                    "suggested_actions": [],
+                }
 
         engine = "local"
         engine_label = "Nội bộ"
@@ -2939,6 +3383,7 @@ class FlowWebService:
             "engine_label": engine_label,
             "model": model,
             "suggested_actions": actions,
+            "flow_operator_plan": flow_operator_plan,
             "trello_candidates": trello_candidates,
             "trello_candidates_error": trello_candidate_error,
             "context_summary": context_summary,

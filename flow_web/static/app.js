@@ -2913,10 +2913,35 @@ function renderUserAssistant() {
   const actions = Array.isArray(last.suggested_actions) ? last.suggested_actions.filter(Boolean) : [];
   const executableActions = actions.filter((action) => action.action);
   const trelloCandidates = Array.isArray(last.trello_candidates) ? last.trello_candidates.filter(Boolean) : [];
+  const flowPlan = last.flow_operator_plan && typeof last.flow_operator_plan === "object" ? last.flow_operator_plan : null;
   const planButton = executableActions.length
     ? `<button type="button" class="secondary-button assistant-plan-button" data-assistant-action-plan ${
         state.userAssistant?.executing ? "disabled" : ""
       }>${state.userAssistant?.executing ? "Đang làm..." : "Làm theo kế hoạch"}</button>`
+    : "";
+  const flowPlanSteps = Array.isArray(flowPlan?.steps) ? flowPlan.steps.filter(Boolean).slice(0, 5) : [];
+  const flowPrompt = String(flowPlan?.flow_prompt || "").trim();
+  const flowPlanHtml = flowPlan
+    ? `<div class="assistant-flow-plan">
+        <div class="assistant-flow-plan-head">
+          <strong>${escapeHtml(flowPlan.title || "Flow AI Operator")}</strong>
+          <span>${escapeHtml(flowPlan.summary || "AI đã lập kế hoạch thao tác Flow.")}</span>
+        </div>
+        ${
+          flowPlanSteps.length
+            ? `<div class="assistant-flow-steps">${flowPlanSteps
+                .map(
+                  (step) => `<div class="assistant-flow-step">
+                    <strong>${escapeHtml(step.label || "Bước automation")}</strong>
+                    <span>${escapeHtml(step.detail || "")}</span>
+                    <em>${escapeHtml(step.status || "sẵn sàng")}</em>
+                  </div>`,
+                )
+                .join("")}</div>`
+            : ""
+        }
+        ${flowPrompt ? `<div class="assistant-flow-prompt">${escapeHtml(flowPrompt)}</div>` : ""}
+      </div>`
     : "";
   const candidateHtml = trelloCandidates.length
     ? `<div class="assistant-candidate-list">
@@ -2971,7 +2996,7 @@ function renderUserAssistant() {
         })
         .join("")}</div>`
     : "";
-  elements.userAssistantAnswer.innerHTML = `${paragraphs}${candidateHtml}${planButton}${actionHtml}`;
+  elements.userAssistantAnswer.innerHTML = `${paragraphs}${flowPlanHtml}${candidateHtml}${planButton}${actionHtml}`;
 }
 
 function renderStoryboardResult() {
@@ -4592,6 +4617,78 @@ async function askUserAssistant(questionOverride = "") {
   }
 }
 
+function mergeAssistantActions(...groups) {
+  const merged = [];
+  const seen = new Set();
+  groups.flat().filter(Boolean).forEach((action) => {
+    const payloadKey = action.payload ? JSON.stringify(action.payload).slice(0, 240) : "";
+    const key = `${action.action || ""}:${action.label || ""}:${payloadKey}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    merged.push(action);
+  });
+  return merged.slice(0, 10);
+}
+
+async function requestFlowAiOperatorPlan(instructionOverride = "") {
+  const instruction = String(
+    instructionOverride ||
+      elements.userAssistantQuestion?.value ||
+      state.userAssistant?.last?.flow_operator_plan?.instruction ||
+      "",
+  ).trim();
+  if (!instruction) {
+    showMessage("Nhập yêu cầu cho Flow AI Operator trước đã.", "error");
+    elements.userAssistantQuestion?.focus();
+    return null;
+  }
+  const payload = await api("/api/flow-ai/plan", {
+    method: "POST",
+    body: JSON.stringify({
+      instruction,
+      context: userAssistantContextSummary(),
+      run_mode: "plan",
+    }),
+  });
+  const previous = state.userAssistant.last || {};
+  state.userAssistant.last = {
+    ...previous,
+    answer:
+      previous.answer ||
+      "Flow AI Operator đã lập kế hoạch. Chủ nhân có thể bấm từng hành động hoặc dùng Làm theo kế hoạch.",
+    flow_operator_plan: payload,
+    suggested_actions: mergeAssistantActions(payload.suggested_actions || [], previous.suggested_actions || []),
+    trello_candidates: payload.trello_candidates || previous.trello_candidates || [],
+    engine: payload.engine || previous.engine,
+    engine_label: payload.engine_label || previous.engine_label,
+    model: payload.model || previous.model,
+  };
+  applyAssistantImmediateHints(state.userAssistant.last);
+  renderUserAssistant();
+  showMessage("Flow AI Operator đã sẵn sàng thao tác.", "success");
+  return payload;
+}
+
+function applyFlowAiPrompt(prompt) {
+  const text = String(prompt || "").trim();
+  if (!text) {
+    showMessage("Flow AI chưa có prompt để áp dụng.", "error");
+    return false;
+  }
+  applyGeneratedPromptToComposer(text);
+  if (elements.automationPromptInput) {
+    elements.automationPromptInput.value = text;
+  }
+  syncAutomationFromForm();
+  state.automation.prompt = text;
+  saveAutomationConfig(state.automation);
+  renderAll();
+  showMessage("Đã áp dụng prompt Flow AI vào luồng tạo ảnh.", "success");
+  return true;
+}
+
 function applyAssistantImmediateHints(payload) {
   const actions = Array.isArray(payload?.suggested_actions) ? payload.suggested_actions : [];
   const productAction = actions.find((action) => action?.action === "apply_product_filter" && action?.requires_confirmation !== true);
@@ -4685,6 +4782,10 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
       setAssistantProductFilter(action.payload?.value || "");
     } else if (actionName === "set_trello_card") {
       setAssistantTrelloCard(action.payload?.value || "");
+    } else if (actionName === "plan_flow_ai_operator") {
+      await requestFlowAiOperatorPlan(action.payload?.instruction || "");
+    } else if (actionName === "apply_flow_ai_prompt") {
+      applyFlowAiPrompt(action.payload?.prompt || state.userAssistant?.last?.flow_operator_plan?.flow_prompt || "");
     } else if (actionName === "preview_prompt_source") {
       await previewPromptSource();
     } else if (actionName === "sync_telegram_approvals") {
