@@ -1868,6 +1868,7 @@ class FlowWebService:
                     "notes": str(item.notes or "").strip(),
                     "trello_card_id": str(item.trello_card_id or "").strip(),
                     "trello_list_id": str(item.trello_list_id or "").strip(),
+                    "trello_attachment_ids": self._normalize_trello_attachment_ids(item.trello_attachment_ids),
                 }
             )
             if len(normalized) >= limit:
@@ -1951,7 +1952,7 @@ class FlowWebService:
         if discovery.get("board_id"):
             payload["trello_board_id"] = payload.get("trello_board_id") or str(discovery.get("board_id") or "")
         if discovery.get("list_id"):
-            payload["trello_list_id"] = payload.get("trello_list_id") or str(discovery.get("list_id") or "")
+            payload["trello_list_id"] = str(discovery.get("list_id") or "")
         return CreateJobRequest(**payload), expanded_items, discovery
 
     def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
@@ -1992,7 +1993,12 @@ class FlowWebService:
         rows = ",".join(str(item.get("row") or "") for item in items)
         prompt_keys = ",".join(str(item.get("product_key") or item.get("product") or "") for item in items)
         item_card_ids = ",".join(str(item.get("trello_card_id") or "") for item in items)
-        return "|".join([card_id, list_id, rows, prompt_keys, item_card_ids]).strip("|")
+        attachment_ids = ",".join(self._normalize_trello_attachment_ids(request.trello_attachment_ids))
+        item_attachment_ids = ",".join(
+            ",".join(self._normalize_trello_attachment_ids(item.get("trello_attachment_ids")))
+            for item in items
+        )
+        return "|".join([card_id, list_id, attachment_ids, rows, prompt_keys, item_card_ids, item_attachment_ids]).strip("|")
 
     def _active_prompt_batch_by_key(self, batch_key: str) -> JobRecord | None:
         if not batch_key:
@@ -2030,6 +2036,8 @@ class FlowWebService:
             payload["trello_card_id"] = str(item.get("trello_card_id") or "").strip()
         if item.get("trello_list_id"):
             payload["trello_list_id"] = str(item.get("trello_list_id") or "").strip()
+        if item.get("trello_attachment_ids"):
+            payload["trello_attachment_ids"] = self._normalize_trello_attachment_ids(item.get("trello_attachment_ids"))
         return CreateJobRequest(**payload)
 
     async def _patch_prompt_batch_result(
@@ -3136,14 +3144,14 @@ class FlowWebService:
             notice = (
                 f"Trello scan: app tìm thấy {len(ready)} card khớp '{query}' đang ở Ready for AI"
                 + (f": {ready_names}." if ready_names else ".")
-                + " Có thể bấm chọn card/ảnh đúng trước khi chạy để chắc chắn lấy đúng sản phẩm."
+                + " Hãy bấm đúng thumbnail ảnh để khóa chính xác attachment trước khi chạy."
             )
         else:
             first = candidates[0]
             notice = (
                 f"Trello scan: app tìm thấy card khớp '{query}' là {first.get('name') or first.get('short_link')} "
                 f"đang ở list {first.get('list_name') or 'khác'}. "
-                "Chủ nhân có thể bấm chọn card này ngay trong app; sau khi chọn, Auto Trello sẽ chạy đúng card đó mà không cần kéo list."
+                "Chủ nhân có thể bấm đúng thumbnail ảnh ngay trong app; sau khi chọn, Auto Trello sẽ dùng chính attachment đó mà không cần kéo list."
             )
         if notice in answer:
             return answer
@@ -3190,7 +3198,7 @@ class FlowWebService:
                         + ("đang ở Ready for AI." if in_ready else "app sẽ chạy trực tiếp card đã chọn, không tự lấy card khác.")
                     ),
                     "action": "set_trello_card",
-                    "payload": {"value": value},
+                    "payload": {"value": value, "list_id": item.get("list_id") or ""},
                     "requires_confirmation": False,
                 }
             )
@@ -5190,6 +5198,11 @@ exit 1
                 payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
             if settings.get("trelloList"):
                 payload["trello_list_id"] = str(settings.get("trelloList") or "").strip()
+            attachment_ids = self._normalize_trello_attachment_ids(
+                settings.get("trelloAttachmentIds") or settings.get("trelloAttachmentId") or []
+            )
+            if attachment_ids:
+                payload["trello_attachment_ids"] = attachment_ids
         return CreateJobRequest(**payload)
 
     async def _run_automation_post_modules(
@@ -5591,13 +5604,24 @@ exit 1
         except (TypeError, ValueError):
             limit = 1
         limit = max(1, min(4, limit))
+        selected_attachment_ids = self._normalize_trello_attachment_ids(
+            module_request.trello_attachment_ids or request.trello_attachment_ids
+        )
+        if selected_attachment_ids:
+            limit = min(4, max(limit, len(selected_attachment_ids)))
 
         await self._set_automation_module_status(
             job_id,
             request,
             module["id"],
             "running",
-            input_data={"board_id": board_id, "card_id": card_id, "list_id": list_id, "limit": limit},
+            input_data={
+                "board_id": board_id,
+                "card_id": card_id,
+                "list_id": list_id,
+                "limit": limit,
+                "attachment_ids": selected_attachment_ids,
+            },
         )
 
         if not card_id:
@@ -5640,7 +5664,15 @@ exit 1
                     f"Card Trello đã chọn không nằm trong cột {ready_name}; app đã dừng để tránh lấy nhầm ảnh từ cột khác."
                 )
 
-        paths = await asyncio.to_thread(self._download_trello_card_image_attachments, key, token, card_id, job_id, limit)
+        paths = await asyncio.to_thread(
+            self._download_trello_card_image_attachments,
+            key,
+            token,
+            card_id,
+            job_id,
+            limit,
+            selected_attachment_ids,
+        )
         if not paths:
             raise RuntimeError("Card Trello này chưa có attachment ảnh nào để làm ảnh tham chiếu.")
 
@@ -5673,11 +5705,13 @@ exit 1
                 "board_id": board_id,
                 "card_id": card_id,
                 "list_id": list_id,
+                "attachment_ids": selected_attachment_ids,
                 "reference_image_count": len(selected_paths),
                 "reference_image_names": [Path(path).name for path in selected_paths],
             },
         )
-        await self.store.append_log(job_id, f"Đã lấy {len(selected_paths)} ảnh gốc từ card Trello để đưa vào Flow.")
+        detail = "ảnh đã chọn" if selected_attachment_ids else "ảnh gốc"
+        await self.store.append_log(job_id, f"Đã lấy {len(selected_paths)} {detail} từ card Trello để đưa vào Flow.")
         return CreateJobRequest(**payload)
 
     async def _resume_automation_after_approval(self, job_id: str, approval_module_id: str) -> None:
@@ -6351,6 +6385,26 @@ exit 1
             raw = raw.split("/", 1)[0]
         return raw.strip()
 
+    def _normalize_trello_attachment_ids(self, values: Any) -> List[str]:
+        if values is None:
+            return []
+        raw_items: List[Any]
+        if isinstance(values, str):
+            raw_items = re.split(r"[\s,;]+", values)
+        elif isinstance(values, (list, tuple, set)):
+            raw_items = list(values)
+        else:
+            raw_items = [values]
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            attachment_id = self._normalize_trello_id(str(item or ""))
+            if not attachment_id or attachment_id in seen:
+                continue
+            seen.add(attachment_id)
+            normalized.append(attachment_id)
+        return normalized
+
     def _normalize_trello_board_id(self, value: str) -> str:
         raw = self._normalize_trello_id(value)
         if "/b/" in raw:
@@ -6425,6 +6479,7 @@ exit 1
         card_id: str,
         job_id: str,
         limit: int,
+        attachment_ids: List[str] | None = None,
     ) -> List[str]:
         payload = self._trello_get_json(
             f"cards/{quote(card_id, safe='')}/attachments",
@@ -6437,7 +6492,15 @@ exit 1
             item
             for item in attachments
             if self._trello_attachment_is_image(item)
-        ][: max(1, min(4, int(limit or 4)))]
+        ]
+        selected_ids = self._normalize_trello_attachment_ids(attachment_ids)
+        if selected_ids:
+            by_id = {self._normalize_trello_id(str(item.get("id") or "")): item for item in image_attachments}
+            selected_attachments = [by_id[item_id] for item_id in selected_ids if item_id in by_id]
+            if not selected_attachments:
+                raise RuntimeError("Ảnh Trello đã chọn không nằm trên card này hoặc không phải attachment ảnh.")
+            image_attachments = selected_attachments
+        image_attachments = image_attachments[: max(1, min(4, int(limit or 4)))]
         paths: List[str] = []
         for index, attachment in enumerate(image_attachments):
             data, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
@@ -6652,6 +6715,28 @@ exit 1
         card["_image_attachments"] = image_attachments
         return card
 
+    def _select_trello_card_attachments(
+        self,
+        card: Dict[str, Any],
+        attachment_ids: List[str],
+    ) -> bool:
+        selected_ids = self._normalize_trello_attachment_ids(attachment_ids)
+        if not selected_ids:
+            card["_selected_attachment_ids"] = []
+            return True
+        image_attachments = [
+            item
+            for item in card.get("_image_attachments") or []
+            if isinstance(item, dict) and self._trello_attachment_is_image(item)
+        ]
+        by_id = {self._normalize_trello_id(str(item.get("id") or "")): item for item in image_attachments}
+        selected = [by_id[item_id] for item_id in selected_ids if item_id in by_id]
+        if not selected:
+            return False
+        card["_image_attachments"] = selected
+        card["_selected_attachment_ids"] = [self._normalize_trello_id(str(item.get("id") or "")) for item in selected if str(item.get("id") or "").strip()]
+        return True
+
     def _default_trello_source_list_name(self) -> str:
         return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
 
@@ -6770,6 +6855,7 @@ exit 1
             or os.getenv("TRELLO_LIST_ID", "")
         )
         explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
+        selected_attachment_ids = self._normalize_trello_attachment_ids(request.trello_attachment_ids)
         list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
         if not list_id:
             if not explicit_card_id:
@@ -6784,6 +6870,11 @@ exit 1
                 raise RuntimeError(
                     "Card Trello đã chọn chưa có attachment ảnh hoặc app không đọc được card đó. "
                     "App đã dừng để tránh lấy nhầm ảnh từ card khác."
+                )
+            if selected_attachment_ids and not self._select_trello_card_attachments(selected_card, selected_attachment_ids):
+                raise RuntimeError(
+                    "Ảnh Trello đã chọn không nằm trên card đã chọn hoặc không phải attachment ảnh. "
+                    "App đã dừng để tránh dùng nhầm ảnh khác trong card."
                 )
             cards = [selected_card]
             card_list_id = self._normalize_trello_id(str(selected_card.get("idList") or ""))
@@ -7069,6 +7160,7 @@ exit 1
             card_list_id = self._normalize_trello_id(str(card.get("idList") or request.trello_list_id or ""))
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
+            selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             shots = self._flow_operator_shot_suite_for_trello_card(request, card)
             remaining = max_items - len(expanded)
@@ -7093,6 +7185,7 @@ exit 1
                         "notes": f"{design_analysis} Shot: {shot.get('label') or 'AI image'}. Google Sheet prompt not required.",
                         "trello_card_id": card_id,
                         "trello_list_id": card_list_id,
+                        "trello_attachment_ids": selected_attachment_ids,
                         "trello_card_name": card_name,
                         "trello_card_url": card_url,
                         "trello_match_mode": "ai_prompt",
@@ -7160,6 +7253,7 @@ exit 1
             if not card_id:
                 continue
             card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+            selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
             item = self._best_prompt_item_for_trello_keyword_card(card, items, used_pairs, query)
             if not item:
                 card_name = str(card.get("name") or card.get("url") or card_id).strip()
@@ -7173,6 +7267,7 @@ exit 1
                     **item,
                     "trello_card_id": card_id,
                     "trello_list_id": card_list_id,
+                    "trello_attachment_ids": selected_attachment_ids,
                     "trello_card_name": str(card.get("name") or "").strip(),
                     "trello_card_url": str(card.get("url") or "").strip(),
                     "trello_match_mode": "keyword",

@@ -437,6 +437,7 @@ function defaultAutomationConfig() {
     trelloBoardId: DEFAULT_TRELLO_BOARD_URL,
     trelloCardId: "",
     trelloListId: DEFAULT_TRELLO_SOURCE_LIST_ID,
+    trelloAttachmentIds: [],
     trelloSetCover: true,
     prompt: "",
     appEyebrow: "Flow v2",
@@ -474,6 +475,12 @@ function normalizeAutomationConfig(value = {}) {
     trelloBoardId,
     trelloCardId: String(parsed?.trelloCardId || ""),
     trelloListId,
+    trelloAttachmentIds: Array.isArray(parsed?.trelloAttachmentIds)
+      ? parsed.trelloAttachmentIds.map((item) => String(item || "").trim()).filter(Boolean)
+      : String(parsed?.trelloAttachmentIds || "")
+          .split(/[\s,;]+/)
+          .map((item) => item.trim())
+          .filter(Boolean),
     trelloSetCover: parsed?.trelloSetCover !== false,
     prompt: String(parsed?.prompt || ""),
     appEyebrow: String(parsed?.appEyebrow || fallback.appEyebrow),
@@ -2041,10 +2048,20 @@ function renderModuleSettings(module) {
         <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu chỉ muốn lấy card trong một list" />
       </label>
       <label class="field">
+        <span>Ảnh Trello đã chọn</span>
+        <input type="text" data-module-setting="trelloAttachmentIds" value="${escapeHtml(
+          Array.isArray(settings.trelloAttachmentIds)
+            ? settings.trelloAttachmentIds.join(", ")
+            : Array.isArray(state.automation.trelloAttachmentIds)
+              ? state.automation.trelloAttachmentIds.join(", ")
+              : "",
+        )}" placeholder="Attachment ID, bấm thumbnail trong trợ lý để tự điền" />
+      </label>
+      <label class="field">
         <span>Số ảnh lấy tối đa</span>
         <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 1)}" />
       </label>
-      <small>Batch từ sheet nên có Card lấy ảnh gốc hoặc cột Trello_Card/Card_URL. Nếu chỉ có board, app sẽ dừng để tránh lấy nhầm card đầu tiên.</small>
+      <small>Bấm đúng thumbnail trong trợ lý để khóa chính xác attachment ảnh. Nếu không chọn ảnh cụ thể, app sẽ lấy ảnh đầu tiên trong card.</small>
     `;
     return;
   }
@@ -2970,8 +2987,10 @@ function renderUserAssistant() {
                       const label = preview.name || `Ảnh ${index + 1}`;
                       return `<button type="button" class="assistant-candidate-thumb" data-assistant-card-value="${escapeHtml(
                         value,
+                      )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
+                        preview.id || "",
                       )}" ${state.userAssistant?.executing || !value ? "disabled" : ""} title="${escapeHtml(
-                        `Chọn ${candidate.name || "card Trello"}`,
+                        `Chọn đúng ảnh này trong ${candidate.name || "card Trello"}`,
                       )}">
                         <img src="${escapeHtml(src)}" alt="${escapeHtml(label)}" loading="lazy">
                       </button>`;
@@ -2983,13 +3002,16 @@ function renderUserAssistant() {
               value
                 ? `<button type="button" class="ghost-button card-button assistant-candidate-pin" data-assistant-card-value="${escapeHtml(
                     value,
-                  )}" ${state.userAssistant?.executing ? "disabled" : ""}>${inReady ? "Chọn" : "Chọn card này"}</button>`
+                  )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" ${
+                    state.userAssistant?.executing ? "disabled" : ""
+                  }>${inReady ? "Chọn card" : "Chọn card"}</button>`
                 : "";
             return `
               <div class="assistant-candidate-item" data-ready="${inReady ? "true" : "false"}">
                 <div class="assistant-candidate-main">
                   <strong>${escapeHtml(candidate.name || candidate.short_link || "Card Trello")}</strong>
                   <span>${escapeHtml(candidate.list_name || "Không rõ list")} · ${Number(candidate.image_count || 0)} ảnh · ${status}</span>
+                  ${previewHtml ? `<span>Bấm đúng thumbnail để dùng chính ảnh đó làm ảnh gốc.</span>` : ""}
                   ${previewHtml}
                   ${
                     candidate.url
@@ -4232,6 +4254,13 @@ function syncModuleSettingFromControl(control) {
     if (elements.automationTrelloListInput) {
       elements.automationTrelloListInput.value = state.automation.trelloListId;
     }
+  } else if (setting === "trelloAttachmentIds") {
+    const ids = String(value || "")
+      .split(/[\s,;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    state.automation.trelloAttachmentIds = ids;
+    module.settings[setting] = ids;
   } else if (setting === "trelloUploadMode") {
     state.trello.upload_mode = value || "file";
     if (elements.automationTrelloUploadMode) {
@@ -4331,6 +4360,11 @@ function automationImageJobPayload(prompt) {
     trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
     trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
     trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
+    trello_attachment_ids: trelloEnabled
+      ? Array.isArray(state.automation.trelloAttachmentIds)
+        ? state.automation.trelloAttachmentIds.filter(Boolean)
+        : []
+      : [],
     trello_set_cover: state.automation.trelloSetCover !== false,
     prompt_product: state.automation.promptProductFilter || "",
     prompt_product_key: state.automation.promptProductFilter || "",
@@ -4766,32 +4800,52 @@ function setAssistantProductFilter(value) {
   return true;
 }
 
-function setAssistantTrelloCard(value) {
+function setAssistantTrelloCard(value, options = {}) {
   const card = String(value || "").trim();
   if (!card) {
     showMessage("AI chưa nhận ra card Trello cần ghim.", "error");
     return false;
   }
+  const listId = String(options.listId || "").trim();
+  const attachmentId = String(options.attachmentId || "").trim();
   syncAutomationFromForm();
   state.automation.trelloCardId = card;
+  if (listId) {
+    state.automation.trelloListId = listId;
+  }
+  state.automation.trelloAttachmentIds = attachmentId ? [attachmentId] : [];
   state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
     if (!["trello_source", "trello"].includes(module.type)) {
       return module;
     }
+    const settings = {
+      ...(module.settings || {}),
+      trelloCard: card,
+      ...(listId ? { trelloList: listId } : {}),
+    };
+    if (attachmentId) {
+      settings.trelloAttachmentIds = [attachmentId];
+    } else {
+      delete settings.trelloAttachmentIds;
+      delete settings.trelloAttachmentId;
+    }
     return {
       ...module,
-      settings: {
-        ...(module.settings || {}),
-        trelloCard: card,
-      },
+      settings,
     };
   });
   if (elements.automationTrelloCardInput) {
     elements.automationTrelloCardInput.value = card;
   }
+  if (elements.automationTrelloListInput && listId) {
+    elements.automationTrelloListInput.value = listId;
+  }
   persistAutomationModules();
   renderAll();
-  showMessage(`AI đã ghim đúng card Trello "${card}".`, "success");
+  showMessage(
+    attachmentId ? `AI đã chọn đúng ảnh Trello "${attachmentId}" trong card "${card}".` : `AI đã ghim đúng card Trello "${card}".`,
+    "success",
+  );
   return true;
 }
 
@@ -4813,7 +4867,10 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
     if (actionName === "apply_product_filter") {
       setAssistantProductFilter(action.payload?.value || "");
     } else if (actionName === "set_trello_card") {
-      setAssistantTrelloCard(action.payload?.value || "");
+      setAssistantTrelloCard(action.payload?.value || "", {
+        listId: action.payload?.list_id || "",
+        attachmentId: action.payload?.attachment_id || "",
+      });
     } else if (actionName === "plan_flow_ai_operator") {
       await requestFlowAiOperatorPlan(action.payload?.instruction || "");
     } else if (actionName === "apply_flow_ai_prompt") {
@@ -5360,7 +5417,10 @@ elements.userAssistantQuickButtons.forEach((button) => {
 elements.userAssistantAnswer?.addEventListener("click", (event) => {
   const candidateButton = event.target.closest("[data-assistant-card-value]");
   if (candidateButton) {
-    setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "");
+    setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "", {
+      listId: candidateButton.dataset.assistantListId || "",
+      attachmentId: candidateButton.dataset.assistantAttachmentId || "",
+    });
     return;
   }
   const planButton = event.target.closest("[data-assistant-action-plan]");

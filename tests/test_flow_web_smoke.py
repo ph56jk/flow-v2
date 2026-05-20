@@ -555,6 +555,35 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual([], cards)
         get_json.assert_not_called()
 
+    def test_download_trello_card_image_attachments_uses_selected_attachment_only(self) -> None:
+        attachments = [
+            {"id": "att-wrong", "name": "wrong.png", "url": "https://trello.local/wrong.png", "mimeType": "image/png"},
+            {"id": "att-right", "name": "right.png", "url": "https://trello.local/right.png", "mimeType": "image/png"},
+        ]
+        downloaded: list[str] = []
+
+        def fake_download(key: str, token: str, card_id: str, attachment: dict) -> tuple[bytes, str]:
+            downloaded.append(str(attachment.get("id") or ""))
+            return b"image", "image/png"
+
+        with patch.object(self.service, "_trello_get_json", return_value=attachments), patch.object(
+            self.service,
+            "_trello_download_attachment_bytes",
+            side_effect=fake_download,
+        ):
+            paths = self.service._download_trello_card_image_attachments(
+                "key",
+                "token",
+                "card-1",
+                "job12345",
+                4,
+                ["att-right"],
+            )
+
+        self.assertEqual(["att-right"], downloaded)
+        self.assertEqual(1, len(paths))
+        self.assertTrue(Path(paths[0]).exists())
+
     def test_trello_matching_hint_defaults_to_ready_list(self) -> None:
         request = CreateJobRequest(type="image", prompt="", trello_board_id="https://trello.com/b/board123/demo")
         items = [{"product_key": "shirt", "product": "Shirt", "prompt": "prompt"}]
@@ -751,7 +780,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("Ideas", candidate["list_name"])
         self.assertFalse(candidate["in_ready_list"])
         self.assertEqual("/api/trello/cards/card-bear/attachments/att-bear/preview", candidate["image_previews"][0]["preview_url"])
-        self.assertIn("bấm chọn card này", result["answer"])
+        self.assertIn("bấm đúng thumbnail ảnh", result["answer"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertNotIn("run_auto_trello", action_names)
         self.assertIn("set_trello_card", action_names)
@@ -3427,6 +3456,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 trello_board_id="https://trello.com/b/board123/demo-board",
                 trello_card_id="outside-card",
+                trello_attachment_ids=["att-1"],
                 automation_graph={
                     "modules": [
                         {
@@ -3449,12 +3479,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             "shortLink": "outside",
             "url": "https://trello.com/c/outside",
             "idList": "ideas-list",
-            "_image_attachments": [{"id": "att-1", "name": "apron.png", "mimeType": "image/png"}],
+            "_image_attachments": [
+                {"id": "att-1", "name": "chosen-apron.png", "mimeType": "image/png"},
+                {"id": "att-2", "name": "wrong-apron.png", "mimeType": "image/png"},
+            ],
         }
-        seen: list[str] = []
+        seen: list[tuple[str, list[str]]] = []
 
         async def fake_run_flow_job(job_id, child_request):
-            seen.append(child_request.trello_card_id)
+            seen.append((child_request.trello_card_id, list(child_request.trello_attachment_ids)))
             await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
@@ -3494,8 +3527,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("completed", saved.status)
         self.assertEqual("ideas-list", saved.result["trello_source_hint"]["list_id"])
         self.assertEqual("outside-card", saved.input["items"][0]["trello_card_id"])
+        self.assertEqual(["att-1"], saved.input["items"][0]["trello_attachment_ids"])
         self.assertTrue(seen)
-        self.assertTrue(all(card_id == "outside-card" for card_id in seen))
+        self.assertTrue(all(card_id == "outside-card" and attachment_ids == ["att-1"] for card_id, attachment_ids in seen))
 
     async def test_auto_trello_ai_suite_for_apron_includes_hand_embroidery_shot(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

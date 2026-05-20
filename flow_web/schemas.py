@@ -331,6 +331,7 @@ class CreateJobRequest(BaseModel):
     trello_board_id: str = ""
     trello_card_id: str = ""
     trello_list_id: str = ""
+    trello_attachment_ids: List[str] = Field(default_factory=list)
     trello_set_cover: bool = True
     prompt_source_row: int = 0
     prompt_product: str = ""
@@ -357,6 +358,7 @@ class PromptBatchItemRequest(BaseModel):
     notes: str = ""
     trello_card_id: str = ""
     trello_list_id: str = ""
+    trello_attachment_ids: List[str] = Field(default_factory=list)
 
 
 class PromptBatchRequest(BaseModel):
