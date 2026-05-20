@@ -4694,7 +4694,7 @@ async function askUserAssistant(questionOverride = "") {
         context: userAssistantContextSummary(),
       }),
     });
-    state.userAssistant.last = payload;
+    state.userAssistant.last = { ...payload, question };
     applyAssistantImmediateHints(payload);
     renderUserAssistant();
     showMessage("Trợ lý đã trả lời.", "success");
@@ -4866,6 +4866,42 @@ function setAssistantTrelloCard(value, options = {}) {
   return true;
 }
 
+function assistantTextForBatchIntent() {
+  return String(
+    state.userAssistant?.last?.question ||
+      state.userAssistant?.last?.flow_operator_plan?.instruction ||
+      elements.userAssistantQuestion?.value ||
+      "",
+  ).trim();
+}
+
+function normalizedAssistantIntentText() {
+  return assistantTextForBatchIntent()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function assistantRequestedSingleTestRun() {
+  const text = normalizedAssistantIntentText();
+  if (!text) {
+    return false;
+  }
+  return (
+    /\b(test|thu|kiem tra|demo)\b/.test(text) ||
+    /\b(1|mot|one)\s+(anh|image|prompt|san pham|card)\b/.test(text)
+  );
+}
+
+function assistantPlanBatchLimit(actions = []) {
+  const runAction = actions.find((action) => action?.action === "run_auto_trello");
+  const explicitLimit = Number(runAction?.payload?.limit || 0);
+  if (Number.isFinite(explicitLimit) && explicitLimit > 0) {
+    return explicitLimit;
+  }
+  return assistantRequestedSingleTestRun() ? 1 : null;
+}
+
 async function executeUserAssistantAction(action, { skipConfirmation = false } = {}) {
   if (!action?.action || state.userAssistant.executing) {
     return;
@@ -4934,7 +4970,7 @@ async function executeUserAssistantPlan() {
   if (!hasRunAction && trelloCandidates.length) {
     if (state.automation?.trelloCardId && selectedAttachmentIds.length) {
       showMessage("Đã có ảnh Trello được chọn, app bắt đầu chạy Auto Trello cho đúng ảnh đó.", "success");
-      await submitAutomationImage({ autoTrello: true });
+      await submitAutomationImage({ autoTrello: true, batchLimit: assistantPlanBatchLimit(actions) });
       return;
     }
     showMessage("Hãy bấm đúng thumbnail ảnh Trello trước, rồi bấm Chạy ảnh đã chọn.", "error");

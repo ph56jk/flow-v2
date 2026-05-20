@@ -2767,6 +2767,11 @@ class FlowWebService:
             ("t_shirt", "t_shirt"),
             ("shirt", "shirt"),
             ("gau", "gấu"),
+            ("bup_be", "búp bê"),
+            ("bupbe", "búp bê"),
+            ("doll", "búp bê"),
+            ("baby_doll", "búp bê"),
+            ("bda", "búp bê"),
             ("ao_thun", "ao thun"),
             ("ao", "ao"),
             ("hoodie", "hoodie"),
@@ -6979,26 +6984,90 @@ exit 1
         }
         return expanded, discovery
 
-    def _flow_operator_design_analysis_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
+    def _flow_operator_card_product_signals(self, request: CreateJobRequest, card: Dict[str, Any]) -> Dict[str, Any]:
         card_name = str(card.get("name") or "").strip()
-        card_url = str(card.get("url") or "").strip()
         query = self._trello_auto_search_query(request)
-        user_instruction = str(request.prompt or "").strip()
         attachment_names = ", ".join(
             str(item.get("name") or "").strip()
             for item in (card.get("_image_attachments") or [])[:4]
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         )
-        raw = " ".join([card_name, query, user_instruction, attachment_names])
+        primary_raw = " ".join([card_name, query, attachment_names]).strip()
+        user_instruction = str(request.prompt or "").strip()
+        raw = primary_raw or user_instruction
         normalized = self._normalize_skill_token(raw)
         compact = self._compact_match_text(raw)
+        tokens = set(self._tokenize_match_words(raw))
+        is_child_shirt = (
+            ("ao" in tokens or "shirt" in tokens or "tshirt" in tokens or "tee" in tokens)
+            and (
+                bool({"tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"} & tokens)
+                or "treem" in compact
+            )
+        )
+        return {
+            "card_name": card_name,
+            "card_url": str(card.get("url") or "").strip(),
+            "query": query,
+            "attachment_names": attachment_names,
+            "normalized": normalized,
+            "compact": compact,
+            "is_apron": any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact,
+            "is_doll": any(term in normalized for term in ("bup_be", "bupbe", "doll", "baby_doll", "babydoll", "bda")),
+            "is_plush": any(term in normalized for term in ("gau_bong", "gaubong", "plush", "stuffed", "stuffed_animal", "teddy", "bear", "gau")),
+            "is_child_shirt": is_child_shirt,
+            "is_shirt": any(term in normalized for term in ("ao", "shirt", "tshirt", "tee")),
+            "is_embroidery": any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made")),
+            "is_baking": any(term in normalized for term in ("baking", "bakery", "kitchen", "nau_an", "lam_banh")),
+        }
+
+    def _flow_operator_relevant_user_instruction_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
+        instruction = re.sub(r"\s+", " ", str(request.prompt or "").strip())
+        if not instruction:
+            return ""
+        query = self._trello_auto_search_query(request)
+        if not query:
+            return instruction
+
+        instruction_normalized = self._normalize_skill_token(instruction)
+        instruction_compact = self._compact_match_text(instruction)
+        card_name = str(card.get("name") or "").strip()
+        candidates = [query, card_name, *self._trello_query_aliases(query)]
+        for candidate in candidates:
+            candidate = str(candidate or "").strip()
+            if not candidate:
+                continue
+            candidate_normalized = self._normalize_skill_token(candidate)
+            candidate_compact = self._compact_match_text(candidate)
+            if candidate_normalized and candidate_normalized in instruction_normalized:
+                return instruction
+            if candidate_compact and candidate_compact in instruction_compact:
+                return instruction
+
+        # Khi AI chạy theo thumbnail đã chọn, ô prompt có thể còn prompt cũ từ lần trước.
+        # Nếu prompt cũ không nhắc tới sản phẩm đang lọc, bỏ qua để tránh đổi sai loại hàng.
+        return ""
+
+    def _flow_operator_design_analysis_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
+        signals = self._flow_operator_card_product_signals(request, card)
+        card_name = str(signals.get("card_name") or "").strip()
+        card_url = str(signals.get("card_url") or "").strip()
+        attachment_names = str(signals.get("attachment_names") or "").strip()
 
         product_bits: List[str] = []
-        if any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact:
+        if signals.get("is_apron"):
             product_bits.append("apron silhouette, chest bib, waist tie, shoulder/neck straps, hem length, and fit")
-        if any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made")):
+        elif signals.get("is_doll"):
+            product_bits.append("doll body shape, face, hair/clothing/accessories, fabric texture, proportions, and collectible toy identity")
+        elif signals.get("is_plush"):
+            product_bits.append("plush toy silhouette, soft fabric pile, stitched seams, facial features, stuffing volume, and cuddly product scale")
+        elif signals.get("is_child_shirt"):
+            product_bits.append("children shirt silhouette, collar/sleeves/hem, print placement, fabric texture, size scale, and kid-safe styling")
+        elif signals.get("is_shirt"):
+            product_bits.append("shirt silhouette, front print placement, neckline, sleeves, fabric texture, fit, and apparel scale")
+        if signals.get("is_embroidery"):
             product_bits.append("hand-embroidered thread texture, stitch direction, raised thread, motif placement, and handmade craft cues")
-        if any(term in normalized for term in ("baking", "bakery", "kitchen", "nau_an", "lam_banh")):
+        if signals.get("is_baking"):
             product_bits.append("warm bakery/kitchen context, baking tools, flour, pastry props, and clean food-safe styling")
         if not product_bits:
             product_bits.append("product type, base color, material texture, print/embroidery details, silhouette, scale, and hero features")
@@ -7019,24 +7088,11 @@ exit 1
         request: CreateJobRequest,
         card: Dict[str, Any],
     ) -> List[Dict[str, str]]:
-        raw = " ".join(
-            [
-                str(card.get("name") or ""),
-                self._trello_auto_search_query(request),
-                str(request.prompt or ""),
-                " ".join(
-                    str(item.get("name") or "")
-                    for item in (card.get("_image_attachments") or [])[:4]
-                    if isinstance(item, dict)
-                ),
-            ]
-        )
-        normalized = self._normalize_skill_token(raw)
-        compact = self._compact_match_text(raw)
-        is_apron = any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact
-        is_embroidery = any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made"))
+        signals = self._flow_operator_card_product_signals(request, card)
+        is_apron = bool(signals.get("is_apron"))
+        is_embroidery = bool(signals.get("is_embroidery"))
 
-        if is_apron or is_embroidery:
+        if is_apron:
             return [
                 {
                     "label": "Hand embroidery detail",
@@ -7070,6 +7126,80 @@ exit 1
                     "label": "Gift artisan scene",
                     "brief": "Artisan gift-ready scene with the apron folded partly open beside embroidery thread, needle, linen ribbon, dried flowers or baking tools, communicating handmade premium quality.",
                     "must_include": "handmade craft props, premium gift presentation, apron embroidery visible",
+                },
+            ]
+
+        if signals.get("is_doll") or signals.get("is_plush"):
+            craft_detail = (
+                "Extreme macro close-up of the embroidered or hand-stitched detail on the selected doll/plush, showing thread fibers, seams, fabric pile, "
+                "raised stitching, and handmade irregularities; this shot must clearly prove the product craft quality."
+                if is_embroidery
+                else "Extreme close-up detail of the selected doll/plush material, seams, fabric pile, face, clothing/accessories, and handmade construction cues."
+            )
+            return [
+                {
+                    "label": "Craft detail proof",
+                    "brief": craft_detail,
+                    "must_include": "selected doll/plush reference design, close-up craft detail, fabric texture, seams or embroidery",
+                },
+                {
+                    "label": "Full collection hero",
+                    "brief": "Clean full product hero shot showing the entire doll/plush shape, face, clothing/accessories, color palette, scale, and main design feature.",
+                    "must_include": "full doll/plush product, exact source identity, clean commercial hero composition",
+                },
+                {
+                    "label": "Lifestyle nursery scene",
+                    "brief": "Warm lifestyle product photo in a nursery, playroom, child's bedroom, or gift setting where the doll/plush feels natural and premium.",
+                    "must_include": "doll/plush in use, soft child-friendly styling, realistic natural light",
+                },
+                {
+                    "label": "Angle and scale",
+                    "brief": "Three-quarter or side angle showing depth, soft volume, stitching, accessories, and realistic scale beside simple child-safe props.",
+                    "must_include": "alternate angle, depth, scale cue, construction details",
+                },
+                {
+                    "label": "Flat lay styling",
+                    "brief": "Overhead flat lay of the doll/plush arranged neatly on a light wooden or linen surface with tasteful toys, ribbon, name tag, or gift props.",
+                    "must_include": "flat lay, full product layout, tasteful toy/gift props",
+                },
+                {
+                    "label": "Gift ready scene",
+                    "brief": "Premium gift-ready scene with the doll/plush beside wrapping tissue, ribbon, small card, or keepsake box while preserving the source product identity.",
+                    "must_include": "premium gift presentation, doll/plush details visible, clean commercial finish",
+                },
+            ]
+
+        if signals.get("is_child_shirt") or signals.get("is_shirt"):
+            return [
+                {
+                    "label": "Print detail proof",
+                    "brief": "Close-up detail shot of the shirt print/embroidery, fabric weave, ink/thread texture, and edge finish without changing the selected design.",
+                    "must_include": "source shirt design, print or embroidery detail, visible fabric texture",
+                },
+                {
+                    "label": "Full front apparel hero",
+                    "brief": "Clean full-front apparel product hero showing the shirt shape, neckline, sleeves, hem, print placement, and color exactly from the reference.",
+                    "must_include": "full shirt front, exact source design, clean ecommerce composition",
+                },
+                {
+                    "label": "Lifestyle worn shot",
+                    "brief": "Realistic model/lifestyle image with the shirt worn naturally in a fitting setting while keeping the print/design visible and undistorted.",
+                    "must_include": "shirt worn naturally, design readable, realistic light",
+                },
+                {
+                    "label": "Folded product angle",
+                    "brief": "Alternate angle or folded product shot showing fabric thickness, sleeve/hem detail, and premium merchandising styling.",
+                    "must_include": "alternate angle, apparel construction, source design visible",
+                },
+                {
+                    "label": "Flat lay styling",
+                    "brief": "Overhead flat lay of the shirt arranged neatly with tasteful props matching the product theme.",
+                    "must_include": "flat lay, full shirt layout, editorial props",
+                },
+                {
+                    "label": "Gift ready scene",
+                    "brief": "Premium packaging or gift-ready apparel scene with folded shirt, tissue paper, tag, or box.",
+                    "must_include": "gift presentation, shirt details, clean commercial finish",
                 },
             ]
 
@@ -7117,7 +7247,7 @@ exit 1
         card_name = str(card.get("name") or "").strip()
         card_url = str(card.get("url") or "").strip()
         query = self._trello_auto_search_query(request)
-        user_instruction = str(request.prompt or "").strip()
+        user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         product_hint = query or card_name or f"card Trello {index + 1}"
         shot = shot or {}
         shot_label = str(shot.get("label") or f"Shot {index}").strip()
