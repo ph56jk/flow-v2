@@ -726,6 +726,20 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(run_action["payload"]["test_mode"])
         self.assertIn("chỉ chạy 1", run_action["detail"])
 
+    def test_user_assistant_sets_requested_auto_trello_batch_limit(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
+            result = asyncio.run(
+                self.service.answer_user_assistant(
+                    UserAssistantRequest(question="tạo 3 ảnh búp bê rồi chạy auto trello")
+                )
+            )
+
+        filter_action = next(action for action in result["suggested_actions"] if action.get("action") == "apply_product_filter")
+        self.assertEqual("búp bê", filter_action["payload"]["value"])
+        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_trello")
+        self.assertEqual(3, run_action["payload"]["limit"])
+        self.assertNotIn("test_mode", run_action["payload"])
+
     def test_user_assistant_can_pin_explicit_trello_card_url(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
             result = asyncio.run(
@@ -1075,6 +1089,11 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
     def test_user_assistant_extracts_doll_from_short_test_request(self) -> None:
         product = self.service._extract_user_assistant_product_filter("test một ảnh búp bê")
+
+        self.assertEqual("búp bê", product)
+
+    def test_user_assistant_extracts_product_after_numeric_batch_count(self) -> None:
+        product = self.service._extract_user_assistant_product_filter("tạo 3 ảnh búp bê rồi chạy auto")
 
         self.assertEqual("búp bê", product)
 
@@ -3766,7 +3785,98 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         combined = "\n".join([*seen_prompts, saved.input["items"][0]["design_analysis"]]).lower()
         self.assertIn("doll", combined)
-        self.assertNotIn("apron", combined)
+        self.assertNotIn("apron silhouette", combined)
+        self.assertNotIn("selected apron", combined)
+
+    async def test_auto_trello_does_not_match_short_alias_inside_attachment_urls(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="tạo ảnh búp bê",
+                count=1,
+                prompt_product="búp bê",
+                prompt_product_key="búp bê",
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=6,
+            auto_trello=True,
+            items=[],
+        )
+        cards = [
+            {
+                "id": "wrong-card",
+                "name": "WHA_11",
+                "shortLink": "wrong",
+                "url": "https://trello.com/c/wrong",
+                "idList": "ready-list",
+                "_image_attachments": [
+                    {
+                        "id": "att-wrong",
+                        "name": "Generated Image May 08.jpg",
+                        "url": "https://trello.local/random-bda-token.png",
+                        "mimeType": "image/png",
+                    }
+                ],
+            },
+            {
+                "id": "card-doll",
+                "name": "BDA_05",
+                "shortLink": "doll",
+                "url": "https://trello.com/c/doll",
+                "idList": "ready-list",
+                "_image_attachments": [{"id": "att-doll", "name": "front.jpg", "mimeType": "image/png"}],
+            },
+        ]
+        seen_cards: list[str] = []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_cards.append(child_request.trello_card_id)
+            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertTrue(seen_cards)
+        self.assertTrue(all(card_id == "card-doll" for card_id in seen_cards))
 
     async def test_auto_trello_prompt_batch_can_search_card_by_user_keyword(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

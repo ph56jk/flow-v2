@@ -4893,13 +4893,44 @@ function assistantRequestedSingleTestRun() {
   );
 }
 
+function assistantRequestedNumericBatchLimit() {
+  const text = normalizedAssistantIntentText();
+  if (!text) {
+    return null;
+  }
+  const numberMatch = text.match(/\b(\d{1,2})\s*(anh|image|prompt|card|san pham)\b/);
+  if (numberMatch) {
+    return Math.max(1, Math.min(6, Number(numberMatch[1] || 1)));
+  }
+  const words = {
+    mot: 1,
+    one: 1,
+    hai: 2,
+    two: 2,
+    ba: 3,
+    three: 3,
+    bon: 4,
+    four: 4,
+    nam: 5,
+    five: 5,
+    sau: 6,
+    six: 6,
+  };
+  for (const [word, value] of Object.entries(words)) {
+    if (new RegExp(`\\b${word}\\s*(anh|image|prompt|card|san pham)\\b`).test(text)) {
+      return value;
+    }
+  }
+  return assistantRequestedSingleTestRun() ? 1 : null;
+}
+
 function assistantPlanBatchLimit(actions = []) {
   const runAction = actions.find((action) => action?.action === "run_auto_trello");
   const explicitLimit = Number(runAction?.payload?.limit || 0);
   if (Number.isFinite(explicitLimit) && explicitLimit > 0) {
     return explicitLimit;
   }
-  return assistantRequestedSingleTestRun() ? 1 : null;
+  return assistantRequestedNumericBatchLimit();
 }
 
 async function executeUserAssistantAction(action, { skipConfirmation = false } = {}) {

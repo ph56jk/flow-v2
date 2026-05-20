@@ -2756,6 +2756,14 @@ class FlowWebService:
                 value,
                 flags=re.IGNORECASE,
             ).strip()
+            value = re.sub(
+                r"^(?:\d+|một|mot|hai|ba|bốn|bon|năm|nam|sáu|sau|bảy|bay|tám|tam|chín|chin|mười|muoi|one|two|three|four|five|six)\s*"
+                r"(?:ảnh|anh|image|prompt|card|sản phẩm|san pham)?\s+",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            ).strip()
+            value = re.sub(r"^(?:ảnh|anh|image|sản phẩm|san pham)\s+", "", value, flags=re.IGNORECASE).strip()
             if 2 <= len(value) <= 48:
                 return value
 
@@ -2791,6 +2799,44 @@ class FlowWebService:
                 return value
         return ""
 
+    def _extract_user_assistant_batch_limit(self, question: str) -> int | None:
+        raw = re.sub(r"\s+", " ", str(question or "").strip()).lower()
+        if not raw:
+            return None
+        normalized = self._strip_accents(raw)
+        number_words = {
+            "mot": 1,
+            "one": 1,
+            "hai": 2,
+            "two": 2,
+            "ba": 3,
+            "three": 3,
+            "bon": 4,
+            "four": 4,
+            "nam": 5,
+            "five": 5,
+            "sau": 6,
+            "six": 6,
+            "bay": 7,
+            "seven": 7,
+            "tam": 8,
+            "eight": 8,
+            "chin": 9,
+            "nine": 9,
+            "muoi": 10,
+            "ten": 10,
+        }
+        for match in re.finditer(r"\b(\d{1,2})\s*(?:anh|image|prompt|card|san pham)\b", normalized):
+            value = int(match.group(1))
+            if value > 0:
+                return max(1, min(self.AI_PROMPT_SUITE_SIZE, value))
+        for word, value in number_words.items():
+            if re.search(rf"\b{re.escape(word)}\s*(?:anh|image|prompt|card|san pham)\b", normalized):
+                return max(1, min(self.AI_PROMPT_SUITE_SIZE, value))
+        if any(term in normalized for term in ("test", "thu", "kiem tra", "demo", "mot san pham", "1 san pham", "mot card", "1 card")):
+            return 1
+        return None
+
     def _extract_user_assistant_trello_card_hint(self, question: str) -> str:
         raw = re.sub(r"\s+", " ", str(question or "").strip())
         if not raw:
@@ -2814,7 +2860,8 @@ class FlowWebService:
         telegram = context.get("telegram", {})
         product_filter = self._extract_user_assistant_product_filter(question)
         trello_card_hint = self._extract_user_assistant_trello_card_hint(question)
-        test_run = any(term in normalized for term in ("test", "thu", "kiem_tra", "demo", "mot_san_pham", "1_san_pham"))
+        requested_limit = self._extract_user_assistant_batch_limit(question)
+        test_run = requested_limit == 1 or any(term in normalized for term in ("test", "thu", "kiem_tra", "demo", "mot_san_pham", "1_san_pham"))
         actions: List[Dict[str, Any]] = []
 
         if self._flow_operator_requested(question):
@@ -2900,6 +2947,9 @@ class FlowWebService:
             )
 
         if any(term in normalized for term in ("auto", "chay", "tao", "lam", "run", "hang_loat", "bat_dau", "xu_ly")):
+            payload = {"limit": requested_limit} if requested_limit else {}
+            if test_run:
+                payload["test_mode"] = True
             actions.append(
                 {
                     "label": "Chạy Auto Trello",
@@ -2909,7 +2959,7 @@ class FlowWebService:
                         else "App sẽ quét card Ready for AI có ảnh, AI tự viết prompt, tạo/chỉnh bằng Flow rồi gửi Telegram duyệt."
                     ),
                     "action": "run_auto_trello",
-                    "payload": {"limit": 1, "test_mode": True} if test_run else {},
+                    "payload": payload,
                     "requires_confirmation": True,
                 }
             )
@@ -2972,15 +3022,15 @@ class FlowWebService:
             list_name: str,
         ) -> int:
             card_name_key = self._compact_match_text(card.get("name"))
+            searchable_values = (
+                card.get("name"),
+                card.get("desc"),
+                list_name,
+                " ".join(str(item.get("name") or "") for item in image_attachments),
+            )
             haystack_raw = " ".join(
                 str(value or "")
-                for value in (
-                    card.get("name"),
-                    card.get("desc"),
-                    card.get("url"),
-                    list_name,
-                    " ".join(str(item.get("name") or "") for item in image_attachments),
-                )
+                for value in searchable_values
             )
             card_text_key = self._compact_match_text(haystack_raw)
             haystack_tokens = set(self._tokenize_match_words(haystack_raw))
@@ -2998,7 +3048,9 @@ class FlowWebService:
                     match_score += 85
                 elif alias_key in card_name_key:
                     match_score += 70
-                elif alias_key in card_text_key:
+                elif len(alias_key) >= 4 and alias_key in card_text_key:
+                    match_score += 55
+                elif len(alias_key) < 4 and alias_key in haystack_tokens:
                     match_score += 55
             for group in query_groups:
                 if group and all(token in haystack_tokens for token in group):
@@ -7260,6 +7312,8 @@ exit 1
             f"Create or edit a commercial product image for {product_hint}.",
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity.",
             "Only change the scene, styling, lighting, composition, model/background, and presentation around the source product.",
+            "Do not change the source product into a different category; if the source is a doll or plush, it must remain a doll or plush, not an apron, shirt, mug, or unrelated object.",
+            "Analyze the visible product first, then create the requested commercial variation around that exact item.",
         ]
         if user_instruction:
             brief_parts.append(f"User automation instruction: {user_instruction}.")
@@ -7462,13 +7516,21 @@ exit 1
         haystack_values = [
             card.get("name"),
             card.get("desc"),
-            card.get("url"),
         ]
         for attachment in card.get("_image_attachments") or []:
             if isinstance(attachment, dict):
-                haystack_values.extend([attachment.get("name"), attachment.get("url")])
-        haystack = self._compact_match_text(" ".join(str(value or "") for value in haystack_values))
-        return any(alias in haystack or haystack in alias for alias in query_aliases)
+                haystack_values.append(attachment.get("name"))
+        haystack_raw = " ".join(str(value or "") for value in haystack_values)
+        haystack = self._compact_match_text(haystack_raw)
+        haystack_tokens = set(self._tokenize_match_words(haystack_raw))
+        for alias in query_aliases:
+            if len(alias) < 4:
+                if alias in haystack_tokens:
+                    return True
+                continue
+            if alias in haystack or haystack in alias:
+                return True
+        return False
 
     def _best_prompt_item_for_trello_keyword_card(
         self,
