@@ -625,6 +625,7 @@ const state = {
   promptAssistant: null,
   userAssistant: {
     busy: false,
+    executing: false,
     last: null,
   },
   promptSourcePreview: null,
@@ -2781,17 +2782,34 @@ function userAssistantContextSummary() {
   const config = state.config || {};
   const trello = state.trello || defaultTrelloState();
   const integrations = state.integrations || defaultIntegrationState();
-  const promptRows = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items.length : 0;
+  const promptItems = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
+  const promptRows = promptItems.length;
+  const activeRows = activePromptSourceItems({ limit: 500 }).length;
+  const sampleProducts = promptItems
+    .map((item) => item.product_key || item.product_name || item.product || item.notes)
+    .filter(Boolean)
+    .slice(0, 5)
+    .join(", ");
+  const enabledModules = normalizeAutomationModules(state.automation)
+    .filter((module) => module.enabled !== false)
+    .map((module) => module.type)
+    .join(" -> ");
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
   const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
   return [
+    "Quy trình chuẩn: Trello Ready for AI attachment -> Google Sheet prompt Active -> Google Flow tạo/chỉnh ảnh -> Telegram duyệt -> upload lại đúng card Trello",
+    "Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list Ready for AI",
     `Màn hình đang ở chế độ ${state.mode}`,
+    `Module bật: ${enabledModules || "chưa có"}`,
+    `Nguồn prompt ${state.automation.sourceType || "sheets"} tại ${state.automation.sourceLocation || "chưa đặt"}`,
+    `Bộ lọc sản phẩm ${state.automation.promptProductFilter || "chưa lọc"}`,
+    `Sản phẩm/prompt mẫu ${sampleProducts || "chưa preview"}`,
     `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
     `đăng nhập ${state.auth?.authenticated ? "đã có" : "chưa thấy"}`,
     `Trello ${trello.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
     `Telegram ${integrations.telegram?.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
     `Gemini ${integrations.gemini?.configured ? "đã bật" : "chưa bật"}`,
-    `prompt preview ${promptRows} dòng`,
+    `prompt preview ${promptRows} dòng, ${activeRows} dòng active sau lọc`,
     `${activeJobs} job đang chạy`,
     `${failedJobs} job lỗi`,
   ].join("; ");
@@ -2825,19 +2843,34 @@ function renderUserAssistant() {
     .map((line) => `<p>${escapeHtml(line)}</p>`)
     .join("");
   const actions = Array.isArray(last.suggested_actions) ? last.suggested_actions.filter(Boolean) : [];
+  const executableActions = actions.filter((action) => action.action);
+  const planButton = executableActions.length
+    ? `<button type="button" class="secondary-button assistant-plan-button" data-assistant-action-plan ${
+        state.userAssistant?.executing ? "disabled" : ""
+      }>${state.userAssistant?.executing ? "Đang làm..." : "Làm theo kế hoạch"}</button>`
+    : "";
   const actionHtml = actions.length
     ? `<div class="assistant-action-list">${actions
-        .map(
-          (action) => `
+        .map((action, index) => {
+          const canExecute = Boolean(action.action);
+          const button = canExecute
+            ? `<button type="button" class="ghost-button card-button assistant-action-button" data-assistant-action-index="${index}" ${
+                state.userAssistant?.executing ? "disabled" : ""
+              }>Thực hiện</button>`
+            : "";
+          return `
             <div class="assistant-action-item">
-              <strong>${escapeHtml(action.label || "Việc cần làm")}</strong>
-              <span>${escapeHtml(action.detail || "")}</span>
+              <div>
+                <strong>${escapeHtml(action.label || "Việc cần làm")}</strong>
+                <span>${escapeHtml(action.detail || "")}</span>
+              </div>
+              ${button}
             </div>
-          `
-        )
+          `;
+        })
         .join("")}</div>`
     : "";
-  elements.userAssistantAnswer.innerHTML = `${paragraphs}${actionHtml}`;
+  elements.userAssistantAnswer.innerHTML = `${paragraphs}${planButton}${actionHtml}`;
 }
 
 function renderStoryboardResult() {
@@ -3973,10 +4006,12 @@ async function previewPromptSource(file = null, { silent = false } = {}) {
     if (!silent) {
       showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi gửi Telegram duyệt.`, "success");
     }
+    return payload;
   } catch (error) {
     if (!silent) {
       showMessage(error.message, "error");
     }
+    return null;
   } finally {
     if (elements.automationSheetPreviewButton) {
       elements.automationSheetPreviewButton.disabled = false;
@@ -4443,6 +4478,106 @@ async function askUserAssistant(questionOverride = "") {
   } finally {
     state.userAssistant.busy = false;
     renderUserAssistant();
+  }
+}
+
+function setAssistantProductFilter(value) {
+  const filter = String(value || "").trim();
+  if (!filter) {
+    showMessage("AI chưa nhận ra tên sản phẩm để lọc.", "error");
+    return false;
+  }
+  syncAutomationFromForm();
+  state.automation.promptProductFilter = filter;
+  state.automation.sourceType = "sheets";
+  state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
+    if (module.type !== "source") {
+      return module;
+    }
+    return {
+      ...module,
+      settings: {
+        ...(module.settings || {}),
+        promptProductFilter: filter,
+      },
+    };
+  });
+  if (elements.automationProductFilterInput) {
+    elements.automationProductFilterInput.value = filter;
+  }
+  persistAutomationModules();
+  renderAll();
+  showMessage(`AI đã lọc sản phẩm theo "${filter}".`, "success");
+  return true;
+}
+
+async function executeUserAssistantAction(action, { skipConfirmation = false } = {}) {
+  if (!action?.action || state.userAssistant.executing) {
+    return;
+  }
+  const actionName = String(action.action || "");
+  if (action.requires_confirmation && !skipConfirmation) {
+    const ok = window.confirm(`${action.label || "Thực hiện hành động"}?\n\n${action.detail || ""}`);
+    if (!ok) {
+      return;
+    }
+  }
+
+  state.userAssistant.executing = true;
+  renderUserAssistant();
+  try {
+    if (actionName === "apply_product_filter") {
+      setAssistantProductFilter(action.payload?.value || "");
+    } else if (actionName === "preview_prompt_source") {
+      await previewPromptSource();
+    } else if (actionName === "sync_telegram_approvals") {
+      await syncTelegramApprovals();
+    } else if (actionName === "open_flow_project") {
+      await openFlowProjectSurface();
+    } else if (actionName === "select_trello_source") {
+      selectAutomationModuleByType("trello_source", { create: true });
+      showMessage("AI đã mở cục Trello Image Source để kiểm tra nguồn ảnh.", "success");
+    } else if (actionName === "run_auto_trello") {
+      if (!activePromptSourceItems({ limit: 500 }).length) {
+        await previewPromptSource(null, { silent: true });
+      }
+      await submitAutomationImage({ autoTrello: true });
+    } else {
+      showMessage("Hành động AI này chưa được app hỗ trợ.", "error");
+    }
+  } catch (error) {
+    showMessage(error.message || "AI chưa thực hiện được hành động này.", "error");
+  } finally {
+    state.userAssistant.executing = false;
+    renderUserAssistant();
+  }
+}
+
+async function executeUserAssistantPlan() {
+  const actions = Array.isArray(state.userAssistant?.last?.suggested_actions)
+    ? state.userAssistant.last.suggested_actions.filter((action) => action?.action)
+    : [];
+  if (!actions.length || state.userAssistant.executing) {
+    return;
+  }
+  const needsConfirmation = actions.some((action) => action.requires_confirmation);
+  if (needsConfirmation) {
+    const ok = window.confirm("AI sẽ thực hiện các bước có thể làm trong app. Nếu có bước chạy Auto Trello, app sẽ bắt đầu tạo/chỉnh ảnh bằng Flow. Tiếp tục?");
+    if (!ok) {
+      return;
+    }
+  }
+  const orderedActions = actions.slice().sort((left, right) => {
+    if (left.action === "run_auto_trello") {
+      return 1;
+    }
+    if (right.action === "run_auto_trello") {
+      return -1;
+    }
+    return 0;
+  });
+  for (const action of orderedActions) {
+    await executeUserAssistantAction(action, { skipConfirmation: true });
   }
 }
 
@@ -4931,6 +5066,20 @@ elements.userAssistantQuestion?.addEventListener("keydown", (event) => {
 });
 elements.userAssistantQuickButtons.forEach((button) => {
   button.addEventListener("click", () => askUserAssistant(button.dataset.assistantQuestion || ""));
+});
+elements.userAssistantAnswer?.addEventListener("click", (event) => {
+  const planButton = event.target.closest("[data-assistant-action-plan]");
+  if (planButton) {
+    void executeUserAssistantPlan();
+    return;
+  }
+  const actionButton = event.target.closest("[data-assistant-action-index]");
+  if (!actionButton) {
+    return;
+  }
+  const index = Number(actionButton.dataset.assistantActionIndex);
+  const action = state.userAssistant?.last?.suggested_actions?.[index];
+  void executeUserAssistantAction(action);
 });
 elements.automationEnvSaveButton?.addEventListener("click", () => saveIntegrationConfig());
 elements.automationEnvClearButton?.addEventListener("click", () => saveIntegrationConfig({ clearSecrets: true }));

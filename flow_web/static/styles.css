@@ -2390,13 +2390,28 @@ textarea:focus {
   gap: 8px;
 }
 
+.assistant-plan-button {
+  width: 100%;
+}
+
 .assistant-action-item {
   display: grid;
-  gap: 3px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
   padding: 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #ffffff;
+}
+
+.assistant-action-item > div {
+  display: grid;
+  gap: 3px;
+}
+
+.assistant-action-button {
+  min-width: 86px;
 }
 
 .assistant-action-item strong {

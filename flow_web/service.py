@@ -2277,6 +2277,13 @@ class FlowWebService:
                 "latest_failed_category": str(getattr(getattr(latest_failed, "error_snapshot", None), "category", "") or ""),
                 "latest_failed_title": str(getattr(getattr(latest_failed, "error_snapshot", None), "title", "") or "")[:140],
             },
+            "workflow": {
+                "product_source": "Trello card attachment trong list Ready for AI",
+                "prompt_source": "Google Sheet/CSV/pasted table với Active=TRUE",
+                "flow_step": "Google Flow dùng ảnh nguồn từ đúng card và prompt khớp để tạo/chỉnh ảnh",
+                "approval_step": "Telegram gửi ảnh để người dùng duyệt",
+                "archive_step": "Ảnh được duyệt upload lại đúng Trello card nguồn",
+            },
         }
 
     def _format_user_assistant_context(self, context: Dict[str, Any], ui_context: str = "") -> str:
@@ -2286,6 +2293,8 @@ class FlowWebService:
         gemini = context.get("gemini", {})
         jobs = context.get("jobs", {})
         lines = [
+            "Quy trình chuẩn: Trello Ready for AI card attachment -> Sheet prompt Active -> Google Flow tạo/chỉnh ảnh -> Telegram duyệt -> upload lại đúng card Trello.",
+            "Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list Ready for AI; prompt lấy từ Google Sheet/CSV/paste, lọc bằng Product_Key/Product_Name/Card_URL nếu có.",
             f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, workflow {'đã chọn' if flow.get('workflow_set') else 'chưa chọn'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}.",
             f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
             f"Telegram: {'đã cấu hình duyệt' if telegram.get('configured') else 'chưa đủ bot/chat để duyệt'}.",
@@ -2297,18 +2306,57 @@ class FlowWebService:
             lines.append(f"Ngữ cảnh UI: {cleaned_ui_context[: self.USER_ASSISTANT_CONTEXT_LIMIT]}")
         return "\n".join(lines)
 
-    def _user_assistant_suggested_actions(self, question: str, context: Dict[str, Any]) -> List[Dict[str, str]]:
+    def _extract_user_assistant_product_filter(self, question: str) -> str:
+        raw = re.sub(r"\s+", " ", str(question or "").strip())
+        if not raw:
+            return ""
+
+        patterns = [
+            r"(?:product[_\s-]*key|product|sản phẩm|san pham|lọc|loc)\s*(?:là|la|=|:)?\s*([a-zA-Z0-9_ -]{2,48})",
+            r"(?:tạo|tao|chạy|chay|làm|lam)\s+(?:ảnh|anh)?\s*(?:cho|sản phẩm|san pham)?\s*([a-zA-Z0-9_ -]{2,48})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, raw, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;\"'")
+            value = re.sub(r"\b(?:rồi|roi|xong|nhé|nhe|giúp|giup|đi|di|auto|trello|flow|telegram|sheet)\b.*$", "", value, flags=re.IGNORECASE).strip()
+            if 2 <= len(value) <= 48:
+                return value
+
+        normalized = self._normalize_skill_token(raw)
+        common_products = (
+            ("tshirt", "tshirt"),
+            ("t_shirt", "t_shirt"),
+            ("shirt", "shirt"),
+            ("ao_thun", "ao thun"),
+            ("ao", "ao"),
+            ("hoodie", "hoodie"),
+            ("mug", "mug"),
+            ("tote", "tote"),
+            ("wedding_hoop", "wedding_hoop"),
+            ("hoops_with_photos", "hoops_with_photos"),
+        )
+        for token, value in common_products:
+            if token in normalized:
+                return value
+        return ""
+
+    def _user_assistant_suggested_actions(self, question: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         normalized = self._normalize_skill_token(question)
         flow = context.get("flow", {})
         trello = context.get("trello", {})
         telegram = context.get("telegram", {})
-        actions: List[Dict[str, str]] = []
+        product_filter = self._extract_user_assistant_product_filter(question)
+        actions: List[Dict[str, Any]] = []
 
         if not flow.get("project_set") or not flow.get("authenticated"):
             actions.append(
                 {
                     "label": "Kiểm tra Flow",
                     "detail": "Lưu project Flow rồi đăng nhập Google Flow một lần trước khi chạy auto.",
+                    "action": "open_flow_project",
+                    "requires_confirmation": False,
                 }
             )
         if not trello.get("credentials_saved") or not trello.get("board_id_set"):
@@ -2326,11 +2374,23 @@ class FlowWebService:
                 }
             )
 
+        if product_filter:
+            actions.append(
+                {
+                    "label": f"Lọc sản phẩm: {product_filter}",
+                    "detail": "Điền bộ lọc này vào Prompt source để app chỉ chạy prompt khớp sản phẩm/card đó.",
+                    "action": "apply_product_filter",
+                    "payload": {"value": product_filter},
+                    "requires_confirmation": False,
+                }
+            )
         if any(term in normalized for term in ("trello", "ready", "card", "list", "anh", "nham")):
             actions.append(
                 {
                     "label": "Soát Ready for AI",
                     "detail": "Chỉ để card cần chạy trong list Ready for AI; ảnh nguồn phải nằm trong attachment của chính card đó.",
+                    "action": "select_trello_source",
+                    "requires_confirmation": False,
                 }
             )
         if any(term in normalized for term in ("sheet", "prompt", "active", "product", "loc")):
@@ -2338,6 +2398,8 @@ class FlowWebService:
                 {
                     "label": "Soát prompt sheet",
                     "detail": "Prompt cần Active=TRUE và khớp Product_Key/Product_Name hoặc có Trello_Card/Card_URL rõ ràng.",
+                    "action": "preview_prompt_source",
+                    "requires_confirmation": False,
                 }
             )
         if any(term in normalized for term in ("duyet", "telegram", "approve", "chap_thuan")):
@@ -2345,6 +2407,18 @@ class FlowWebService:
                 {
                     "label": "Đồng bộ duyệt",
                     "detail": "Sau khi bấm duyệt trên Telegram, app sẽ đồng bộ approval rồi upload ảnh đã duyệt về đúng card Trello.",
+                    "action": "sync_telegram_approvals",
+                    "requires_confirmation": False,
+                }
+            )
+
+        if any(term in normalized for term in ("auto", "chay", "tao", "lam", "run", "hang_loat", "bat_dau", "xu_ly")):
+            actions.append(
+                {
+                    "label": "Chạy Auto Trello",
+                    "detail": "App sẽ quét card Ready for AI có ảnh, lấy prompt khớp từ sheet, tạo/chỉnh bằng Flow rồi gửi Telegram duyệt.",
+                    "action": "run_auto_trello",
+                    "requires_confirmation": True,
                 }
             )
 
@@ -2353,18 +2427,21 @@ class FlowWebService:
                 {
                     "label": "Chạy Auto Trello",
                     "detail": "Khi Flow, Trello, Sheet và Telegram đều sẵn sàng, bấm Auto Trello để app tự tìm card và chạy hàng loạt.",
+                    "action": "run_auto_trello",
+                    "requires_confirmation": True,
                 }
             )
 
-        unique: List[Dict[str, str]] = []
+        unique: List[Dict[str, Any]] = []
         seen: set[str] = set()
         for action in actions:
             label = action.get("label", "")
-            if label in seen:
+            action_key = f"{action.get('action', '')}:{label}"
+            if action_key in seen:
                 continue
-            seen.add(label)
+            seen.add(action_key)
             unique.append(action)
-        return unique[:4]
+        return unique[:8]
 
     def _local_user_assistant_reply(self, question: str, context: Dict[str, Any], ui_context: str = "") -> str:
         normalized = self._normalize_skill_token(f"{question} {ui_context}")
@@ -2408,7 +2485,7 @@ class FlowWebService:
             )
         else:
             parts.append(
-                "Mình có thể hỗ trợ ngay trong app về Trello, Google Sheet, Google Flow, Telegram duyệt, lỗi vòng lặp và cách chạy hàng loạt."
+                "Mình có thể hỗ trợ ngay trong app về Trello, Google Sheet, Google Flow, Telegram duyệt, lỗi vòng lặp và cách chạy hàng loạt. Với những việc app đã có nút sẵn, trợ lý sẽ đưa nút thực thi để làm luôn trong giao diện."
             )
             parts.append(
                 "Để chạy đúng luồng, cần có card ở Ready for AI, ảnh attachment trên card, prompt Active trong Sheet, Flow đã đăng nhập, Telegram bot đã lưu, rồi bấm Auto Trello."
@@ -2422,6 +2499,8 @@ class FlowWebService:
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
                 "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, lấy prompt từ Google Sheet, tạo/chỉnh ảnh bằng Google Flow, gửi Telegram duyệt, rồi lưu lại đúng card Trello.",
+                "Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list Ready for AI. Prompt nằm ở Google Sheet/CSV/paste, thường khớp bằng Product_Key/Product_Name/Card_URL.",
+                "Nếu người dùng yêu cầu app làm việc gì, hãy nói app sẽ dùng các nút hành động kèm theo câu trả lời; không bịa hành động ngoài khả năng hiện có.",
                 "Không yêu cầu người dùng dán secret vào chat. Không in API key, token, cookie hay biến môi trường.",
                 "Trả lời ngắn, thực dụng, ưu tiên các bước người dùng bấm được trong giao diện.",
                 "Nếu người dùng hỏi lỗi lấy nhầm ảnh, nhấn mạnh Ready for AI và attachment phải nằm trên chính card nguồn.",
