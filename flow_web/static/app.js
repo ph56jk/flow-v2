@@ -29,9 +29,9 @@ let promptSourceAutoPreviewStarted = false;
 let automationSubmitInFlight = false;
 const AUTOMATION_MODULE_TYPE_CONFIG = {
   source: {
-    label: "Prompt source",
-    title: "Prompt Source",
-    detail: "Google Sheet / file / nhập tay",
+    label: "AI prompt",
+    title: "AI Prompt Source",
+    detail: "AI tự viết / Sheet tùy chọn",
     icon: "T",
     iconClass: "node-icon-trello",
   },
@@ -382,12 +382,18 @@ function normalizeAutomationModule(value = {}, index = 0) {
   const fallback = createAutomationModule(type, {
     id: value.id || `module_${index + 1}`,
   });
+  const title = type === "source" && String(value.title || "").trim() === "Prompt Source"
+    ? fallback.title
+    : String(value.title || fallback.title);
+  const detail = type === "source" && String(value.detail || "").trim() === "Google Sheet / file / nhập tay"
+    ? fallback.detail
+    : String(value.detail || fallback.detail);
   return createAutomationModule(type, {
     ...fallback,
     ...value,
     id: String(value.id || fallback.id),
-    title: String(value.title || fallback.title),
-    detail: String(value.detail || fallback.detail),
+    title,
+    detail,
     icon: String(value.icon || fallback.icon),
     enabled: value.enabled !== false,
     settings: value.settings && typeof value.settings === "object" ? value.settings : {},
@@ -435,7 +441,7 @@ function defaultAutomationConfig() {
     prompt: "",
     appEyebrow: "Flow v2",
     appTitle: "Flow v2",
-    appSubtitle: "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.",
+    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, AI tự viết prompt, Flow tạo ảnh và Telegram duyệt.",
     accentColor: "#7c2ee6",
     canvasZoom: 1,
     modules,
@@ -1719,13 +1725,13 @@ function automationStepTone(module, stats) {
   }
   const stepKey = module.type || module.id;
   if (stepKey === "source") {
-    return state.automation.prompt.trim() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
+    return state.automation.prompt.trim() || shouldAutoDiscoverTrello() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
   }
   if (stepKey === "trello_source") {
     return trelloSourceIsReady(module) ? "ready" : "blocked";
   }
   if (stepKey === "normalize") {
-    return state.automation.prompt.trim() ? "done" : "pending";
+    return state.automation.prompt.trim() || shouldAutoDiscoverTrello() ? "done" : "pending";
   }
   if (stepKey === "flow") {
     if (!state.config?.project_id || !state.auth?.authenticated) {
@@ -2352,12 +2358,13 @@ function productFilterMatches(values, filter) {
 }
 
 function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 500 })) {
-  if (!automationModuleEnabled("trello_source") || state.automation.sourceType !== "sheets" || !batchItems.length) {
+  if (!automationModuleEnabled("trello_source")) {
     return false;
   }
-  const fixedCard = String(state.automation.trelloCardId || state.trello?.card_id || "").trim();
   const board = String(state.automation.trelloBoardId || state.trello?.board_id || "").trim();
-  return Boolean(board && !fixedCard);
+  const sourceType = String(state.automation.sourceType || "sheets");
+  const hasPrompt = Boolean(String(state.automation.prompt || "").trim());
+  return Boolean(board && (sourceType === "sheets" || sourceType === "trello" || batchItems.length || !hasPrompt));
 }
 
 function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
@@ -2369,7 +2376,7 @@ function renderEasyPanel(stats) {
   const autoTrelloReady = shouldAutoDiscoverTrello(batchItems);
   const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoTrelloReady });
   const displayedBatchCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : batchItems.length;
-  const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0;
+  const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0 || autoTrelloReady;
   const projectReady = Boolean(state.config?.project_id);
   const flowModuleReady = automationModuleEnabled("flow");
   const flowReady = flowModuleReady && projectReady && Boolean(state.auth?.authenticated);
@@ -2382,7 +2389,9 @@ function renderEasyPanel(stats) {
   );
 
   if (elements.easyPromptStatus) {
-    elements.easyPromptStatus.textContent = batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Dán sheet hoặc nhập tay";
+    elements.easyPromptStatus.textContent = autoTrelloReady && !batchItems.length
+      ? "AI tự viết prompt"
+      : batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Nhập yêu cầu hoặc Auto Trello";
   }
   if (elements.easyFlowStatus) {
     elements.easyFlowStatus.textContent = flowReady ? "Đã sẵn sàng" : !flowModuleReady ? "Thiếu cục Flow" : projectReady ? "Cần đăng nhập" : "Cần project";
@@ -2404,12 +2413,12 @@ function renderEasyPanel(stats) {
   }
   if (elements.automationRunImageButton) {
     elements.automationRunImageButton.textContent = autoTrelloReady
-      ? `Auto ${displayedBatchCount} prompt`
+      ? (displayedBatchCount ? `Auto ${displayedBatchCount} prompt` : "Auto AI từ Trello")
       : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
   }
   if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.textContent = autoTrelloReady ? "Auto Trello" : "Auto Trello";
-    elements.automationAutoRunButton.disabled = stats.active.length > 0 || !batchItems.length;
+    elements.automationAutoRunButton.textContent = autoTrelloReady && !batchItems.length ? "Auto AI Trello" : "Auto Trello";
+    elements.automationAutoRunButton.disabled = stats.active.length > 0 || !automationModuleEnabled("trello_source");
   }
   if (elements.automationRunButton) {
     elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
@@ -2865,11 +2874,11 @@ function userAssistantContextSummary() {
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
   const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
   return [
-    "Quy trình chuẩn: Trello Ready for AI attachment -> Google Sheet prompt Active -> Google Flow tạo/chỉnh ảnh -> Telegram duyệt -> upload lại đúng card Trello",
+    "Quy trình chuẩn: Trello Ready for AI attachment -> Flow AI Operator tự viết prompt -> Google Flow tạo/chỉnh ảnh -> Telegram duyệt -> upload lại đúng card Trello",
     "Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list Ready for AI",
     `Màn hình đang ở chế độ ${state.mode}`,
     `Module bật: ${enabledModules || "chưa có"}`,
-    `Nguồn prompt ${state.automation.sourceType || "sheets"} tại ${state.automation.sourceLocation || "chưa đặt"}`,
+    `Nguồn prompt ${state.automation.sourceType || "ai"} tại ${state.automation.sourceLocation || "AI tự viết, Sheet tùy chọn"}`,
     `Bộ lọc sản phẩm ${state.automation.promptProductFilter || "chưa lọc"}`,
     `Sản phẩm/prompt mẫu ${sampleProducts || "chưa preview"}`,
     `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
@@ -4318,6 +4327,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
   const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
   const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
+  const aiWillWritePrompt = Boolean(autoDiscoverTrello && !prompt);
   if (!state.config?.project_id) {
     state.setupOpen = true;
     renderTopbar();
@@ -4330,11 +4340,11 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     showMessage("Hãy đăng nhập Google Flow trước khi automation tạo ảnh.", "error");
     return;
   }
-  if (!prompt) {
+  if (!prompt && !aiWillWritePrompt) {
     showMessage(
       trelloSearchQuery
-        ? `Sheet chưa có prompt active khớp bộ lọc "${trelloSearchQuery}". App đã dừng để không lấy nhầm prompt.`
-        : "Hãy dán prompt hoặc để nguồn prompt lấy được dữ liệu trước khi chạy.",
+        ? `Chưa có prompt nhập tay. Có thể bấm Auto Trello để AI tự viết prompt cho "${trelloSearchQuery}".`
+        : "Hãy nhập yêu cầu ngắn, hoặc bấm Auto Trello để AI tự viết prompt từ card có ảnh.",
       "error",
     );
     elements.automationPromptInput.focus();
@@ -4353,7 +4363,9 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
 
   const payload = automationImageJobPayload(prompt);
   const resolvedBatchLimit = Math.max(1, Math.min(40, Number(batchLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)));
-  const queuedCount = batchItems.length > 1 || autoDiscoverTrello ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
+  const queuedCount = autoDiscoverTrello
+    ? (batchItems.length ? Math.min(batchItems.length, resolvedBatchLimit) : resolvedBatchLimit)
+    : batchItems.length > 1 ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
 
   automationSubmitInFlight = true;
   elements.automationRunButton.disabled = true;
@@ -4391,7 +4403,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     saveAutomationConfig(state.automation);
     showMessage(
       autoDiscoverTrello
-        ? `Đã xếp hàng auto Trello. App sẽ quét card có ảnh, lấy prompt khớp trong sheet, tạo tối đa ${queuedCount} ảnh rồi gửi Telegram duyệt.`
+        ? `Đã xếp hàng auto Trello. App sẽ quét card có ảnh, AI tự viết prompt, tạo tối đa ${queuedCount} ảnh rồi gửi Telegram duyệt.`
         : batchItems.length > 1
         ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi gửi Telegram để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, luồng sẽ dừng ở bước duyệt Telegram/log để chủ nhân xử lý.",
@@ -4796,7 +4808,7 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
       selectAutomationModuleByType("trello_source", { create: true });
       showMessage("AI đã mở cục Trello Image Source để kiểm tra nguồn ảnh.", "success");
     } else if (actionName === "run_auto_trello") {
-      if (!activePromptSourceItems({ limit: 500 }).length) {
+      if (state.automation.sourceType === "sheets" && String(state.automation.sourceLocation || "").trim() && !activePromptSourceItems({ limit: 500 }).length) {
         await previewPromptSource(null, { silent: true });
       }
       await submitAutomationImage({ autoTrello: true, batchLimit: action.payload?.limit || null });

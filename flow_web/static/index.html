@@ -11,7 +11,7 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260520e" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260520f" />
   </head>
   <body class="flow-dashboard">
     <div class="app-shell">
@@ -220,7 +220,7 @@
             </div>
             <div class="assistant-quick-row">
               <button type="button" class="ghost-button card-button" data-assistant-question="Vì sao app lấy nhầm ảnh Trello?">Trello</button>
-              <button type="button" class="ghost-button card-button" data-assistant-question="Sheet prompt cần điền như nào để khớp card?">Sheet</button>
+              <button type="button" class="ghost-button card-button" data-assistant-question="Sheet prompt còn cần không hay AI tự viết prompt?">Sheet</button>
               <button type="button" class="ghost-button card-button" data-assistant-question="Duyệt Telegram xong app lưu lại Trello ra sao?">Telegram</button>
               <button type="button" class="ghost-button card-button" data-assistant-question="Dùng Flow AI Operator để tự động lấy ảnh Trello, viết prompt Flow, gửi Telegram duyệt và lưu lại Trello.">Flow AI</button>
             </div>
@@ -240,23 +240,23 @@
 
           <section class="inspector-section" id="automationPromptSourceSection">
             <div class="inspector-head">
-              <p class="eyebrow">Prompt source</p>
-              <span class="status-pill" id="automationSheetStatus">Chưa lấy</span>
+              <p class="eyebrow">AI prompt source</p>
+              <span class="status-pill" id="automationSheetStatus">Tùy chọn</span>
             </div>
             <label class="field">
-              <span>Google Sheet / CSV link</span>
-              <input type="text" id="automationSourceLocationInput" placeholder="Dán link Google Sheet hoặc CSV export" />
+              <span>Google Sheet / CSV link tùy chọn</span>
+              <input type="text" id="automationSourceLocationInput" placeholder="Không bắt buộc. Dán link nếu muốn dùng prompt có sẵn." />
             </label>
             <label class="field">
-              <span>Lọc sản phẩm</span>
-              <input type="text" id="automationProductFilterInput" placeholder="Ví dụ: tote_bag, áo, wedding_hoop" />
+              <span>Từ khóa tìm Trello</span>
+              <input type="text" id="automationProductFilterInput" placeholder="Ví dụ: gấu bông, áo trẻ em, wedding_hoop" />
             </label>
             <label class="field">
-              <span>Paste bảng từ Google Sheets</span>
-              <textarea id="automationSheetPasteInput" rows="3" placeholder="Copy hàng có Product_Key, Prompt_Content, Active rồi paste vào đây"></textarea>
+              <span>Paste prompt từ Sheet nếu muốn</span>
+              <textarea id="automationSheetPasteInput" rows="3" placeholder="Tùy chọn. Nếu để trống, AI sẽ tự viết prompt từ card Trello."></textarea>
             </label>
             <div class="customize-actions source-actions">
-              <button type="button" class="ghost-button card-button" id="automationSheetPreviewButton">Lấy prompt</button>
+              <button type="button" class="ghost-button card-button" id="automationSheetPreviewButton">Lấy prompt tùy chọn</button>
               <button type="button" class="ghost-button card-button" id="automationSheetFileButton">Upload .xlsx/.csv</button>
               <input
                 type="file"
@@ -405,11 +405,11 @@
             </label>
             <label class="field">
               <span>Mô tả trên thanh đầu</span>
-              <textarea id="automationAppSubtitleInput" rows="2" placeholder="Nhập prompt rồi Flow tạo ảnh, Telegram duyệt."></textarea>
+              <textarea id="automationAppSubtitleInput" rows="2" placeholder="Auto Trello lấy ảnh, AI viết prompt, Flow tạo ảnh, Telegram duyệt."></textarea>
             </label>
             <label class="field">
               <span>Nguồn prompt cụ thể</span>
-              <small>Dùng Prompt source phía trên để dán sheet, upload file hoặc paste bảng. Export/import vẫn giữ cấu hình nguồn này.</small>
+              <small>Không cần Google Sheet. AI sẽ tự viết prompt; chỉ dán Sheet nếu muốn dùng prompt có sẵn.</small>
             </label>
             <label class="field color-field">
               <span>Màu chủ đạo</span>
@@ -908,6 +908,6 @@
       </div>
     </div>
 
-    <script type="module" src="/static/app.js?v=20260520e"></script>
+    <script type="module" src="/static/app.js?v=20260520f"></script>
   </body>
 </html>
