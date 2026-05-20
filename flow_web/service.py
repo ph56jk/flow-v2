@@ -2357,6 +2357,7 @@ class FlowWebService:
         trello = context.get("trello", {})
         telegram = context.get("telegram", {})
         product_filter = self._extract_user_assistant_product_filter(question)
+        test_run = any(term in normalized for term in ("test", "thu", "kiem_tra", "demo", "mot_san_pham", "1_san_pham"))
         actions: List[Dict[str, Any]] = []
 
         if not flow.get("project_set") or not flow.get("authenticated"):
@@ -2425,8 +2426,13 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy Auto Trello",
-                    "detail": "App sẽ quét card Ready for AI có ảnh, lấy prompt khớp từ sheet, tạo/chỉnh bằng Flow rồi gửi Telegram duyệt.",
+                    "detail": (
+                        "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Telegram."
+                        if test_run
+                        else "App sẽ quét card Ready for AI có ảnh, lấy prompt khớp từ sheet, tạo/chỉnh bằng Flow rồi gửi Telegram duyệt."
+                    ),
                     "action": "run_auto_trello",
+                    "payload": {"limit": 1, "test_mode": True} if test_run else {},
                     "requires_confirmation": True,
                 }
             )

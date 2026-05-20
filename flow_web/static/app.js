@@ -4183,7 +4183,7 @@ function automationImageJobPayload(prompt) {
   };
 }
 
-async function submitAutomationImage({ autoTrello = false } = {}) {
+async function submitAutomationImage({ autoTrello = false, batchLimit = null } = {}) {
   if (automationSubmitInFlight) {
     return;
   }
@@ -4224,8 +4224,8 @@ async function submitAutomationImage({ autoTrello = false } = {}) {
   }
 
   const payload = automationImageJobPayload(prompt);
-  const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello });
-  const queuedCount = batchItems.length > 1 || autoDiscoverTrello ? Math.min(batchItems.length, batchLimit) : 1;
+  const resolvedBatchLimit = Math.max(1, Math.min(40, Number(batchLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)));
+  const queuedCount = batchItems.length > 1 || autoDiscoverTrello ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
 
   automationSubmitInFlight = true;
   elements.automationRunButton.disabled = true;
@@ -4242,7 +4242,7 @@ async function submitAutomationImage({ autoTrello = false } = {}) {
         method: "POST",
         body: JSON.stringify({
           title: autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
-          limit: batchLimit,
+          limit: resolvedBatchLimit,
           auto_trello: autoDiscoverTrello,
           job: {
             ...payload,
@@ -4548,7 +4548,7 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
       if (!activePromptSourceItems({ limit: 500 }).length) {
         await previewPromptSource(null, { silent: true });
       }
-      await submitAutomationImage({ autoTrello: true });
+      await submitAutomationImage({ autoTrello: true, batchLimit: action.payload?.limit || null });
     } else {
       showMessage("Hành động AI này chưa được app hỗ trợ.", "error");
     }

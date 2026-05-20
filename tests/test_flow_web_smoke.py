@@ -682,6 +682,19 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("gấu", filter_action["payload"]["value"])
         self.assertIn("Ready for AI", result["context_summary"])
 
+    def test_user_assistant_limits_auto_trello_when_user_asks_for_test(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
+            result = asyncio.run(
+                self.service.answer_user_assistant(
+                    UserAssistantRequest(question="test trên trello ảnh về hoops_with_photos rồi chạy auto trello")
+                )
+            )
+
+        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_trello")
+        self.assertEqual(1, run_action["payload"]["limit"])
+        self.assertTrue(run_action["payload"]["test_mode"])
+        self.assertIn("chỉ chạy 1", run_action["detail"])
+
     def test_user_assistant_uses_gemini_when_configured(self) -> None:
         asyncio.run(
             self.service.update_integration_config(
