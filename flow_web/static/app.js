@@ -2844,10 +2844,43 @@ function renderUserAssistant() {
     .join("");
   const actions = Array.isArray(last.suggested_actions) ? last.suggested_actions.filter(Boolean) : [];
   const executableActions = actions.filter((action) => action.action);
+  const trelloCandidates = Array.isArray(last.trello_candidates) ? last.trello_candidates.filter(Boolean) : [];
   const planButton = executableActions.length
     ? `<button type="button" class="secondary-button assistant-plan-button" data-assistant-action-plan ${
         state.userAssistant?.executing ? "disabled" : ""
       }>${state.userAssistant?.executing ? "Đang làm..." : "Làm theo kế hoạch"}</button>`
+    : "";
+  const candidateHtml = trelloCandidates.length
+    ? `<div class="assistant-candidate-list">
+        <strong>Card Trello tìm được</strong>
+        ${trelloCandidates
+          .map((candidate) => {
+            const inReady = Boolean(candidate.in_ready_list);
+            const status = inReady ? "Đúng Ready for AI" : "Chưa ở Ready for AI";
+            const value = candidate.short_link || candidate.card_id || candidate.url || "";
+            const pinButton =
+              inReady && value
+                ? `<button type="button" class="ghost-button card-button assistant-candidate-pin" data-assistant-card-value="${escapeHtml(
+                    value,
+                  )}" ${state.userAssistant?.executing ? "disabled" : ""}>Ghim</button>`
+                : `<span class="assistant-candidate-wait">Kéo vào Ready</span>`;
+            return `
+              <div class="assistant-candidate-item" data-ready="${inReady ? "true" : "false"}">
+                <div>
+                  <strong>${escapeHtml(candidate.name || candidate.short_link || "Card Trello")}</strong>
+                  <span>${escapeHtml(candidate.list_name || "Không rõ list")} · ${Number(candidate.image_count || 0)} ảnh · ${status}</span>
+                  ${
+                    candidate.url
+                      ? `<a href="${escapeHtml(candidate.url)}" target="_blank" rel="noreferrer">Mở card</a>`
+                      : ""
+                  }
+                </div>
+                ${pinButton}
+              </div>
+            `;
+          })
+          .join("")}
+      </div>`
     : "";
   const actionHtml = actions.length
     ? `<div class="assistant-action-list">${actions
@@ -2870,7 +2903,7 @@ function renderUserAssistant() {
         })
         .join("")}</div>`
     : "";
-  elements.userAssistantAnswer.innerHTML = `${paragraphs}${planButton}${actionHtml}`;
+  elements.userAssistantAnswer.innerHTML = `${paragraphs}${candidateHtml}${planButton}${actionHtml}`;
 }
 
 function renderStoryboardResult() {
@@ -5106,6 +5139,11 @@ elements.userAssistantQuickButtons.forEach((button) => {
   button.addEventListener("click", () => askUserAssistant(button.dataset.assistantQuestion || ""));
 });
 elements.userAssistantAnswer?.addEventListener("click", (event) => {
+  const candidateButton = event.target.closest("[data-assistant-card-value]");
+  if (candidateButton) {
+    setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "");
+    return;
+  }
   const planButton = event.target.closest("[data-assistant-action-plan]");
   if (planButton) {
     void executeUserAssistantPlan();

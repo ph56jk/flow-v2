@@ -27,6 +27,7 @@ from flow_web.schemas import (
     SkillRecord,
     StateSnapshot,
     StoryboardPlanRequest,
+    TrelloConfig,
     TrelloConfigUpdateRequest,
     UserAssistantRequest,
 )
@@ -706,6 +707,99 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         card_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_trello_card")
         self.assertEqual("abc12345", card_action["payload"]["value"])
         self.assertIn("không tự chọn card khác", card_action["detail"])
+
+    def test_user_assistant_reports_trello_candidate_outside_ready(self) -> None:
+        asyncio.run(
+            self.store.replace_trello_config(
+                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            )
+        )
+        cards_payload = [
+            {
+                "id": "card-bear",
+                "name": "gau_bong",
+                "shortLink": "bear",
+                "url": "https://trello.com/c/bear",
+                "idList": "ideas-list",
+                "attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
+            }
+        ]
+
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
+            clear=False,
+        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "ideas-list", "name": "Ideas"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            return_value=cards_payload,
+        ):
+            result = asyncio.run(
+                self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về gấu bông"))
+            )
+
+        self.assertEqual(1, len(result["trello_candidates"]))
+        candidate = result["trello_candidates"][0]
+        self.assertEqual("Ideas", candidate["list_name"])
+        self.assertFalse(candidate["in_ready_list"])
+        self.assertIn("chưa ở Ready for AI", result["answer"])
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertNotIn("run_auto_trello", action_names)
+        self.assertIn("Trello scan theo", result["context_summary"])
+
+    def test_user_assistant_can_pin_ready_trello_candidate(self) -> None:
+        asyncio.run(
+            self.store.replace_trello_config(
+                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            )
+        )
+        cards_payload = [
+            {
+                "id": "card-bear",
+                "name": "gau_bong",
+                "shortLink": "bear",
+                "url": "https://trello.com/c/bear",
+                "idList": "ready-list",
+                "attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
+            }
+        ]
+
+        with patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
+            clear=False,
+        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_board_lists",
+            return_value=[
+                {"id": "ideas-list", "name": "Ideas"},
+                {"id": "ready-list", "name": "Ready for AI"},
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            return_value=cards_payload,
+        ):
+            result = asyncio.run(
+                self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về gấu bông"))
+            )
+
+        self.assertTrue(result["trello_candidates"][0]["in_ready_list"])
+        action_names = [action.get("action") for action in result["suggested_actions"]]
+        self.assertIn("run_auto_trello", action_names)
+        pin_action = next(
+            action
+            for action in result["suggested_actions"]
+            if action.get("action") == "set_trello_card" and action.get("payload", {}).get("value") == "bear"
+        )
+        self.assertIn("Ready for AI", pin_action["detail"])
 
     def test_user_assistant_uses_gemini_when_configured(self) -> None:
         asyncio.run(
