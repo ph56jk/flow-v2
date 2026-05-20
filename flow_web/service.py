@@ -3205,6 +3205,13 @@ class FlowWebService:
             cleaned = self._storyboard_clean_unit(normalized)
             return [cleaned] if cleaned else []
 
+        if len(units) == 1 and scene_count > 1:
+            phase_labels = ["Mở đầu", "Phát triển", "Cao trào", "Chuyển cảnh", "Kết thúc"]
+            return [
+                f"{phase_labels[index] if index < len(phase_labels) else f'Nhịp {index + 1}'}: {units[0]}"
+                for index in range(scene_count)
+            ]
+
         target = max(1, min(scene_count, len(units)))
         buckets: List[List[str]] = [[] for _ in range(target)]
         total_units = max(1, len(units))
@@ -3432,7 +3439,7 @@ class FlowWebService:
             "generationConfig": {
                 "temperature": 0.8,
                 "topP": 0.95,
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
             },
         }

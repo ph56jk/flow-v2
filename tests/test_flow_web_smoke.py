@@ -1207,6 +1207,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Giữ cùng nhân vật chính", scenes[0].continuity)
         self.assertIn("mưa lớn", scenes[0].continuity)
 
+    def test_local_storyboard_plan_honors_explicit_count_for_short_script(self) -> None:
+        request = StoryboardPlanRequest(
+            script="Một shop online nhận ảnh từ Trello, tạo ảnh bằng Flow, duyệt Telegram rồi lưu lại đúng card.",
+            style="software explainer",
+            must_include="Trello, Flow, Telegram",
+            aspect="landscape",
+            scene_count=3,
+        )
+
+        scenes = self.service._local_storyboard_plan(request, 3, [])
+
+        self.assertEqual(3, len(scenes))
+        self.assertEqual([1, 2, 3], [scene.index for scene in scenes])
+        self.assertIn("Mở đầu", scenes[0].beat)
+        self.assertIn("Phát triển", scenes[1].beat)
+        self.assertIn("Cao trào", scenes[2].beat)
+
+    def test_gemini_storyboard_request_allows_large_json_outputs(self) -> None:
+        request = StoryboardPlanRequest(script="Một shop online chạy automation Trello, Flow và Telegram.", scene_count=3)
+
+        payload = self.service._gemini_storyboard_request(request, [], 3)
+
+        self.assertGreaterEqual(payload["generationConfig"]["maxOutputTokens"], 4096)
+
     def test_logout_flow_clears_local_profile_session(self) -> None:
         profile_dir = self.temp_root / "flow-profile"
         cookies_path = profile_dir / "Default" / "Cookies"
