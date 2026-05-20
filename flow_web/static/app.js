@@ -4518,6 +4518,35 @@ function setAssistantProductFilter(value) {
   return true;
 }
 
+function setAssistantTrelloCard(value) {
+  const card = String(value || "").trim();
+  if (!card) {
+    showMessage("AI chưa nhận ra card Trello cần ghim.", "error");
+    return false;
+  }
+  syncAutomationFromForm();
+  state.automation.trelloCardId = card;
+  state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
+    if (!["trello_source", "trello"].includes(module.type)) {
+      return module;
+    }
+    return {
+      ...module,
+      settings: {
+        ...(module.settings || {}),
+        trelloCard: card,
+      },
+    };
+  });
+  if (elements.automationTrelloCardInput) {
+    elements.automationTrelloCardInput.value = card;
+  }
+  persistAutomationModules();
+  renderAll();
+  showMessage(`AI đã ghim đúng card Trello "${card}".`, "success");
+  return true;
+}
+
 async function executeUserAssistantAction(action, { skipConfirmation = false } = {}) {
   if (!action?.action || state.userAssistant.executing) {
     return;
@@ -4535,6 +4564,8 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
   try {
     if (actionName === "apply_product_filter") {
       setAssistantProductFilter(action.payload?.value || "");
+    } else if (actionName === "set_trello_card") {
+      setAssistantTrelloCard(action.payload?.value || "");
     } else if (actionName === "preview_prompt_source") {
       await previewPromptSource();
     } else if (actionName === "sync_telegram_approvals") {

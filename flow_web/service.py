@@ -2323,6 +2323,8 @@ class FlowWebService:
             if not match:
                 continue
             value = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;\"'")
+            if value.startswith(("http://", "https://")) or "trello.com/" in value.lower():
+                continue
             value = re.sub(
                 r"\b(?:cho tôi|cho toi|của tôi|cua toi|rồi|roi|xong|nhé|nhe|giúp|giup|đi|di|auto|trello|flow|telegram|sheet)\b.*$",
                 "",
@@ -2351,12 +2353,29 @@ class FlowWebService:
                 return value
         return ""
 
+    def _extract_user_assistant_trello_card_hint(self, question: str) -> str:
+        raw = re.sub(r"\s+", " ", str(question or "").strip())
+        if not raw:
+            return ""
+        url_match = re.search(r"https?://(?:www\.)?trello\.com/c/[^\s,;]+", raw, flags=re.IGNORECASE)
+        if url_match:
+            return self._normalize_trello_card_id(url_match.group(0))
+        card_match = re.search(
+            r"(?:card|thẻ|the)\s*(?:trello)?\s*(?:id|là|la|=|:)?\s*([a-zA-Z0-9_-]{6,32})",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if card_match:
+            return self._normalize_trello_card_id(card_match.group(1))
+        return ""
+
     def _user_assistant_suggested_actions(self, question: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         normalized = self._normalize_skill_token(question)
         flow = context.get("flow", {})
         trello = context.get("trello", {})
         telegram = context.get("telegram", {})
         product_filter = self._extract_user_assistant_product_filter(question)
+        trello_card_hint = self._extract_user_assistant_trello_card_hint(question)
         test_run = any(term in normalized for term in ("test", "thu", "kiem_tra", "demo", "mot_san_pham", "1_san_pham"))
         actions: List[Dict[str, Any]] = []
 
@@ -2391,6 +2410,16 @@ class FlowWebService:
                     "detail": "Điền bộ lọc này vào Prompt source để app chỉ chạy prompt khớp sản phẩm/card đó.",
                     "action": "apply_product_filter",
                     "payload": {"value": product_filter},
+                    "requires_confirmation": False,
+                }
+            )
+        if trello_card_hint:
+            actions.append(
+                {
+                    "label": f"Chọn card Trello: {trello_card_hint}",
+                    "detail": "Ghim đúng card Trello này làm nguồn ảnh để app không tự chọn card khác.",
+                    "action": "set_trello_card",
+                    "payload": {"value": trello_card_hint},
                     "requires_confirmation": False,
                 }
             )
@@ -5913,6 +5942,19 @@ exit 1
             )
         max_items = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(limit or self.MAX_PROMPT_BATCH_ITEMS)))
         cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
+        explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
+        if explicit_card_id:
+            cards = [
+                card
+                for card in cards
+                if self._normalize_trello_card_id(str(card.get("id") or "")) == explicit_card_id
+                or self._normalize_trello_card_id(str(card.get("shortLink") or "")) == explicit_card_id
+            ]
+            if not cards:
+                raise RuntimeError(
+                    "Card Trello đã chọn không nằm trong list Ready for AI hoặc chưa có attachment ảnh. "
+                    "App đã dừng để tránh lấy nhầm ảnh từ card khác."
+                )
         expanded: List[Dict[str, Any]] = []
         used_pairs: set[tuple[str, int, str]] = set()
 
@@ -5982,6 +6024,13 @@ exit 1
         matched_cards = [card for card in cards if self._trello_card_matches_query(card, query)]
         if not matched_cards:
             return []
+        explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
+        if len(matched_cards) > 1 and not explicit_card_id:
+            names = ", ".join(str(card.get("name") or card.get("url") or card.get("id") or "").strip() for card in matched_cards[:5])
+            raise RuntimeError(
+                "Auto Trello tìm thấy nhiều card cùng khớp từ khóa. "
+                f"Hãy dán đúng link card Trello hoặc đổi tên card rõ hơn trước khi chạy: {names}"
+            )
 
         expanded: List[Dict[str, Any]] = []
         used_pairs: set[tuple[str, int, str]] = set()
@@ -5990,9 +6039,13 @@ exit 1
             if not card_id:
                 continue
             card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
-            item = self._best_prompt_item_for_trello_keyword_card(card, items, used_pairs)
+            item = self._best_prompt_item_for_trello_keyword_card(card, items, used_pairs, query)
             if not item:
-                continue
+                card_name = str(card.get("name") or card.get("url") or card_id).strip()
+                raise RuntimeError(
+                    "Auto Trello đã tìm thấy card ảnh nhưng chưa tìm thấy prompt Active khớp card/từ khóa. "
+                    f"Card: {card_name}. Hãy thêm Product_Key/Product_Name/Notes khớp trong sheet hoặc thêm Trello_Card/Card_URL."
+                )
             used_pairs.add((card_id, int(item.get("row") or 0), str(item.get("index") or "")))
             expanded.append(
                 {
@@ -6041,6 +6094,7 @@ exit 1
         card: Dict[str, Any],
         items: List[Dict[str, Any]],
         used_pairs: set[tuple[str, int, str]],
+        query: str,
     ) -> Dict[str, Any]:
         card_id = str(card.get("id") or card.get("shortLink") or "").strip()
         for item in items:
@@ -6052,9 +6106,26 @@ exit 1
                 return item
         for item in items:
             item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
-            if item_key not in used_pairs:
+            if item_key not in used_pairs and self._prompt_batch_item_matches_query(item, query):
                 return item
         return {}
+
+    def _prompt_batch_item_matches_query(self, item: Dict[str, Any], query: str) -> bool:
+        query_key = self._compact_match_text(query)
+        if not query_key:
+            return False
+        for value in (
+            item.get("product_key"),
+            item.get("product_name"),
+            item.get("product"),
+            item.get("notes"),
+            item.get("trello_card_id"),
+            item.get("prompt"),
+        ):
+            candidate = self._compact_match_text(value)
+            if candidate and (query_key in candidate or candidate in query_key):
+                return True
+        return False
 
     def _trello_image_cards_on_board(
         self,

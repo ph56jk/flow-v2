@@ -695,6 +695,18 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(run_action["payload"]["test_mode"])
         self.assertIn("chỉ chạy 1", run_action["detail"])
 
+    def test_user_assistant_can_pin_explicit_trello_card_url(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
+            result = asyncio.run(
+                self.service.answer_user_assistant(
+                    UserAssistantRequest(question="lấy ảnh đúng card https://trello.com/c/abc12345/ten-card rồi chạy auto")
+                )
+            )
+
+        card_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_trello_card")
+        self.assertEqual("abc12345", card_action["payload"]["value"])
+        self.assertIn("không tự chọn card khác", card_action["detail"])
+
     def test_user_assistant_uses_gemini_when_configured(self) -> None:
         asyncio.run(
             self.service.update_integration_config(
@@ -3048,14 +3060,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             limit=10,
             auto_trello=True,
             items=[
-                {"row": 2, "prompt": "generic plush product prompt", "product_key": "toy", "product": "Toy", "index": "1", "active": True},
+                {"row": 2, "prompt": "bear plush product prompt", "product_key": "gau_bong", "product": "Gấu bông", "index": "1", "active": True},
             ],
         )
         seen: list[tuple[str, str]] = []
         cards = [
             {
                 "id": "card-bear",
-                "name": "Gấu bông dễ thương",
+                "name": "Bear plush product card",
                 "shortLink": "bear",
                 "url": "https://trello.com/c/bear",
                 "idList": "ready-list",
@@ -3091,13 +3103,137 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             batch = await self.service.enqueue_prompt_batch(request)
             await self.service._tasks[batch.id]
 
-        self.assertEqual([("generic plush product prompt", "card-bear")], seen)
+        self.assertEqual([("bear plush product prompt", "card-bear")], seen)
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
         self.assertEqual("keyword", saved.result["trello_source_hint"]["match_mode"])
         self.assertEqual("gấu", saved.input["items"][0]["trello_search_query"])
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
         self.assertEqual(["card-bear"], [job.input["trello_card_id"] for job in child_jobs])
+
+    async def test_auto_trello_keyword_search_does_not_use_unrelated_prompt(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                prompt_product="gấu",
+                prompt_product_key="gấu",
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=10,
+            auto_trello=True,
+            items=[
+                {"row": 2, "prompt": "unrelated toy prompt", "product_key": "toy", "product": "Toy", "index": "1", "active": True},
+            ],
+        )
+        cards = [
+            {
+                "id": "card-bear",
+                "name": "Gấu bông dễ thương",
+                "shortLink": "bear",
+                "url": "https://trello.com/c/bear",
+                "idList": "ready-list",
+                "_image_attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
+            }
+        ]
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service.enqueue_prompt_batch(request)
+
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("chưa tìm thấy prompt Active khớp", str(ctx.exception.detail))
+
+    async def test_auto_trello_keyword_search_rejects_ambiguous_cards(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                prompt_product="gấu",
+                prompt_product_key="gấu",
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=10,
+            auto_trello=True,
+            items=[
+                {"row": 2, "prompt": "bear plush product prompt", "product_key": "gau_bong", "product": "Gấu bông", "index": "1", "active": True},
+            ],
+        )
+        cards = [
+            {
+                "id": "card-bear-1",
+                "name": "Cream plush product card",
+                "shortLink": "bear1",
+                "url": "https://trello.com/c/bear1",
+                "idList": "ready-list",
+                "_image_attachments": [{"name": "gau-1.png", "mimeType": "image/png"}],
+            },
+            {
+                "id": "card-bear-2",
+                "name": "Brown plush product card",
+                "shortLink": "bear2",
+                "url": "https://trello.com/c/bear2",
+                "idList": "ready-list",
+                "_image_attachments": [{"name": "gau-2.png", "mimeType": "image/png"}],
+            },
+        ]
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service.enqueue_prompt_batch(request)
+
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("nhiều card cùng khớp", str(ctx.exception.detail))
 
     async def test_generate_images_with_retry_reloads_project_after_recaptcha_error(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
