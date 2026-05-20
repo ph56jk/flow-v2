@@ -3406,11 +3406,104 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
         self.assertEqual("ai_generated", saved.result["trello_source_hint"]["prompt_mode"])
-        self.assertEqual(1, saved.result["total"])
+        self.assertEqual(6, saved.result["total"])
         self.assertEqual("card-bear", saved.input["items"][0]["trello_card_id"])
         self.assertTrue(saved.input["items"][0]["generated_by_ai"])
+        self.assertEqual(
+            ["Detail craft proof", "Full front hero", "Lifestyle use", "Angle and fit", "Flat lay", "Gift ready"],
+            [item["shot_label"] for item in saved.input["items"]],
+        )
         self.assertEqual("card-bear", seen[0][1])
         self.assertIn("selected Trello attachment", seen[0][0])
+
+    async def test_auto_trello_ai_suite_for_apron_includes_hand_embroidery_shot(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="làm một bộ ảnh cho chiếc tạp dề này, trước khi làm hãy phân tích thiết kế, bắt buộc có 1 ảnh thể hiện đây là sản phẩm thêu tay",
+                count=1,
+                prompt_product="tạp dề thêu tay",
+                prompt_product_key="tạp dề thêu tay",
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=10,
+            auto_trello=True,
+            items=[],
+        )
+        seen_prompts: list[str] = []
+        cards = [
+            {
+                "id": "card-apron",
+                "name": "Hand-Embroidered Baking Apron",
+                "shortLink": "apron",
+                "url": "https://trello.com/c/apron",
+                "idList": "ready-list",
+                "_image_attachments": [{"name": "white-ruffled-apron-embroidery.png", "mimeType": "image/png"}],
+            }
+        ]
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_prompts.append(child_request.prompt)
+            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(6, saved.result["total"])
+        self.assertEqual(
+            [
+                "Hand embroidery detail",
+                "Full front hero",
+                "Lifestyle baking action",
+                "Back tie fit",
+                "Flat lay styling",
+                "Gift artisan scene",
+            ],
+            [item["shot_label"] for item in saved.input["items"]],
+        )
+        self.assertIn("hand-embroidered", seen_prompts[0])
+        self.assertIn("Extreme macro close-up", seen_prompts[0])
+        self.assertTrue(all("Before creating images, carefully analyze" in prompt for prompt in seen_prompts))
+        self.assertIn("apron silhouette", saved.input["items"][0]["design_analysis"])
 
     async def test_auto_trello_prompt_batch_can_search_card_by_user_keyword(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

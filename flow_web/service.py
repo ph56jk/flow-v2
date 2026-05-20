@@ -116,6 +116,7 @@ class FlowWebService:
     GEMINI_TIMEOUT_S = 30
     USER_ASSISTANT_CONTEXT_LIMIT = 1200
     USER_ASSISTANT_ANSWER_LIMIT = 1400
+    AI_PROMPT_SUITE_SIZE = 6
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
@@ -2007,7 +2008,9 @@ class FlowWebService:
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         if item.get("generated_by_ai"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
-            return f"AI {index + 1}/{total} · {label}"[:120]
+            shot_label = str(item.get("shot_label") or "").strip()
+            suffix = f" · {shot_label}" if shot_label else ""
+            return f"AI {index + 1}/{total} · {label}{suffix}"[:120]
         label = str(item.get("product") or "").strip() or f"Prompt dòng {item.get('row') or index + 1}"
         prompt_index = str(item.get("index") or "").strip()
         suffix = f" #{prompt_index}" if prompt_index else ""
@@ -6769,19 +6772,154 @@ exit 1
         }
         return expanded, discovery
 
+    def _flow_operator_design_analysis_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
+        card_name = str(card.get("name") or "").strip()
+        card_url = str(card.get("url") or "").strip()
+        query = self._trello_auto_search_query(request)
+        user_instruction = str(request.prompt or "").strip()
+        attachment_names = ", ".join(
+            str(item.get("name") or "").strip()
+            for item in (card.get("_image_attachments") or [])[:4]
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        )
+        raw = " ".join([card_name, query, user_instruction, attachment_names])
+        normalized = self._normalize_skill_token(raw)
+        compact = self._compact_match_text(raw)
+
+        product_bits: List[str] = []
+        if any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact:
+            product_bits.append("apron silhouette, chest bib, waist tie, shoulder/neck straps, hem length, and fit")
+        if any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made")):
+            product_bits.append("hand-embroidered thread texture, stitch direction, raised thread, motif placement, and handmade craft cues")
+        if any(term in normalized for term in ("baking", "bakery", "kitchen", "nau_an", "lam_banh")):
+            product_bits.append("warm bakery/kitchen context, baking tools, flour, pastry props, and clean food-safe styling")
+        if not product_bits:
+            product_bits.append("product type, base color, material texture, print/embroidery details, silhouette, scale, and hero features")
+
+        visible_sources = ", ".join(part for part in [card_name, attachment_names] if part)
+        source_hint = f" Visible Trello clues: {visible_sources}." if visible_sources else ""
+        if card_url:
+            source_hint += f" Source card: {card_url}."
+        return (
+            "Before creating images, carefully analyze the selected Trello reference image for "
+            + "; ".join(product_bits)
+            + ". Keep those design features consistent across the whole image set."
+            + source_hint
+        )
+
+    def _flow_operator_shot_suite_for_trello_card(
+        self,
+        request: CreateJobRequest,
+        card: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        raw = " ".join(
+            [
+                str(card.get("name") or ""),
+                self._trello_auto_search_query(request),
+                str(request.prompt or ""),
+                " ".join(
+                    str(item.get("name") or "")
+                    for item in (card.get("_image_attachments") or [])[:4]
+                    if isinstance(item, dict)
+                ),
+            ]
+        )
+        normalized = self._normalize_skill_token(raw)
+        compact = self._compact_match_text(raw)
+        is_apron = any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact
+        is_embroidery = any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made"))
+
+        if is_apron or is_embroidery:
+            return [
+                {
+                    "label": "Hand embroidery detail",
+                    "brief": (
+                        "Extreme macro close-up of the embroidered area on the apron, showing individual thread fibers, "
+                        "raised stitches, needlework texture, and handmade irregularities; this shot must clearly prove the product is hand-embroidered."
+                    ),
+                    "must_include": "hand-embroidered stitches, visible thread texture, close-up craft detail, selected apron reference design",
+                },
+                {
+                    "label": "Full front hero",
+                    "brief": "Full front product hero shot of the apron worn by a model or displayed on a form, showing the complete silhouette, bib, straps, waist, skirt/hem, and embroidery placement.",
+                    "must_include": "full apron front, complete fit, embroidery visible, clean premium product photography",
+                },
+                {
+                    "label": "Lifestyle baking action",
+                    "brief": "Lifestyle image in a warm bakery or home kitchen, model wearing the apron while decorating pastries or preparing dough, natural movement and believable cooking context.",
+                    "must_include": "apron in use, baking props, warm kitchen light, embroidery still visible",
+                },
+                {
+                    "label": "Back tie fit",
+                    "brief": "Back or three-quarter view showing apron straps, waist tie, fabric drape, ruffle/edge details if present, and how the apron fits on the body.",
+                    "must_include": "back tie, straps, fabric drape, fit detail",
+                },
+                {
+                    "label": "Flat lay styling",
+                    "brief": "Overhead flat lay of the apron neatly arranged on a light wooden or linen surface with tasteful baking and craft props around it.",
+                    "must_include": "full apron layout, embroidery placement, baking props, clean editorial styling",
+                },
+                {
+                    "label": "Gift artisan scene",
+                    "brief": "Artisan gift-ready scene with the apron folded partly open beside embroidery thread, needle, linen ribbon, dried flowers or baking tools, communicating handmade premium quality.",
+                    "must_include": "handmade craft props, premium gift presentation, apron embroidery visible",
+                },
+            ]
+
+        return [
+            {
+                "label": "Detail craft proof",
+                "brief": "Extreme close-up detail shot of the most important product craftsmanship, material texture, stitching, print/embroidery, edge finish, or surface detail.",
+                "must_include": "macro craftsmanship detail, selected Trello reference product, visible material texture",
+            },
+            {
+                "label": "Full front hero",
+                "brief": "Clean full product hero shot showing the entire product shape, key design, color, proportions, and main visual feature.",
+                "must_include": "full product, clean hero composition, exact source design",
+            },
+            {
+                "label": "Lifestyle use",
+                "brief": "Lifestyle scene showing the product being used naturally in a fitting environment, with realistic light and commercial styling.",
+                "must_include": "product in use, believable environment, source product identity",
+            },
+            {
+                "label": "Angle and fit",
+                "brief": "Three-quarter or alternate angle showing depth, fit, side/back detail, and construction that the front hero does not reveal.",
+                "must_include": "alternate angle, construction details, product depth",
+            },
+            {
+                "label": "Flat lay",
+                "brief": "Overhead flat lay with the product arranged neatly with tasteful props that match the product story.",
+                "must_include": "flat lay, full product layout, editorial props",
+            },
+            {
+                "label": "Gift ready",
+                "brief": "Premium packaging or gift-ready scene that makes the product feel handmade, valuable, and ready to sell.",
+                "must_include": "premium presentation, product details, clean commercial finish",
+            },
+        ]
+
     def _flow_operator_prompt_for_trello_card(
         self,
         request: CreateJobRequest,
         card: Dict[str, Any],
         index: int,
+        shot: Dict[str, str] | None = None,
+        design_analysis: str = "",
     ) -> str:
         card_name = str(card.get("name") or "").strip()
         card_url = str(card.get("url") or "").strip()
         query = self._trello_auto_search_query(request)
         user_instruction = str(request.prompt or "").strip()
         product_hint = query or card_name or f"card Trello {index + 1}"
+        shot = shot or {}
+        shot_label = str(shot.get("label") or f"Shot {index}").strip()
+        shot_brief = str(shot.get("brief") or "").strip()
+        design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
         brief_parts = [
+            design_analysis,
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
+            f"Shot {index} - {shot_label}: {shot_brief}" if shot_brief else f"Shot {index}: create a distinct commercial product image.",
             f"Create or edit a commercial product image for {product_hint}.",
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity.",
             "Only change the scene, styling, lighting, composition, model/background, and presentation around the source product.",
@@ -6796,7 +6934,7 @@ exit 1
             style="photorealistic ecommerce product photography, clean commercial styling, realistic lighting",
             must_include=(
                 "selected Trello attachment/reference image, exact source product, believable product photo, "
-                "clear hero composition, Telegram approval ready"
+                f"clear hero composition, Telegram approval ready, {shot.get('must_include') or shot_label}"
             ),
             avoid="wrong product, unrelated design, extra text, watermark, distorted logo, deformed product, low quality",
             audience="automation review in Telegram and archive back to the same Trello card",
@@ -6824,37 +6962,81 @@ exit 1
         if query:
             matched_cards = [card for card in cards if self._trello_card_matches_query(card, query)]
             if not matched_cards:
-                return []
+                if len(cards) == 1:
+                    matched_cards = cards
+                else:
+                    return []
         expanded: List[Dict[str, Any]] = []
-        for card in matched_cards[:max_items]:
+        for card in matched_cards:
+            if len(expanded) >= max_items:
+                break
             card_id = str(card.get("id") or card.get("shortLink") or "").strip()
             if not card_id:
                 continue
             card_list_id = self._normalize_trello_id(str(card.get("idList") or request.trello_list_id or ""))
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
-            prompt = self._flow_operator_prompt_for_trello_card(request, card, len(expanded) + 1)
-            expanded.append(
-                {
-                    "row": 0,
-                    "active": True,
-                    "used": False,
-                    "prompt": prompt,
-                    "product": query or card_name,
-                    "product_key": query or str(card.get("shortLink") or card_id).strip(),
-                    "product_name": card_name,
-                    "index": str(len(expanded) + 1),
-                    "notes": "AI prompt generated from Trello card attachment; Google Sheet prompt not required.",
-                    "trello_card_id": card_id,
-                    "trello_list_id": card_list_id,
-                    "trello_card_name": card_name,
-                    "trello_card_url": card_url,
-                    "trello_match_mode": "ai_prompt",
-                    "trello_search_query": query,
-                    "generated_by_ai": True,
-                }
-            )
+            design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
+            shots = self._flow_operator_shot_suite_for_trello_card(request, card)
+            remaining = max_items - len(expanded)
+            for shot in shots[: max(1, min(self.AI_PROMPT_SUITE_SIZE, remaining))]:
+                prompt = self._flow_operator_prompt_for_trello_card(
+                    request,
+                    card,
+                    len(expanded) + 1,
+                    shot=shot,
+                    design_analysis=design_analysis,
+                )
+                expanded.append(
+                    {
+                        "row": 0,
+                        "active": True,
+                        "used": False,
+                        "prompt": prompt,
+                        "product": query or card_name,
+                        "product_key": query or str(card.get("shortLink") or card_id).strip(),
+                        "product_name": card_name,
+                        "index": str(len(expanded) + 1),
+                        "notes": f"{design_analysis} Shot: {shot.get('label') or 'AI image'}. Google Sheet prompt not required.",
+                        "trello_card_id": card_id,
+                        "trello_list_id": card_list_id,
+                        "trello_card_name": card_name,
+                        "trello_card_url": card_url,
+                        "trello_match_mode": "ai_prompt",
+                        "trello_search_query": query,
+                        "shot_label": shot.get("label") or "",
+                        "design_analysis": design_analysis,
+                        "generated_by_ai": True,
+                    }
+                )
+                if len(expanded) >= max_items:
+                    break
         return expanded
+
+    def _trello_query_aliases(self, query: str) -> List[str]:
+        aliases = [str(query or "").strip()]
+        normalized = self._normalize_skill_token(query)
+        compact = self._compact_match_text(query)
+        alias_groups = [
+            (("tap_de", "tapde", "apron"), ("apron", "baking apron", "kitchen apron", "tap de")),
+            (("theu", "embroider", "embroidery"), ("embroidered", "embroidery", "hand embroidered", "handmade")),
+            (("gau", "gau_bong", "gaubong"), ("bear", "teddy bear", "plush", "stuffed toy")),
+            (("ao_tre_em", "aotreem"), ("kids shirt", "children shirt", "baby shirt", "youth tee")),
+            (("ao", "shirt", "tshirt"), ("shirt", "tshirt", "tee")),
+        ]
+        for triggers, values in alias_groups:
+            if any(trigger in normalized or trigger in compact for trigger in triggers):
+                aliases.extend(values)
+        unique: List[str] = []
+        seen: set[str] = set()
+        for alias in aliases:
+            cleaned = re.sub(r"\s+", " ", str(alias or "").strip())
+            key = self._compact_match_text(cleaned)
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            unique.append(cleaned)
+        return unique
 
     def _trello_prompt_items_for_keyword_image_cards(
         self,
@@ -6921,8 +7103,9 @@ exit 1
         return ""
 
     def _trello_card_matches_query(self, card: Dict[str, Any], query: str) -> bool:
-        normalized_query = self._compact_match_text(query)
-        if not normalized_query:
+        query_aliases = [self._compact_match_text(alias) for alias in self._trello_query_aliases(query)]
+        query_aliases = [alias for alias in query_aliases if alias]
+        if not query_aliases:
             return False
         haystack_values = [
             card.get("name"),
@@ -6933,7 +7116,7 @@ exit 1
             if isinstance(attachment, dict):
                 haystack_values.extend([attachment.get("name"), attachment.get("url")])
         haystack = self._compact_match_text(" ".join(str(value or "") for value in haystack_values))
-        return bool(normalized_query and (normalized_query in haystack or haystack in normalized_query))
+        return any(alias in haystack or haystack in alias for alias in query_aliases)
 
     def _best_prompt_item_for_trello_keyword_card(
         self,
