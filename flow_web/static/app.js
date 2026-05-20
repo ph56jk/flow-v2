@@ -4391,7 +4391,12 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     return;
   }
   syncAutomationFromForm();
-  let batchItems = activePromptSourceItems({ limit: 500 });
+  const selectedTrelloAttachmentIds = Array.isArray(state.automation.trelloAttachmentIds)
+    ? state.automation.trelloAttachmentIds.filter(Boolean)
+    : [];
+  const selectedTrelloCard = String(state.automation.trelloCardId || "").trim();
+  const selectedTrelloImageRun = Boolean(autoTrello && selectedTrelloCard && selectedTrelloAttachmentIds.length);
+  let batchItems = selectedTrelloImageRun ? [] : activePromptSourceItems({ limit: 500 });
   const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
   const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
@@ -4430,7 +4435,11 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
   }
 
   const payload = automationImageJobPayload(prompt);
-  const resolvedBatchLimit = Math.max(1, Math.min(40, Number(batchLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)));
+  const selectedImageDefaultLimit = selectedTrelloImageRun ? 6 : 0;
+  const resolvedBatchLimit = Math.max(
+    1,
+    Math.min(40, Number(batchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)),
+  );
   const queuedCount = autoDiscoverTrello
     ? (batchItems.length ? Math.min(batchItems.length, resolvedBatchLimit) : resolvedBatchLimit)
     : batchItems.length > 1 ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
