@@ -13884,13 +13884,25 @@ exit 1
                         el.getAttribute('data-testid') || '',
                       ].join(' ').replace(/\\s+/g, ' ').trim();
                       const bodyText = document.body?.innerText || '';
+                      const isApproveLabel = (label) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm/i.test(label)
+                        && !/Từ\\s*chối|Tu\\s*choi|Reject|Cancel|không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
                       const approveButtons = [...document.querySelectorAll('button, [role="button"]')]
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
-                        .filter(({ label }) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm/i.test(label))
-                        .filter(({ label }) => !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label))
+                        .filter(({ label }) => isApproveLabel(label))
                         .sort((a, b) => (b.rect.right - a.rect.right) || (b.rect.bottom - a.rect.bottom));
-                      const approve = approveButtons[0];
+                      const textCandidates = [...document.querySelectorAll('span, div, p, label, a, mat-label')]
+                        .filter(visible)
+                        .map((el) => {
+                          const rect = el.getBoundingClientRect();
+                          const label = labelFor(el);
+                          const clickable = el.closest('button, [role="button"], [tabindex], a') || el;
+                          const clickRect = clickable.getBoundingClientRect();
+                          return { el: clickable, rect: clickRect.width && clickRect.height ? clickRect : rect, label };
+                        })
+                        .filter(({ label, rect }) => label.length <= 120 && isApproveLabel(label) && rect.width <= 420 && rect.height <= 140)
+                        .sort((a, b) => ((a.rect.width * a.rect.height) - (b.rect.width * b.rect.height)) || (b.rect.right - a.rect.right));
+                      const approve = approveButtons[0] || textCandidates[0];
                       if (!approve) {
                         const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
                         return { ok: false, waiting, detail: waiting ? 'approval text visible, approve button not found' : 'approval dialog not visible' };
