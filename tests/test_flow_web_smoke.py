@@ -1144,7 +1144,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                     {
                         "id": "flow",
                         "type": "flow",
-                        "settings": {"flowAgentEnabled": False, "imageCount": 3, "imageAspect": "square"},
+                        "settings": {
+                            "flowAgentEnabled": False,
+                            "flowAgentAutoApprove": False,
+                            "imageCount": 3,
+                            "imageAspect": "square",
+                        },
                     }
                 ]
             },
@@ -1152,10 +1157,20 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         resolved = self.service._request_with_automation_module_settings(
             request,
-            {"id": "flow", "type": "flow", "settings": {"flowAgentEnabled": False, "imageCount": 3, "imageAspect": "square"}},
+            {
+                "id": "flow",
+                "type": "flow",
+                "settings": {
+                    "flowAgentEnabled": False,
+                    "flowAgentAutoApprove": False,
+                    "imageCount": 3,
+                    "imageAspect": "square",
+                },
+            },
         )
 
         self.assertFalse(resolved.flow_agent_enabled)
+        self.assertFalse(resolved.flow_agent_auto_approve)
         self.assertEqual(3, resolved.count)
         self.assertEqual("square", resolved.aspect)
 
@@ -4167,7 +4182,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         single_ref.assert_awaited_once()
 
     async def test_generate_images_via_ui_passes_flow_agent_flag(self) -> None:
-        request = CreateJobRequest(type="image", prompt="them kinh", count=1, flow_agent_enabled=False)
+        request = CreateJobRequest(
+            type="image",
+            prompt="them kinh",
+            count=1,
+            flow_agent_enabled=False,
+            flow_agent_auto_approve=False,
+        )
         fake_image = SimpleNamespace(media_name="img-1")
         fake_client = SimpleNamespace()
 
@@ -4180,6 +4201,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertEqual([fake_image], result)
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_enabled"])
+        self.assertFalse(single_ref.await_args.kwargs["flow_agent_auto_approve"])
 
     async def test_enable_flow_agent_mode_clicks_visible_tac_nhan_button(self) -> None:
         events: list[tuple[str, float, float]] = []
@@ -4201,6 +4223,35 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(ok)
         self.assertIn("Tác nhân", detail)
         self.assertEqual([("click", 160, 720)], events)
+
+    async def test_approve_flow_agent_generation_clicks_remember_and_approve(self) -> None:
+        events: list[tuple[str, float, float]] = []
+
+        class FakeMouse:
+            async def click(self, x: float, y: float) -> None:
+                events.append(("click", x, y))
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str) -> dict:
+                self.script = script
+                return {
+                    "ok": True,
+                    "hasRemember": True,
+                    "rememberX": 90,
+                    "rememberY": 430,
+                    "approveX": 720,
+                    "approveY": 330,
+                    "detail": "Phê duyệt",
+                }
+
+        page = FakePage()
+        ok, detail = await self.service._approve_flow_agent_generation(page, timeout_s=2)
+
+        self.assertTrue(ok)
+        self.assertIn("Phê duyệt", detail)
+        self.assertEqual([("click", 90, 430), ("click", 720, 330)], events)
 
     async def test_select_flow_edit_target_image_drags_source_into_prompt(self) -> None:
         events: list[tuple[str, float | None, float | None]] = []

@@ -5311,6 +5311,11 @@ exit 1
                     pass
             if "flowAgentEnabled" in settings:
                 payload["flow_agent_enabled"] = self._config_bool(settings.get("flowAgentEnabled"), default=True)
+            if "flowAgentAutoApprove" in settings:
+                payload["flow_agent_auto_approve"] = self._config_bool(
+                    settings.get("flowAgentAutoApprove"),
+                    default=True,
+                )
         if module.get("type") == "telegram" and settings.get("telegramChat"):
             payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
         if module.get("type") in {"trello", "trello_source"}:
@@ -12741,6 +12746,7 @@ exit 1
                 count=max(1, min(4, int(request.count or 1))),
                 timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
                 flow_agent_enabled=self._flow_agent_enabled_for_request(request),
+                flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
                 job_id=job_id,
             )
         return await client.generate_image(
@@ -12762,6 +12768,7 @@ exit 1
         count: int = 1,
         timeout_s: int = 120,
         flow_agent_enabled: bool = True,
+        flow_agent_auto_approve: bool = True,
         job_id: str = "",
     ) -> List[Any]:
         from flow._ui_interceptor import UIInterceptor
@@ -12840,10 +12847,26 @@ exit 1
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: đã bấm nút tạo ảnh ({click_detail[:120]}), chờ Flow trả ảnh tối đa {int(ui_timeout_s)} giây.")
 
+        if flow_agent_enabled and flow_agent_auto_approve:
+            approved, approve_detail = await self._approve_flow_agent_generation(
+                page,
+                timeout_s=min(45.0, max(10.0, ui_timeout_s / 6)),
+            )
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Fallback UI Flow: đã tự phê duyệt Tác nhân Flow ({approve_detail[:120]})."
+                        if approved
+                        else f"Fallback UI Flow: không thấy hộp phê duyệt Tác nhân ({approve_detail[:120]})."
+                    ),
+                )
+
+        network_wait_s = min(ui_timeout_s, 45.0) if flow_agent_enabled else ui_timeout_s
         try:
             result = await interceptor.wait_for(
                 "batchGenerateImages",
-                timeout=ui_timeout_s,
+                timeout=network_wait_s,
                 require_success=True,
             )
         except Exception as exc:
@@ -12851,6 +12874,36 @@ exit 1
             if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
                 if job_id:
                     await self.store.append_log(job_id, f"Fallback UI Flow timeout/recaptcha: {str(exc)[:300]}")
+                if flow_agent_enabled:
+                    try:
+                        if flow_agent_auto_approve:
+                            approved, approve_detail = await self._approve_flow_agent_generation(page, timeout_s=8.0)
+                            if approved and job_id:
+                                await self.store.append_log(
+                                    job_id,
+                                    f"Fallback UI Flow: đã tự phê duyệt Tác nhân Flow sau timeout ({approve_detail[:120]}).",
+                                )
+                        images = await self._wait_for_new_project_images(
+                            client,
+                            known_media_before_submit,
+                            prompt=prompt,
+                            target_count=max(1, min(4, int(count or 1))),
+                            timeout_s=min(120.0, max(20.0, ui_timeout_s / 2)),
+                            fallback_workflow_id=resolved_workflow_id,
+                        )
+                        if images:
+                            if job_id:
+                                await self.store.append_log(
+                                    job_id,
+                                    f"Fallback UI Flow: Flow Agent đã tạo {len(images)} ảnh mới trong project.",
+                                )
+                            return images[: max(1, min(4, int(count or 1)))]
+                    except Exception as project_exc:
+                        if job_id:
+                            await self.store.append_log(
+                                job_id,
+                                f"Fallback UI Flow: chưa lấy được ảnh mới sau Flow Agent ({str(project_exc)[:220]}).",
+                            )
                 raise RuntimeError(
                     "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
                     "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong."
@@ -12894,6 +12947,20 @@ exit 1
             settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
             if "flowAgentEnabled" in settings:
                 return self._config_bool(settings.get("flowAgentEnabled"), default=enabled)
+        return enabled
+
+    def _flow_agent_auto_approve_enabled_for_request(self, request: CreateJobRequest) -> bool:
+        enabled = self._config_bool(getattr(request, "flow_agent_auto_approve", True), default=True)
+        try:
+            graph = self._automation_graph_payload(request)
+        except Exception:
+            graph = {"modules": []}
+        for module in graph.get("modules", []):
+            if module.get("type") != "flow":
+                continue
+            settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+            if "flowAgentAutoApprove" in settings:
+                return self._config_bool(settings.get("flowAgentAutoApprove"), default=enabled)
         return enabled
 
     async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
@@ -13022,6 +13089,83 @@ exit 1
             return True, detail
         except Exception as exc:
             return False, humanize_flow_error(str(exc))
+
+    async def _approve_flow_agent_generation(self, page: Any, timeout_s: float = 30.0) -> tuple[bool, str]:
+        deadline = asyncio.get_running_loop().time() + max(2.0, float(timeout_s or 30.0))
+        last_detail = "approval dialog not visible"
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                result = await page.evaluate(
+                    """
+                    () => {
+                      const visible = (el) => {
+                        if (!el || !(el instanceof Element)) return false;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 24 || rect.height < 18) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && style.opacity !== '0'
+                          && rect.bottom > 0
+                          && rect.top < window.innerHeight;
+                      };
+                      const labelFor = (el) => [
+                        el.textContent || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-testid') || '',
+                      ].join(' ').replace(/\\s+/g, ' ').trim();
+                      const bodyText = document.body?.innerText || '';
+                      const approveButtons = [...document.querySelectorAll('button, [role="button"]')]
+                        .filter(visible)
+                        .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                        .filter(({ label }) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm/i.test(label))
+                        .filter(({ label }) => !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label))
+                        .sort((a, b) => (b.rect.right - a.rect.right) || (b.rect.bottom - a.rect.bottom));
+                      const approve = approveButtons[0];
+                      if (!approve) {
+                        const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
+                        return { ok: false, waiting, detail: waiting ? 'approval text visible, approve button not found' : 'approval dialog not visible' };
+                      }
+                      const rememberControls = [...document.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], label, button, [role="button"], div')]
+                        .filter(visible)
+                        .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                        .filter(({ label }) => /không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label))
+                        .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+                      const remember = rememberControls[0];
+                      const approveRect = approve.el.getBoundingClientRect();
+                      const rememberRect = remember?.el?.getBoundingClientRect?.();
+                      approve.el.scrollIntoView({ block: 'center', inline: 'center' });
+                      return {
+                        ok: true,
+                        approveX: approveRect.left + approveRect.width / 2,
+                        approveY: approveRect.top + approveRect.height / 2,
+                        rememberX: rememberRect ? rememberRect.left + Math.min(rememberRect.width - 12, Math.max(12, rememberRect.width * 0.12)) : 0,
+                        rememberY: rememberRect ? rememberRect.top + rememberRect.height / 2 : 0,
+                        hasRemember: Boolean(rememberRect),
+                        detail: approve.label || 'approve',
+                      };
+                    }
+                    """
+                )
+            except Exception as exc:
+                return False, humanize_flow_error(str(exc))
+
+            ok = bool((result or {}).get("ok")) if isinstance(result, dict) else False
+            last_detail = str((result or {}).get("detail") or last_detail).strip() if isinstance(result, dict) else last_detail
+            if not ok:
+                await asyncio.sleep(0.5)
+                continue
+            try:
+                if bool((result or {}).get("hasRemember")):
+                    await page.mouse.click(float((result or {}).get("rememberX")), float((result or {}).get("rememberY")))
+                    await asyncio.sleep(0.25)
+                await page.mouse.click(float((result or {}).get("approveX")), float((result or {}).get("approveY")))
+                await asyncio.sleep(1.0)
+                return True, last_detail
+            except Exception as exc:
+                return False, humanize_flow_error(str(exc))
+        return False, last_detail
 
     async def _click_flow_create_button(self, page: Any) -> tuple[bool, str]:
         try:

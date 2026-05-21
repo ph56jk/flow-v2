@@ -2034,6 +2034,7 @@ function renderModuleSettings(module) {
     const imageAspect = settings.imageAspect || state.drafts.image.aspect;
     const imageCount = settings.imageCount || state.drafts.image.count || 1;
     const flowAgentEnabled = settings.flowAgentEnabled !== false;
+    const flowAgentAutoApprove = settings.flowAgentAutoApprove !== false;
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Model ảnh Flow</span>
@@ -2058,6 +2059,10 @@ function renderModuleSettings(module) {
       <label class="inline-check module-check">
         <input type="checkbox" data-module-setting="flowAgentEnabled"${flowAgentEnabled ? " checked" : ""} />
         <span>Dùng nút Tác nhân trong Google Flow khi có thể</span>
+      </label>
+      <label class="inline-check module-check">
+        <input type="checkbox" data-module-setting="flowAgentAutoApprove"${flowAgentAutoApprove ? " checked" : ""} />
+        <span>Tự phê duyệt Tác nhân Flow khi Flow hỏi xác nhận</span>
       </label>
     `;
     return;
@@ -3048,8 +3053,10 @@ function renderUserAssistant() {
                         value,
                       )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
                         preview.id || "",
-                      )}" ${state.userAssistant?.executing || !value ? "disabled" : ""} title="${escapeHtml(
-                        `Chọn đúng ảnh này trong ${candidate.name || "card Trello"}`,
+                      )}" ${preview.id ? "data-assistant-run-after-select=\"true\"" : ""} ${
+                        state.userAssistant?.executing || !value ? "disabled" : ""
+                      } title="${escapeHtml(
+                        `Chọn và chạy ảnh này trong ${candidate.name || "card Trello"}`,
                       )}">
                         <img src="${escapeHtml(src)}" alt="${escapeHtml(label)}" loading="lazy">
                       </button>`;
@@ -4419,6 +4426,7 @@ function automationImageJobPayload(prompt) {
     telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
     trello_enabled: trelloEnabled,
     flow_agent_enabled: flowSettings.flowAgentEnabled !== false,
+    flow_agent_auto_approve: flowSettings.flowAgentAutoApprove !== false,
     automation_graph: graph,
     trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
     trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
@@ -5595,7 +5603,10 @@ elements.userAssistantAnswer?.addEventListener("click", (event) => {
     });
     if (selected && candidateButton.dataset.assistantRunAfterSelect === "true") {
       window.setTimeout(() => {
-        void executeUserAssistantPlan();
+        const actions = Array.isArray(state.userAssistant?.last?.suggested_actions)
+          ? state.userAssistant.last.suggested_actions.filter((action) => action?.action)
+          : [];
+        void submitAutomationImage({ autoTrello: true, batchLimit: assistantPlanBatchLimit(actions) });
       }, 0);
     }
     return;
