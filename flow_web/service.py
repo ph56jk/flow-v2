@@ -12824,16 +12824,24 @@ exit 1
         ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
         page = await client._bm.page()
         project_url = self._project_url(client.project_id)
+        edit_url = f"{project_url}/edit/{quote(resolved_workflow_id, safe='')}" if resolved_workflow_id else project_url
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: mở project và chọn ảnh nguồn {resolved_workflow_id}.")
         try:
-            await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(edit_url, wait_until="domcontentloaded", timeout=60_000)
         except Exception:
-            await page.goto(project_url, wait_until="commit", timeout=60_000)
+            try:
+                await page.goto(edit_url, wait_until="commit", timeout=60_000)
+            except Exception:
+                await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(2.5)
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: tab hiện tại {str(getattr(page, 'url', '') or '')[:160]}.")
-        selected, selected_detail = await self._select_flow_edit_target_image(page, reference_media_name)
+        selected, selected_detail = await self._select_flow_edit_target_image(
+            page,
+            reference_media_name,
+            allow_visible_fallback=True,
+        )
         if not selected:
             raise RuntimeError(
                 "Google Flow chua chon duoc anh goc tren project, nen em dung lai de tranh tao anh moi tu prompt. "
@@ -13266,12 +13274,18 @@ exit 1
         except Exception as exc:
             return False, humanize_flow_error(str(exc))
 
-    async def _select_flow_edit_target_image(self, page: Any, reference_media_name: str) -> tuple[bool, str]:
+    async def _select_flow_edit_target_image(
+        self,
+        page: Any,
+        reference_media_name: str,
+        *,
+        allow_visible_fallback: bool = False,
+    ) -> tuple[bool, str]:
         media_token = str(reference_media_name or "").strip()
         try:
             result = await page.evaluate(
                 """
-                (mediaToken) => {
+                ({ mediaToken, allowVisibleFallback }) => {
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
                     const rect = el.getBoundingClientRect();
@@ -13334,10 +13348,46 @@ exit 1
                     }
                   }
 
+                  const onEditPage = /\\/edit\\//.test(window.location.pathname || '');
+                  if (allowVisibleFallback || onEditPage) {
+                    const candidates = [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]
+                      .filter(visible)
+                      .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const label = [
+                          el.getAttribute('alt') || '',
+                          el.getAttribute('aria-label') || '',
+                          el.getAttribute('title') || '',
+                          el.getAttribute('data-testid') || '',
+                          el.getAttribute('src') || '',
+                        ].join(' ');
+                        const area = rect.width * rect.height;
+                        const inPrompt = Boolean(el.closest('[contenteditable="true"], textarea, input, button, [role="button"], nav, header'));
+                        const central = rect.bottom > 0
+                          && rect.top < window.innerHeight * 0.88
+                          && rect.left < window.innerWidth * 0.86
+                          && rect.right > 0;
+                        return { el, rect, area, label, inPrompt, central };
+                      })
+                      .filter((item) => !item.inPrompt && item.central && item.area >= 12000)
+                      .sort((a, b) => b.area - a.area);
+                    const fallback = candidates[0];
+                    if (fallback) {
+                      const selected = rectInfo(fallback.el);
+                      if (selected.ok) {
+                        selected.detail = `fallback visible edit image: ${selected.detail}`;
+                      }
+                      return selected;
+                    }
+                  }
+
                   return {ok: false, detail: token ? `media token not visible: ${token}` : 'missing media token'};
                 }
                 """,
-                media_token,
+                {
+                    "mediaToken": media_token,
+                    "allowVisibleFallback": bool(allow_visible_fallback),
+                },
             )
         except Exception as exc:
             return False, humanize_flow_error(str(exc))

@@ -4348,8 +4348,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         class FakePage:
             mouse = FakeMouse()
 
-            async def evaluate(self, script: str, media_token: str) -> dict:
-                self.media_token = media_token
+            async def evaluate(self, script: str, payload: dict) -> dict:
+                self.media_token = payload.get("mediaToken")
+                self.allow_visible_fallback = payload.get("allowVisibleFallback")
                 return {
                     "ok": True,
                     "sourceX": 120,
@@ -4364,10 +4365,54 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertTrue(ok)
         self.assertEqual("media-source", page.media_token)
+        self.assertFalse(page.allow_visible_fallback)
         self.assertIn("drag", detail)
         self.assertIn(("down", None, None), events)
         self.assertIn(("up", None, None), events)
         self.assertEqual(("click", 420, 820), events[-1])
+
+    async def test_select_flow_edit_target_image_allows_visible_edit_fallback(self) -> None:
+        events: list[tuple[str, float | None, float | None]] = []
+
+        class FakeMouse:
+            async def move(self, x: float, y: float) -> None:
+                events.append(("move", x, y))
+
+            async def down(self) -> None:
+                events.append(("down", None, None))
+
+            async def up(self) -> None:
+                events.append(("up", None, None))
+
+            async def click(self, x: float, y: float) -> None:
+                events.append(("click", x, y))
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str, payload: dict) -> dict:
+                self.payload = payload
+                return {
+                    "ok": True,
+                    "sourceX": 210,
+                    "sourceY": 180,
+                    "targetX": 510,
+                    "targetY": 780,
+                    "detail": "fallback visible edit image: drag img 110,80 -> prompt 500,760",
+                }
+
+        page = FakePage()
+        ok, detail = await self.service._select_flow_edit_target_image(
+            page,
+            "media-not-in-dom",
+            allow_visible_fallback=True,
+        )
+
+        self.assertTrue(ok)
+        self.assertTrue(page.payload["allowVisibleFallback"])
+        self.assertEqual("media-not-in-dom", page.payload["mediaToken"])
+        self.assertIn("fallback visible edit image", detail)
+        self.assertEqual(("click", 510, 780), events[-1])
 
     async def test_resolve_image_reference_media_uses_robust_upload_helper(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

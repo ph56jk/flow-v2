@@ -412,10 +412,10 @@ function normalizeAutomationModule(value = {}, index = 0) {
   });
   const sourceTitle = String(value.title || "").trim();
   const sourceDetail = String(value.detail || "").trim();
-  const title = type === "source" && ["Prompt Source", "AI Prompt Source"].includes(sourceTitle)
+  const title = type === "source" && ["Prompt Source", "AI Prompt Source", "Flow AI Prompt"].includes(sourceTitle)
     ? fallback.title
     : String(value.title || fallback.title);
-  const detail = type === "source" && ["Google Sheet / file / nhập tay", "Trello / Sheet / nhập tay", "AI tự viết / Sheet tùy chọn"].includes(sourceDetail)
+  const detail = type === "source" && ["Google Sheet / file / nhập tay", "Trello / Sheet / nhập tay", "AI tự viết / Sheet tùy chọn", "Flow AI tự viết prompt"].includes(sourceDetail)
     ? fallback.detail
     : String(value.detail || fallback.detail);
   return createAutomationModule(type, {
