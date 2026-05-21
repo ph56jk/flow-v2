@@ -13089,6 +13089,51 @@ exit 1
                     continue
 
         if not uploaded:
+            trigger_locators = [
+                page.locator('[aria-label*="Upload" i]').first,
+                page.locator('[aria-label*="Tải" i]').first,
+                page.locator('[aria-label*="Tai" i]').first,
+                page.locator('[aria-label*="Add media" i]').first,
+                page.locator('[aria-label*="Add image" i]').first,
+                page.locator('[data-testid*="upload" i]').first,
+                page.locator("button").filter(has_text=re.compile(r"^\\+$|Upload|Tải|Tai|Thêm|Them|Add", re.I)).first,
+                page.locator('[role="button"]').filter(has_text=re.compile(r"^\\+$|Upload|Tải|Tai|Thêm|Them|Add", re.I)).first,
+            ]
+            for trigger in trigger_locators:
+                try:
+                    if await trigger.count() == 0:
+                        continue
+                    try:
+                        await trigger.scroll_into_view_if_needed(timeout=1200)
+                    except Exception:
+                        pass
+                    async with page.expect_file_chooser(timeout=3500) as chooser_info:
+                        await trigger.click(force=True, timeout=2500)
+                    chooser = await chooser_info.value
+                    await chooser.set_files(str(image_file))
+                    uploaded = True
+                    break
+                except Exception:
+                    try:
+                        for selector in selectors:
+                            locator = page.locator(selector)
+                            count = await locator.count()
+                            for index in range(count):
+                                candidate = locator.nth(index)
+                                try:
+                                    await candidate.set_input_files(str(image_file))
+                                    uploaded = True
+                                    break
+                                except Exception:
+                                    continue
+                            if uploaded:
+                                break
+                    except Exception:
+                        pass
+                    if uploaded:
+                        break
+
+        if not uploaded:
             raise RuntimeError(f"Failed to upload: {image_file}")
 
         deadline = time.monotonic() + 25.0
