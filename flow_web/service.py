@@ -6941,6 +6941,22 @@ exit 1
                                 index,
                                 artifact_url,
                             )
+                            if upscale_2k:
+                                ensured_bytes, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
+                                    self._ensure_image_long_edge_2k,
+                                    source_bytes,
+                                    source_mime or artifact.mime_type or "image/jpeg",
+                                )
+                                if changed:
+                                    source_bytes = ensured_bytes
+                                    source_mime = ensured_mime or "image/jpeg"
+                                    await self.store.append_log(
+                                        job_id,
+                                        (
+                                            f"Đã ép ảnh {index + 1} lên 2K cục bộ "
+                                            f"({source_size[0]}x{source_size[1]} -> {target_size[0]}x{target_size[1]}) trước khi upload Trello."
+                                        ),
+                                    )
                         attachment_payload = await self._trello_attach_file_bytes_with_cover_fallback(
                             job_id,
                             index,
