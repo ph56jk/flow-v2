@@ -829,6 +829,18 @@ class FlowWebService:
         normalized = self._normalize_prompt_source_header(value)
         return normalized in {"true", "1", "yes", "y", "active", "on", "x", "co", "yesrun"}
 
+    def _config_bool(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        normalized = self._normalize_prompt_source_header(str(value))
+        if normalized in {"true", "1", "yes", "y", "active", "on", "x", "co", "bat", "enabled"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off", "tat", "disabled"}:
+            return False
+        return default
+
     def _apply_runtime_integration_env(self, config: IntegrationConfig | None = None) -> None:
         current = config or self.store.snapshot().integration_config
         playwright_path = str(current.playwright_browsers_path or "").strip()
@@ -2348,7 +2360,7 @@ class FlowWebService:
             },
             {
                 "label": "Điều khiển Flow AI",
-                "detail": "AI operator viết prompt, đổ vào Flow, mở project Flow và chạy bằng ảnh nguồn đã chọn.",
+                "detail": "AI operator bấm Tác nhân trong Flow khi nút này hiện, nhập prompt vào ô Bạn muốn tạo gì và chạy bằng ảnh nguồn đã chọn.",
                 "status": "sẵn sàng" if flow.get("project_set") and flow.get("authenticated") else "cần mở Flow",
             },
             {
@@ -2388,8 +2400,8 @@ class FlowWebService:
     ) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = [
             {
-                "label": "Áp dụng prompt Flow AI",
-                "detail": "Đổ prompt AI operator vào ô tạo ảnh và ô chạy thử Flow để dùng ngay.",
+                "label": "Áp dụng prompt Flow Agent",
+                "detail": "Đổ prompt AI operator vào app; khi chạy Flow, app sẽ ưu tiên nút Tác nhân nếu Google Flow đang có.",
                 "action": "apply_flow_ai_prompt",
                 "payload": {"prompt": flow_prompt},
                 "requires_confirmation": False,
@@ -2479,7 +2491,7 @@ class FlowWebService:
             [
                 "Bạn là Flow AI Operator trong app Flow v2.",
                 "Nhiệm vụ: biến yêu cầu người dùng thành kế hoạch automation có thể thao tác Google Flow.",
-                "Quy trình bắt buộc: Trello Ready for AI attachment -> Flow AI Operator tự viết prompt -> Google Flow tạo/chỉnh ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
+                "Quy trình bắt buộc: Trello Ready for AI attachment -> Flow AI Operator tự viết prompt -> ưu tiên nút Tác nhân/Agent trong Google Flow nếu có -> Google Flow tạo/chỉnh ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
                 "Bạn không được yêu cầu secret trong chat và không in API key/token/cookie.",
                 "Trả về duy nhất JSON object, không markdown.",
                 "Schema JSON:",
@@ -5287,6 +5299,18 @@ exit 1
     def _request_with_automation_module_settings(self, request: CreateJobRequest, module: Dict[str, Any]) -> CreateJobRequest:
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         payload = _model_dump(request)
+        if module.get("type") == "flow":
+            if settings.get("imageModel"):
+                payload["model"] = str(settings.get("imageModel") or "").strip()
+            if settings.get("imageAspect"):
+                payload["aspect"] = str(settings.get("imageAspect") or "").strip()
+            if settings.get("imageCount"):
+                try:
+                    payload["count"] = max(1, min(4, int(settings.get("imageCount") or 1)))
+                except Exception:
+                    pass
+            if "flowAgentEnabled" in settings:
+                payload["flow_agent_enabled"] = self._config_bool(settings.get("flowAgentEnabled"), default=True)
         if module.get("type") == "telegram" and settings.get("telegramChat"):
             payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
         if module.get("type") in {"trello", "trello_source"}:
@@ -12716,6 +12740,7 @@ exit 1
                 reference_media_name=reference_media_names[0],
                 count=max(1, min(4, int(request.count or 1))),
                 timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+                flow_agent_enabled=self._flow_agent_enabled_for_request(request),
                 job_id=job_id,
             )
         return await client.generate_image(
@@ -12736,6 +12761,7 @@ exit 1
         workflow_id: str = "",
         count: int = 1,
         timeout_s: int = 120,
+        flow_agent_enabled: bool = True,
         job_id: str = "",
     ) -> List[Any]:
         from flow._ui_interceptor import UIInterceptor
@@ -12776,7 +12802,22 @@ exit 1
         except Exception:
             pass
 
+        if flow_agent_enabled:
+            agent_opened, agent_detail = await self._enable_flow_agent_mode(page)
+            if job_id:
+                if agent_opened:
+                    await self.store.append_log(job_id, f"Fallback UI Flow: đã bật Tác nhân Flow ({agent_detail[:120]}).")
+                else:
+                    await self.store.append_log(
+                        job_id,
+                        f"Fallback UI Flow: chưa thấy nút Tác nhân, chạy bằng prompt thường ({agent_detail[:120]}).",
+                    )
+
         filled = await client._ui.fill_prompt(page, prompt)
+        if not filled and flow_agent_enabled:
+            filled, fill_detail = await self._fill_flow_agent_instruction(page, prompt)
+            if job_id and fill_detail:
+                await self.store.append_log(job_id, f"Fallback UI Flow: nhập prompt bằng ô Tác nhân ({fill_detail[:120]}).")
         if not filled:
             raise RuntimeError("Google Flow chua dien duoc prompt vao man hinh chinh anh.")
         if job_id:
@@ -12841,6 +12882,147 @@ exit 1
             raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
         return images[: max(1, min(4, int(count or 1)))]
 
+    def _flow_agent_enabled_for_request(self, request: CreateJobRequest) -> bool:
+        enabled = self._config_bool(getattr(request, "flow_agent_enabled", True), default=True)
+        try:
+            graph = self._automation_graph_payload(request)
+        except Exception:
+            graph = {"modules": []}
+        for module in graph.get("modules", []):
+            if module.get("type") != "flow":
+                continue
+            settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+            if "flowAgentEnabled" in settings:
+                return self._config_bool(settings.get("flowAgentEnabled"), default=enabled)
+        return enabled
+
+    async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 36 || rect.height < 24) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const controls = [...document.querySelectorAll('button, [role="button"]')]
+                    .filter(visible)
+                    .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                    .filter(({ label }) => /Tác\\s*nhân|Tac\\s*nhan|Agent/i.test(label));
+                  const target = controls
+                    .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (a.rect.left - b.rect.left))[0];
+                  if (!target) return { ok: false, detail: 'no visible Tac nhan/Agent button' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  const rect = target.el.getBoundingClientRect();
+                  return {
+                    ok: true,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    detail: target.label || target.el.outerHTML?.slice(0, 160) || 'Tac nhan',
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        ok = bool((result or {}).get("ok")) if isinstance(result, dict) else False
+        detail = str((result or {}).get("detail") or "").strip() if isinstance(result, dict) else ""
+        if not ok:
+            return False, detail
+        try:
+            await page.mouse.click(float((result or {}).get("x")), float((result or {}).get("y")))
+            await asyncio.sleep(0.8)
+            return True, detail
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+    async def _fill_flow_agent_instruction(self, page: Any, prompt: str) -> tuple[bool, str]:
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            return False, "empty prompt"
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 180 || rect.height < 18) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('placeholder') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                  ].join(' ');
+                  const candidates = [...document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const label = labelFor(el);
+                      let score = rect.top;
+                      if (/Bạn\\s*muốn\\s*tạo\\s*gì|Ban\\s*muon\\s*tao\\s*gi|What\\s+do\\s+you\\s+want|prompt|create/i.test(label)) score += 1000;
+                      if (rect.top > window.innerHeight * 0.45) score += 300;
+                      return { el, rect, label, score };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const target = candidates[0];
+                  if (!target) return { ok: false, detail: 'no prompt textbox for Tac nhan' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  const rect = target.el.getBoundingClientRect();
+                  return {
+                    ok: true,
+                    x: rect.left + Math.min(rect.width - 16, Math.max(16, rect.width * 0.18)),
+                    y: rect.top + rect.height / 2,
+                    detail: target.label.trim() || target.el.tagName,
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        ok = bool((result or {}).get("ok")) if isinstance(result, dict) else False
+        detail = str((result or {}).get("detail") or "").strip() if isinstance(result, dict) else ""
+        if not ok:
+            return False, detail
+        try:
+            await page.mouse.click(float((result or {}).get("x")), float((result or {}).get("y")))
+            await asyncio.sleep(0.15)
+            await page.keyboard.press("Meta+a")
+            await page.keyboard.press("Control+a")
+            await asyncio.sleep(0.05)
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.05)
+            try:
+                await page.keyboard.insert_text(prompt)
+            except Exception:
+                await page.keyboard.type(prompt, delay=10)
+            await asyncio.sleep(0.2)
+            return True, detail
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
     async def _click_flow_create_button(self, page: Any) -> tuple[bool, str]:
         try:
             result = await page.evaluate(
@@ -12855,10 +13037,19 @@ exit 1
                   };
                   const buttons = [...document.querySelectorAll('button')]
                     .filter(visible)
-                    .map((el) => ({el, rect: el.getBoundingClientRect(), text: (el.textContent || '').trim()}))
-                    .filter(({text}) => /Create|Tạo|Tao|arrow_forward|add_2/i.test(text));
+                    .map((el) => ({
+                      el,
+                      rect: el.getBoundingClientRect(),
+                      text: [
+                        el.textContent || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-testid') || '',
+                      ].join(' ').trim(),
+                    }))
+                    .filter(({text}) => /Create|Tạo|Tao|Send|Gửi|Gui|arrow_forward|arrow_upward|send|add_2/i.test(text));
                   const createButtons = buttons
-                    .filter(({text}) => /Create|Tạo|Tao|arrow_forward/i.test(text))
+                    .filter(({text}) => /Create|Tạo|Tao|Send|Gửi|Gui|arrow_forward|arrow_upward|send/i.test(text))
                     .sort((a, b) => (b.rect.top - a.rect.top) || (b.rect.right - a.rect.right));
                   const target = createButtons[0] || buttons.sort((a, b) => (b.rect.top - a.rect.top) || (b.rect.right - a.rect.right))[0];
                   if (!target) return {ok: false, detail: 'no visible create button'};

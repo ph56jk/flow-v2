@@ -53,7 +53,7 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
   flow: {
     label: "Google Flow",
     title: "Google Flow",
-    detail: "Tạo ảnh bằng Flow account",
+    detail: "Tác nhân Flow tạo ảnh",
     icon: "F",
     iconClass: "node-icon-flow",
   },
@@ -101,7 +101,7 @@ const AUTOMATION_STEP_DEFAULTS = {
   },
   flow: {
     title: "Google Flow",
-    detail: "Tạo ảnh bằng Flow account",
+    detail: "Tác nhân Flow tạo ảnh",
   },
   telegram: {
     title: "Telegram Review",
@@ -2033,6 +2033,7 @@ function renderModuleSettings(module) {
     const imageModel = settings.imageModel || state.drafts.image.model;
     const imageAspect = settings.imageAspect || state.drafts.image.aspect;
     const imageCount = settings.imageCount || state.drafts.image.count || 1;
+    const flowAgentEnabled = settings.flowAgentEnabled !== false;
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Model ảnh Flow</span>
@@ -2054,6 +2055,10 @@ function renderModuleSettings(module) {
           <input type="number" min="1" max="4" step="1" data-module-setting="imageCount" value="${escapeHtml(imageCount)}" />
         </label>
       </div>
+      <label class="inline-check module-check">
+        <input type="checkbox" data-module-setting="flowAgentEnabled"${flowAgentEnabled ? " checked" : ""} />
+        <span>Dùng nút Tác nhân trong Google Flow khi có thể</span>
+      </label>
     `;
     return;
   }
@@ -4413,6 +4418,7 @@ function automationImageJobPayload(prompt) {
     telegram_enabled: telegramEnabled,
     telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
     trello_enabled: trelloEnabled,
+    flow_agent_enabled: flowSettings.flowAgentEnabled !== false,
     automation_graph: graph,
     trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
     trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",

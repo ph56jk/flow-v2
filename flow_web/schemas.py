@@ -327,6 +327,7 @@ class CreateJobRequest(BaseModel):
     telegram_chat_id: str = ""
     telegram_enabled: bool = True
     trello_enabled: bool = True
+    flow_agent_enabled: bool = True
     automation_graph: AutomationGraphRequest = Field(default_factory=AutomationGraphRequest)
     trello_board_id: str = ""
     trello_card_id: str = ""

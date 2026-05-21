@@ -1134,6 +1134,31 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("gấu bông", result["product_filter"])
         self.assertIn("apply_flow_ai_prompt", [action.get("action") for action in result["suggested_actions"]])
 
+    def test_flow_module_setting_can_disable_flow_agent(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            flow_agent_enabled=True,
+            automation_graph={
+                "modules": [
+                    {
+                        "id": "flow",
+                        "type": "flow",
+                        "settings": {"flowAgentEnabled": False, "imageCount": 3, "imageAspect": "square"},
+                    }
+                ]
+            },
+        )
+
+        resolved = self.service._request_with_automation_module_settings(
+            request,
+            {"id": "flow", "type": "flow", "settings": {"flowAgentEnabled": False, "imageCount": 3, "imageAspect": "square"}},
+        )
+
+        self.assertFalse(resolved.flow_agent_enabled)
+        self.assertEqual(3, resolved.count)
+        self.assertEqual("square", resolved.aspect)
+
     def test_telegram_review_pack_uses_app_saved_config(self) -> None:
         asyncio.run(
             self.service.update_integration_config(
@@ -4140,6 +4165,42 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertEqual([fake_image], result)
         single_ref.assert_awaited_once()
+
+    async def test_generate_images_via_ui_passes_flow_agent_flag(self) -> None:
+        request = CreateJobRequest(type="image", prompt="them kinh", count=1, flow_agent_enabled=False)
+        fake_image = SimpleNamespace(media_name="img-1")
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(return_value=[fake_image]),
+        ) as single_ref:
+            result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"])
+
+        self.assertEqual([fake_image], result)
+        self.assertFalse(single_ref.await_args.kwargs["flow_agent_enabled"])
+
+    async def test_enable_flow_agent_mode_clicks_visible_tac_nhan_button(self) -> None:
+        events: list[tuple[str, float, float]] = []
+
+        class FakeMouse:
+            async def click(self, x: float, y: float) -> None:
+                events.append(("click", x, y))
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str) -> dict:
+                self.script = script
+                return {"ok": True, "x": 160, "y": 720, "detail": "Tác nhân"}
+
+        page = FakePage()
+        ok, detail = await self.service._enable_flow_agent_mode(page)
+
+        self.assertTrue(ok)
+        self.assertIn("Tác nhân", detail)
+        self.assertEqual([("click", 160, 720)], events)
 
     async def test_select_flow_edit_target_image_drags_source_into_prompt(self) -> None:
         events: list[tuple[str, float | None, float | None]] = []
