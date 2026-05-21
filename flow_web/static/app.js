@@ -21,6 +21,7 @@ const AUTOMATION_CONFIG_VERSION = 1;
 const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jkj2p_H2hsbDgh-kzc0WqUFWtmqR0gYqbE9Zp4U/edit?gid=2137274733#gid=2137274733";
 const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
 const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
+const FLOW_AI_SOURCE_TYPE = "flow_ai";
 const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "telegram", "review_hold", "log"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
@@ -30,8 +31,8 @@ let automationSubmitInFlight = false;
 const AUTOMATION_MODULE_TYPE_CONFIG = {
   source: {
     label: "AI prompt",
-    title: "AI Prompt Source",
-    detail: "AI tự viết / Sheet tùy chọn",
+    title: "Flow AI Prompt",
+    detail: "Flow AI tự viết prompt",
     icon: "T",
     iconClass: "node-icon-trello",
   },
@@ -87,8 +88,8 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
 };
 const AUTOMATION_STEP_DEFAULTS = {
   source: {
-    title: "Prompt Source",
-    detail: "Google Sheet / file / nhập tay",
+    title: "Flow AI Prompt",
+    detail: "Flow AI tự viết prompt",
   },
   trello_source: {
     title: "Trello Image Source",
@@ -382,10 +383,12 @@ function normalizeAutomationModule(value = {}, index = 0) {
   const fallback = createAutomationModule(type, {
     id: value.id || `module_${index + 1}`,
   });
-  const title = type === "source" && String(value.title || "").trim() === "Prompt Source"
+  const sourceTitle = String(value.title || "").trim();
+  const sourceDetail = String(value.detail || "").trim();
+  const title = type === "source" && ["Prompt Source", "AI Prompt Source"].includes(sourceTitle)
     ? fallback.title
     : String(value.title || fallback.title);
-  const detail = type === "source" && String(value.detail || "").trim() === "Google Sheet / file / nhập tay"
+  const detail = type === "source" && ["Google Sheet / file / nhập tay", "Trello / Sheet / nhập tay", "AI tự viết / Sheet tùy chọn"].includes(sourceDetail)
     ? fallback.detail
     : String(value.detail || fallback.detail);
   return createAutomationModule(type, {
@@ -429,8 +432,8 @@ function defaultAutomationConfig() {
     enabled: false,
     view: "diagram",
     selectedStep: "flow",
-    sourceType: "sheets",
-    sourceLocation: DEFAULT_PROMPT_SHEET_URL,
+    sourceType: FLOW_AI_SOURCE_TYPE,
+    sourceLocation: "",
     promptProductFilter: "",
     telegramChat: "",
     sheetLog: "",
@@ -453,12 +456,31 @@ function defaultAutomationConfig() {
 function normalizeAutomationConfig(value = {}) {
   const fallback = defaultAutomationConfig();
   const parsed = value && typeof value === "object" ? value : {};
-  const modules = normalizeAutomationModules(parsed);
+  let modules = normalizeAutomationModules(parsed);
   const hasSelected = modules.some((module) => module.id === parsed?.selectedStep);
   const selectedStep = hasSelected ? parsed.selectedStep : (modules.find((module) => module.type === "flow") || modules[0])?.id || "flow";
   const parsedSourceLocation = String(parsed?.sourceLocation || "").trim();
-  const sourceLocation = parsedSourceLocation || fallback.sourceLocation;
-  const sourceType = parsedSourceLocation ? String(parsed?.sourceType || fallback.sourceType) : fallback.sourceType;
+  const rawParsedSourceType = String(parsed?.sourceType || "").trim();
+  const parsedSourceType = rawParsedSourceType === "ai" ? FLOW_AI_SOURCE_TYPE : rawParsedSourceType;
+  const usedDefaultSheet = !parsedSourceLocation || parsedSourceLocation === DEFAULT_PROMPT_SHEET_URL;
+  const shouldMigrateDefaultSheet = (!parsedSourceType || parsedSourceType === "sheets") && usedDefaultSheet;
+  const sourceType = shouldMigrateDefaultSheet ? FLOW_AI_SOURCE_TYPE : (parsedSourceType || fallback.sourceType);
+  const sourceLocation = shouldMigrateDefaultSheet ? "" : parsedSourceLocation;
+  if (shouldMigrateDefaultSheet) {
+    modules = modules.map((module) => {
+      if (module.type !== "source") {
+        return module;
+      }
+      const settings = { ...(module.settings || {}) };
+      if (!settings.sourceType || settings.sourceType === "sheets") {
+        settings.sourceType = FLOW_AI_SOURCE_TYPE;
+      }
+      if (!settings.sourceLocation || settings.sourceLocation === DEFAULT_PROMPT_SHEET_URL) {
+        settings.sourceLocation = "";
+      }
+      return { ...module, settings };
+    });
+  }
   const trelloBoardId = String(parsed?.trelloBoardId || "").trim() || fallback.trelloBoardId;
   const trelloListId = String(parsed?.trelloListId || "").trim() || fallback.trelloListId;
   return {
@@ -1670,7 +1692,7 @@ function syncAutomationFromForm() {
   }
   state.automation.enabled = Boolean(elements.automationEnabled?.checked);
   state.automation.prompt = elements.automationPromptInput.value;
-  state.automation.sourceType = elements.automationSourceType.value || "manual";
+  state.automation.sourceType = elements.automationSourceType.value || FLOW_AI_SOURCE_TYPE;
   state.automation.sourceLocation = elements.automationSourceLocationInput.value.trim();
   state.automation.promptProductFilter = elements.automationProductFilterInput?.value?.trim() || "";
   state.automation.telegramChat = elements.automationTelegramInput.value.trim();
@@ -1901,7 +1923,7 @@ function renderAutomationInspector(stats) {
     elements.automationPromptInput.value = state.automation.prompt || "";
   }
   if (document.activeElement !== elements.automationSourceType) {
-    elements.automationSourceType.value = state.automation.sourceType || "manual";
+    elements.automationSourceType.value = state.automation.sourceType || FLOW_AI_SOURCE_TYPE;
   }
   if (document.activeElement !== elements.automationSourceLocationInput) {
     elements.automationSourceLocationInput.value = state.automation.sourceLocation || "";
@@ -1979,11 +2001,13 @@ function renderModuleSettings(module) {
   const type = module.type || "custom";
   const settings = module.settings || {};
   if (type === "source") {
-    const sourceType = settings.sourceType || state.automation.sourceType || "manual";
+    const rawSourceType = settings.sourceType || state.automation.sourceType || FLOW_AI_SOURCE_TYPE;
+    const sourceType = rawSourceType === "ai" ? FLOW_AI_SOURCE_TYPE : rawSourceType;
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Nguồn của cục này</span>
         <select data-module-setting="sourceType">
+          <option value="flow_ai"${sourceType === FLOW_AI_SOURCE_TYPE ? " selected" : ""}>Flow AI tự viết prompt</option>
           <option value="manual"${sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
           <option value="trello"${sourceType === "trello" ? " selected" : ""}>Trello list</option>
           <option value="sheets"${sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
@@ -1991,15 +2015,15 @@ function renderModuleSettings(module) {
         </select>
       </label>
       <label class="field">
-        <span>Sheet / CSV link</span>
-        <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(settings.sourceLocation || state.automation.sourceLocation || "")}" placeholder="Dán link Google Sheet hoặc CSV" />
+        <span>Sheet / CSV link tùy chọn</span>
+        <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(settings.sourceLocation || state.automation.sourceLocation || "")}" placeholder="Chỉ dán nếu muốn dùng prompt có sẵn" />
       </label>
       <label class="field">
         <span>Lọc sản phẩm</span>
         <input type="text" data-module-setting="promptProductFilter" value="${escapeHtml(settings.promptProductFilter || state.automation.promptProductFilter || "")}" placeholder="Ví dụ: tote_bag, áo, wedding_hoop" />
       </label>
       <div class="customize-actions source-actions">
-        <button type="button" class="ghost-button card-button" data-module-action="preview-source">Lấy prompt</button>
+        <button type="button" class="ghost-button card-button" data-module-action="preview-source">Lấy prompt tùy chọn</button>
         <button type="button" class="ghost-button card-button" data-module-action="upload-source">Upload file</button>
       </div>
     `;
@@ -2156,7 +2180,10 @@ function renderModuleSettings(module) {
 function renderPromptSourcePreview() {
   const preview = state.promptSourcePreview;
   if (elements.automationSheetStatus) {
-    if (preview?.prompt_count) {
+    if (state.automation.sourceType !== "sheets") {
+      elements.automationSheetStatus.textContent = "Flow AI";
+      elements.automationSheetStatus.dataset.state = "ready";
+    } else if (preview?.prompt_count) {
       elements.automationSheetStatus.textContent = `${preview.active_count || preview.prompt_count} prompt`;
       elements.automationSheetStatus.dataset.state = "ready";
     } else if (state.automation.prompt?.trim()) {
@@ -2172,7 +2199,10 @@ function renderPromptSourcePreview() {
   }
   const items = preview?.preview || [];
   if (!items.length) {
-    elements.automationSheetPreviewList.innerHTML = `<p class="empty-automation-history">Dán link, upload file hoặc paste bảng rồi bấm lấy prompt.</p>`;
+    elements.automationSheetPreviewList.innerHTML =
+      state.automation.sourceType === "sheets"
+        ? `<p class="empty-automation-history">Dán link, upload file hoặc paste bảng rồi bấm lấy prompt.</p>`
+        : `<p class="empty-automation-history">Đang dùng Flow AI: app sẽ phân tích ảnh Trello rồi tự viết prompt, không cần Google Sheet.</p>`;
     return;
   }
   const totalActive = Number(preview?.active_count || items.length || 0);
@@ -2379,9 +2409,18 @@ function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 
     return false;
   }
   const board = String(state.automation.trelloBoardId || state.trello?.board_id || "").trim();
-  const sourceType = String(state.automation.sourceType || "sheets");
+  const sourceType = String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE);
   const hasPrompt = Boolean(String(state.automation.prompt || "").trim());
-  return Boolean(board && (sourceType === "sheets" || sourceType === "trello" || batchItems.length || !hasPrompt));
+  return Boolean(
+    board &&
+      (
+        sourceType === FLOW_AI_SOURCE_TYPE ||
+        sourceType === "sheets" ||
+        sourceType === "trello" ||
+        batchItems.length ||
+        !hasPrompt
+      )
+  );
 }
 
 function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
@@ -4227,7 +4266,7 @@ function syncModuleSettingFromControl(control) {
   module.settings = module.settings || {};
   module.settings[setting] = value;
   if (setting === "sourceType") {
-    state.automation.sourceType = value || "manual";
+    state.automation.sourceType = value || FLOW_AI_SOURCE_TYPE;
     if (elements.automationSourceType) {
       elements.automationSourceType.value = state.automation.sourceType;
     }
@@ -4799,7 +4838,10 @@ function setAssistantProductFilter(value) {
   }
   syncAutomationFromForm();
   state.automation.promptProductFilter = filter;
-  state.automation.sourceType = "sheets";
+  state.automation.sourceType = FLOW_AI_SOURCE_TYPE;
+  if (state.automation.sourceLocation === DEFAULT_PROMPT_SHEET_URL) {
+    state.automation.sourceLocation = "";
+  }
   state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
     if (module.type !== "source") {
       return module;
@@ -4808,10 +4850,18 @@ function setAssistantProductFilter(value) {
       ...module,
       settings: {
         ...(module.settings || {}),
+        sourceType: FLOW_AI_SOURCE_TYPE,
+        sourceLocation: "",
         promptProductFilter: filter,
       },
     };
   });
+  if (elements.automationSourceType) {
+    elements.automationSourceType.value = FLOW_AI_SOURCE_TYPE;
+  }
+  if (elements.automationSourceLocationInput && elements.automationSourceLocationInput.value === DEFAULT_PROMPT_SHEET_URL) {
+    elements.automationSourceLocationInput.value = "";
+  }
   if (elements.automationProductFilterInput) {
     elements.automationProductFilterInput.value = filter;
   }
@@ -5427,7 +5477,9 @@ elements.easyPromptButton?.addEventListener("click", () => {
   state.automation.view = "diagram";
   selectAutomationModuleByType("source", { create: true });
   window.setTimeout(() => {
-    if (!String(state.automation.prompt || "").trim()) {
+    if (state.automation.sourceType !== "sheets") {
+      elements.automationProductFilterInput?.focus();
+    } else if (!String(state.automation.prompt || "").trim()) {
       elements.automationSheetPasteInput?.focus();
     } else {
       elements.automationPromptInput?.focus();

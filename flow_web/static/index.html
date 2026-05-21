@@ -95,8 +95,8 @@
             <div class="scenario-node-row" aria-label="Automation modules">
               <button type="button" class="scenario-node" data-scenario-step="source">
                 <span class="node-icon node-icon-trello">T</span>
-                <strong id="nodeTitleSource">Prompt Source</strong>
-                <small id="nodeDetailSource">Google Sheet / file / nhập tay</small>
+                <strong id="nodeTitleSource">Flow AI Prompt</strong>
+                <small id="nodeDetailSource">Flow AI tự viết prompt</small>
               </button>
               <span class="scenario-link" aria-hidden="true"></span>
               <button type="button" class="scenario-node" data-scenario-step="trello_source">
@@ -164,16 +164,17 @@
               <textarea
                 id="automationPromptInput"
                 rows="3"
-                placeholder="Dán prompt mẫu hoặc prompt vừa lấy từ Trello/Sheets để Flow tạo ảnh."
+                placeholder="Tùy chọn. Nếu để trống, Flow AI sẽ tự viết prompt từ ảnh Trello."
               ></textarea>
             </label>
             <div class="automation-command-side">
               <label class="field">
                 <span>Nguồn prompt</span>
                 <select id="automationSourceType">
+                  <option value="flow_ai">Flow AI tự viết prompt</option>
                   <option value="manual">Nhập tay / clipboard</option>
                   <option value="trello">Trello list</option>
-                  <option value="sheets">Google Sheets</option>
+                  <option value="sheets">Google Sheets tùy chọn</option>
                   <option value="folder">Folder / CSV nội bộ</option>
                 </select>
               </label>
@@ -908,6 +909,6 @@
       </div>
     </div>
 
-    <script type="module" src="/static/app.js?v=20260521b"></script>
+    <script type="module" src="/static/app.js?v=20260521d"></script>
   </body>
 </html>
