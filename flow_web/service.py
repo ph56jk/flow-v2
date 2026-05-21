@@ -12995,6 +12995,7 @@ exit 1
         except Exception:
             pass
 
+        agent_opened = False
         if flow_agent_enabled:
             agent_opened, agent_detail = await self._enable_flow_agent_mode(page)
             if job_id:
@@ -13006,7 +13007,13 @@ exit 1
                         f"Fallback UI Flow: chưa thấy nút Tác nhân, chạy bằng prompt thường ({agent_detail[:120]}).",
                     )
 
-        filled = await client._ui.fill_prompt(page, prompt)
+        filled = False
+        if agent_opened:
+            filled, fill_detail = await self._fill_flow_agent_instruction(page, prompt)
+            if job_id and fill_detail:
+                await self.store.append_log(job_id, f"Fallback UI Flow: nhập prompt bằng ô Tác nhân ({fill_detail[:120]}).")
+        if not filled:
+            filled = await client._ui.fill_prompt(page, prompt)
         if not filled and flow_agent_enabled:
             filled, fill_detail = await self._fill_flow_agent_instruction(page, prompt)
             if job_id and fill_detail:
@@ -13150,6 +13157,29 @@ exit 1
         return enabled
 
     async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
+        locator_patterns = [
+            re.compile(r"Tác\s*nhân|Tac\s*nhan|Agent", re.IGNORECASE),
+            re.compile(r"Bạn\s*muốn\s*tạo\s*gì|Ban\s*muon\s*tao\s*gi|What\s+do\s+you\s+want", re.IGNORECASE),
+        ]
+        for pattern in locator_patterns:
+            for locator_factory in (
+                lambda pat=pattern: page.get_by_role("button", name=pat).first(),
+                lambda pat=pattern: page.get_by_text(pat).first(),
+            ):
+                try:
+                    locator = locator_factory()
+                    if await locator.count():
+                        label = ""
+                        try:
+                            label = str(await locator.inner_text(timeout=800) or "").strip()
+                        except Exception:
+                            label = getattr(pattern, "pattern", "Flow Agent")
+                        await locator.click(timeout=2500)
+                        await asyncio.sleep(0.8)
+                        return True, label or getattr(pattern, "pattern", "Flow Agent")
+                except Exception:
+                    continue
+
         try:
             result = await page.evaluate(
                 """
@@ -13171,9 +13201,13 @@ exit 1
                     el.getAttribute('title') || '',
                     el.getAttribute('data-testid') || '',
                   ].join(' ').replace(/\\s+/g, ' ').trim();
-                  const controls = [...document.querySelectorAll('button, [role="button"]')]
+                  const controls = [...document.querySelectorAll('button, [role="button"], a, div, span')]
                     .filter(visible)
-                    .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                    .map((el) => {
+                      const control = el.closest('button, [role="button"], a') || el;
+                      return { el: control, rect: control.getBoundingClientRect(), label: `${labelFor(el)} ${labelFor(control)}`.trim() };
+                    })
+                    .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
                     .filter(({ label }) => /Tác\\s*nhân|Tac\\s*nhan|Agent/i.test(label));
                   const target = controls
                     .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (a.rect.left - b.rect.left))[0];
@@ -13280,6 +13314,23 @@ exit 1
         deadline = asyncio.get_running_loop().time() + max(2.0, float(timeout_s or 30.0))
         last_detail = "approval dialog not visible"
         while asyncio.get_running_loop().time() < deadline:
+            for pattern in (
+                re.compile(r"Phê\s*duyệt|Phe\s*duyet|Approve|Allow|Confirm", re.IGNORECASE),
+                re.compile(r"^\\s*✓?\\s*Phê\\s*duyệt\\s*$|^\\s*✓?\\s*Approve\\s*$", re.IGNORECASE),
+            ):
+                try:
+                    locator = page.get_by_role("button", name=pattern).first()
+                    if await locator.count():
+                        label = ""
+                        try:
+                            label = str(await locator.inner_text(timeout=800) or "").strip()
+                        except Exception:
+                            label = getattr(pattern, "pattern", "approve")
+                        await locator.click(timeout=2500)
+                        await asyncio.sleep(1.0)
+                        return True, label or getattr(pattern, "pattern", "approve")
+                except Exception:
+                    continue
             try:
                 result = await page.evaluate(
                     """
