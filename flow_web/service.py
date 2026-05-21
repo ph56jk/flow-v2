@@ -1802,6 +1802,7 @@ class FlowWebService:
             raise HTTPException(status_code=400, detail="Batch prompt từ sheet hiện chỉ hỗ trợ tạo ảnh.")
 
         raw_limit = int(request.limit or 0)
+        continuous = bool(request.auto_trello and request.continuous)
         run_until_empty = bool(request.auto_trello and (request.run_until_empty or raw_limit <= 0))
         limit = (
             max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit or self.MAX_PROMPT_BATCH_ITEMS))
@@ -1815,6 +1816,50 @@ class FlowWebService:
                 status_code=400,
                 detail="Hãy nhập lệnh, hoặc bật Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
             )
+        if continuous:
+            base_request, trello_source_hint = await self._continuous_auto_trello_base_request(base_request)
+            batch_key = self._continuous_auto_trello_batch_key(base_request, trello_source_hint)
+            async with self._prompt_batch_lock:
+                active_batch = self._active_prompt_batch_by_key(batch_key)
+                if active_batch is not None:
+                    return active_batch
+                title = str(request.title or "").strip() or "Auto AI Trello: chờ sản phẩm mới liên tục"
+                poll_interval_s = max(1, min(300, int(request.poll_interval_s or 30)))
+                batch_job = JobRecord(
+                    type="batch_image",
+                    status="queued",
+                    title=title,
+                    input={
+                        "type": "batch_image",
+                        "total": 0,
+                        "limit": 0,
+                        "run_until_empty": True,
+                        "continuous": True,
+                        "poll_interval_s": poll_interval_s,
+                        "job": _model_dump(base_request),
+                        "items": items,
+                        "trello_source_hint": trello_source_hint,
+                        "batch_key": batch_key,
+                    },
+                    result={
+                        "total": 0,
+                        "completed": 0,
+                        "failed": 0,
+                        "remaining": 0,
+                        "child_job_ids": [],
+                        "trello_source_hint": trello_source_hint,
+                        "batch_key": batch_key,
+                        "run_until_empty": True,
+                        "continuous": True,
+                        "poll_interval_s": poll_interval_s,
+                        "cycles": 0,
+                    },
+                )
+                await self.store.add_job(batch_job)
+                self._tasks[batch_job.id] = asyncio.create_task(
+                    self._run_continuous_auto_trello_batch(batch_job.id, base_request, items, poll_interval_s)
+                )
+                return batch_job
         if request.auto_trello:
             base_request, items, trello_source_hint = await self._expand_prompt_batch_with_trello_images(
                 base_request,
@@ -1996,6 +2041,74 @@ class FlowWebService:
             payload["trello_list_id"] = str(discovery.get("list_id") or "")
         return CreateJobRequest(**payload), expanded_items, discovery
 
+    async def _continuous_auto_trello_base_request(
+        self,
+        base_request: CreateJobRequest,
+    ) -> tuple[CreateJobRequest, Dict[str, Any]]:
+        graph = self._automation_graph_payload(base_request)
+        module = next(
+            (
+                item
+                for item in graph["modules"]
+                if item["enabled"] and item["type"] == "trello_source"
+            ),
+            None,
+        )
+        if module is None:
+            raise HTTPException(status_code=400, detail="Auto AI Trello liên tục cần bật cục Trello Image Source.")
+
+        module_request = self._request_with_automation_module_settings(base_request, module)
+
+        def _resolve_scope() -> Dict[str, Any]:
+            key, token = self._trello_credentials()
+            if not key or not token:
+                raise RuntimeError("Auto AI Trello liên tục cần API key/token Trello để quét card mới.")
+            trello_config = self.store.snapshot().trello_config
+            board_id = self._normalize_trello_board_id(
+                module_request.trello_board_id
+                or trello_config.board_id
+                or os.getenv("TRELLO_BOARD_ID", "")
+            )
+            if not board_id:
+                raise RuntimeError("Auto AI Trello liên tục cần Board URL/Board ID để tìm card mới.")
+            raw_list_id = self._normalize_trello_id(
+                module_request.trello_list_id
+                or trello_config.list_id
+                or os.getenv("TRELLO_LIST_ID", "")
+            )
+            list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
+            if not list_id:
+                raise RuntimeError(
+                    f"Auto AI Trello liên tục chỉ quét cột {self._default_trello_source_list_name()}. "
+                    "Hãy chọn đúng list trong cục Trello Image Source."
+                )
+            return {
+                "mode": "auto_trello_continuous",
+                "board_id": board_id,
+                "list_id": list_id,
+                "list_name": self._trello_list_name(key, token, list_id),
+                "match_mode": "flow_agent",
+                "prompt_mode": "flow_agent",
+            }
+
+        try:
+            discovery = await asyncio.to_thread(_resolve_scope)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
+
+        payload = _model_dump(module_request)
+        payload["trello_board_id"] = str(discovery.get("board_id") or "")
+        payload["trello_list_id"] = str(discovery.get("list_id") or "")
+        payload["trello_card_id"] = ""
+        payload["trello_attachment_ids"] = []
+        return CreateJobRequest(**payload), discovery
+
+    def _continuous_auto_trello_batch_key(self, request: CreateJobRequest, trello_source_hint: Dict[str, Any]) -> str:
+        board_id = str(trello_source_hint.get("board_id") or request.trello_board_id or "").strip()
+        list_id = str(trello_source_hint.get("list_id") or request.trello_list_id or "").strip()
+        query = self._compact_match_text(self._trello_auto_search_query(request))
+        return "|".join(["continuous_auto_trello", board_id, list_id, query]).strip("|")
+
     def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
         item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
         source_card_id = self._normalize_trello_card_id(str(source_hint.get("card_id") or ""))
@@ -2098,6 +2211,7 @@ class FlowWebService:
         failed: int,
         current_index: int = 0,
         current_child_job_id: str = "",
+        extra: Dict[str, Any] | None = None,
     ) -> None:
         existing = self.store.get_job(batch_id)
         existing_input = existing.input if existing is not None and isinstance(existing.input, dict) else {}
@@ -2105,6 +2219,8 @@ class FlowWebService:
         trello_source_hint = existing_result.get("trello_source_hint") or existing_input.get("trello_source_hint") or {}
         batch_key = str(existing_result.get("batch_key") or existing_input.get("batch_key") or "").strip()
         run_until_empty = bool(existing_result.get("run_until_empty") or existing_input.get("run_until_empty"))
+        continuous = bool(existing_result.get("continuous") or existing_input.get("continuous"))
+        stop_requested = bool(existing_result.get("stop_requested") or existing_input.get("stop_requested"))
         result = {
             "total": total,
             "completed": completed,
@@ -2120,6 +2236,16 @@ class FlowWebService:
             result["batch_key"] = batch_key
         if run_until_empty:
             result["run_until_empty"] = True
+        if continuous:
+            result["continuous"] = True
+            result["poll_interval_s"] = int(existing_result.get("poll_interval_s") or existing_input.get("poll_interval_s") or 30)
+            result["cycles"] = int(existing_result.get("cycles") or 0)
+            result["idle_cycles"] = int(existing_result.get("idle_cycles") or 0)
+            result["last_scan_at"] = str(existing_result.get("last_scan_at") or "")
+        if stop_requested:
+            result["stop_requested"] = True
+        if extra:
+            result.update(extra)
         await self.store.patch_job(
             batch_id,
             result=result,
@@ -2219,6 +2345,211 @@ class FlowWebService:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(batch_id, status="failed", error=detail)
             await self.store.append_log(batch_id, f"Batch sheet thất bại: {detail}")
+
+    def _prompt_batch_stop_requested(self, batch_id: str) -> bool:
+        job = self.store.get_job(batch_id)
+        if job is None:
+            return True
+        result = job.result if isinstance(job.result, dict) else {}
+        input_payload = job.input if isinstance(job.input, dict) else {}
+        return bool(result.get("stop_requested") or input_payload.get("stop_requested"))
+
+    async def request_stop_prompt_batch(self, job_id: str) -> JobRecord:
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy job auto này.")
+        if job.type != "batch_image":
+            raise HTTPException(status_code=400, detail="Chỉ có thể dừng job Auto Trello/batch.")
+        result = dict(job.result or {})
+        result["stop_requested"] = True
+        result["continuous"] = bool(result.get("continuous") or (job.input or {}).get("continuous"))
+        if job.status in {"queued", "running", "polling"}:
+            updated = await self.store.patch_job(job_id, result=result)
+            await self.store.append_log(job_id, "Đã nhận lệnh dừng auto. App sẽ không nhận thêm card mới sau tác vụ hiện tại.")
+            return updated
+        updated = await self.store.patch_job(job_id, result=result)
+        await self.store.append_log(job_id, "Job auto này đã dừng từ trước.")
+        return updated
+
+    def _auto_trello_waitable_empty_error(self, detail: str) -> bool:
+        normalized = self._strip_accents(str(detail or "")).lower()
+        return "chua tim thay card" in normalized or "khong tim thay card" in normalized
+
+    async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
+        remaining = max(1.0, float(poll_interval_s or 30))
+        while remaining > 0:
+            if self._prompt_batch_stop_requested(batch_id):
+                return
+            chunk = min(1.0, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
+
+    async def _run_continuous_auto_trello_batch(
+        self,
+        batch_id: str,
+        base_request: CreateJobRequest,
+        seed_items: List[Dict[str, Any]],
+        poll_interval_s: int,
+    ) -> None:
+        child_job_ids: List[str] = []
+        completed = 0
+        failed = 0
+        planned_total = 0
+        cycles = 0
+        idle_cycles = 0
+        await self.store.patch_job(batch_id, status="running")
+        await self.store.append_log(
+            batch_id,
+            f"Auto AI Trello liên tục đã bật. App sẽ quét Ready for AI mỗi {poll_interval_s}s cho tới khi chủ nhân bấm Dừng.",
+        )
+
+        try:
+            while not self._prompt_batch_stop_requested(batch_id):
+                cycles += 1
+                await self.store.set_progress_hint(
+                    batch_id,
+                    stage="polling",
+                    detail=f"Đang quét Ready for AI lần {cycles}; có card mới sẽ chạy ngay.",
+                )
+                existing = self.store.get_job(batch_id)
+                existing_result = dict(existing.result or {}) if existing is not None else {}
+                existing_result.update(
+                    {
+                        "continuous": True,
+                        "run_until_empty": True,
+                        "poll_interval_s": poll_interval_s,
+                        "cycles": cycles,
+                        "idle_cycles": idle_cycles,
+                        "last_scan_at": utc_now(),
+                    }
+                )
+                await self.store.patch_job(batch_id, result=existing_result)
+
+                try:
+                    scan_request, items, discovery = await self._expand_prompt_batch_with_trello_images(
+                        base_request,
+                        seed_items,
+                        0,
+                    )
+                except HTTPException as exc:
+                    detail = self._flow_error_detail(exc)
+                    if self._auto_trello_waitable_empty_error(detail):
+                        idle_cycles += 1
+                        if idle_cycles == 1 or idle_cycles % 10 == 0:
+                            await self.store.append_log(
+                                batch_id,
+                                f"Chưa có card mới trong Ready for AI. App sẽ quét lại sau {poll_interval_s}s.",
+                            )
+                        await self._patch_prompt_batch_result(
+                            batch_id,
+                            total=planned_total,
+                            child_job_ids=child_job_ids,
+                            completed=completed,
+                            failed=failed,
+                            current_index=0,
+                            current_child_job_id="",
+                            extra={"cycles": cycles, "idle_cycles": idle_cycles, "last_scan_at": utc_now()},
+                        )
+                        await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
+                        continue
+                    raise
+
+                if not items:
+                    idle_cycles += 1
+                    if idle_cycles == 1 or idle_cycles % 10 == 0:
+                        await self.store.append_log(
+                            batch_id,
+                            f"Chưa có card mới trong Ready for AI. App sẽ quét lại sau {poll_interval_s}s.",
+                        )
+                    await self._patch_prompt_batch_result(
+                        batch_id,
+                        total=planned_total,
+                        child_job_ids=child_job_ids,
+                        completed=completed,
+                        failed=failed,
+                        current_index=0,
+                        current_child_job_id="",
+                        extra={"cycles": cycles, "idle_cycles": idle_cycles, "last_scan_at": utc_now()},
+                    )
+                    await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
+                    continue
+
+                idle_cycles = 0
+                planned_total += len(items)
+                await self.store.append_log(
+                    batch_id,
+                    f"Tìm thấy {len(items)} card mới trong Ready for AI. Bắt đầu xử lý lô này.",
+                )
+
+                for item in items:
+                    if self._prompt_batch_stop_requested(batch_id):
+                        break
+                    item_index = completed + failed + 1
+                    child_request = self._prompt_batch_child_request(scan_request, item, item_index - 1, planned_total)
+                    self._validate_job_request(child_request)
+                    child_job = JobRecord(
+                        type="image",
+                        status="queued",
+                        title=child_request.title or self._default_title(child_request),
+                        input=_model_dump(child_request),
+                    )
+                    await self.store.add_job(child_job)
+                    child_job_ids.append(child_job.id)
+                    await self._patch_prompt_batch_result(
+                        batch_id,
+                        total=planned_total,
+                        child_job_ids=child_job_ids,
+                        completed=completed,
+                        failed=failed,
+                        current_index=item_index,
+                        current_child_job_id=child_job.id,
+                    )
+                    await self.store.set_progress_hint(
+                        batch_id,
+                        stage="sending_request",
+                        detail=f"Đang chạy card mới {item_index}/{planned_total}: {child_request.title}",
+                    )
+                    await self.store.append_log(batch_id, f"Đang chạy card mới {item_index}/{planned_total}: {child_request.title}")
+
+                    await self._run_flow_job(child_job.id, child_request)
+                    saved_child = self.store.get_job(child_job.id)
+                    if saved_child is not None and saved_child.status == "completed":
+                        completed += 1
+                        await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} đã xong và ảnh đã gửi về Trello.")
+                    else:
+                        failed += 1
+                        detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
+                        await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} bị lỗi: {detail}")
+
+                    await self._patch_prompt_batch_result(
+                        batch_id,
+                        total=planned_total,
+                        child_job_ids=child_job_ids,
+                        completed=completed,
+                        failed=failed,
+                        current_index=item_index,
+                        current_child_job_id="",
+                    )
+
+                if not self._prompt_batch_stop_requested(batch_id):
+                    await self.store.append_log(batch_id, f"Đã xử lý xong lô hiện tại. App tiếp tục chờ card mới sau {poll_interval_s}s.")
+                    await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
+
+            await self._patch_prompt_batch_result(
+                batch_id,
+                total=planned_total,
+                child_job_ids=child_job_ids,
+                completed=completed,
+                failed=failed,
+                current_index=0,
+                current_child_job_id="",
+            )
+            await self.store.patch_job(batch_id, status="completed", error="")
+            await self.store.append_log(batch_id, f"Đã dừng Auto AI Trello liên tục: {completed} card xong, {failed} card lỗi.")
+        except Exception as exc:
+            detail = self._flow_error_detail(exc)
+            await self.store.patch_job(batch_id, status="failed", error=detail)
+            await self.store.append_log(batch_id, f"Auto AI Trello liên tục thất bại: {detail}")
 
     async def create_skill(self, request: SkillCreateRequest) -> SkillRecord:
         fields_set = self._fields_set(request)

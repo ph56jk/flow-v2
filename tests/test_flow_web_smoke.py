@@ -3773,6 +3773,70 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(45, saved.result["completed"])
         self.assertEqual([f"card-{index}" for index in range(45)], seen_cards)
 
+    async def test_continuous_auto_trello_waits_until_user_stops(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    ]
+                },
+            ),
+            limit=0,
+            auto_trello=True,
+            run_until_empty=True,
+            continuous=True,
+            poll_interval_s=1,
+        )
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=[],
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await asyncio.sleep(0.05)
+            running = self.store.get_job(batch.id)
+            self.assertEqual("running", running.status)
+            self.assertTrue(running.result["continuous"])
+            await self.service.request_stop_prompt_batch(batch.id)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertTrue(saved.result["continuous"])
+        self.assertTrue(saved.result["stop_requested"])
+        self.assertEqual(0, saved.result["completed"])
+        self.assertEqual(0, saved.result["failed"])
+
     async def test_auto_trello_uses_flow_agent_instruction_without_sheet_items(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(

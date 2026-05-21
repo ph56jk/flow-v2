@@ -1755,6 +1755,17 @@ function automationJobs() {
   return (state.jobs || []).filter((job) => job.type === "image" || job.type === "batch_image");
 }
 
+function activeContinuousAutoTrelloJob() {
+  return automationJobs().find((job) => {
+    if (!ACTIVE_STATUSES.has(job.status) || job.type !== "batch_image") {
+      return false;
+    }
+    const input = job.input || {};
+    const result = job.result || {};
+    return Boolean(input.continuous || result.continuous);
+  }) || null;
+}
+
 function automationStepTone(module, stats) {
   const executionNode = latestAutomationExecutionNode(module);
   if (executionNode) {
@@ -2468,6 +2479,7 @@ function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
 function renderEasyPanel(stats) {
   const batchItems = activePromptSourceItems();
   const autoTrelloReady = shouldAutoDiscoverTrello(batchItems);
+  const continuousAutoJob = activeContinuousAutoTrelloJob();
   const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoTrelloReady });
   const displayedBatchCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : batchItems.length;
   const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0 || autoTrelloReady;
@@ -2510,8 +2522,8 @@ function renderEasyPanel(stats) {
       : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
   }
   if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.textContent = autoTrelloReady && !batchItems.length ? "Auto AI Trello" : "Auto Trello";
-    elements.automationAutoRunButton.disabled = stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
+    elements.automationAutoRunButton.textContent = continuousAutoJob ? "Dừng auto" : autoTrelloReady && !batchItems.length ? "Auto AI Trello" : "Auto Trello";
+    elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello"));
   }
   if (elements.automationRunButton) {
     elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
@@ -4472,7 +4484,32 @@ function automationImageJobPayload(prompt) {
   };
 }
 
-async function submitAutomationImage({ autoTrello = false, batchLimit = null } = {}) {
+async function stopContinuousAutoTrello() {
+  const job = activeContinuousAutoTrelloJob();
+  if (!job) {
+    showMessage("Không có Auto AI Trello liên tục nào đang chạy.", "error");
+    return;
+  }
+  if (automationSubmitInFlight) {
+    return;
+  }
+  automationSubmitInFlight = true;
+  if (elements.automationAutoRunButton) {
+    elements.automationAutoRunButton.disabled = true;
+  }
+  try {
+    await api(`/api/jobs/${encodeURIComponent(job.id)}/stop`, { method: "POST" });
+    showMessage("Đã gửi lệnh dừng. App sẽ không nhận thêm card mới sau tác vụ hiện tại.", "success");
+    await loadState({ silent: true });
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    automationSubmitInFlight = false;
+    renderAutomationDashboard();
+  }
+}
+
+async function submitAutomationImage({ autoTrello = false, batchLimit = null, continuousAutoTrello = false } = {}) {
   if (automationSubmitInFlight) {
     return;
   }
@@ -4557,15 +4594,17 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
       await api("/api/jobs/batch", {
         method: "POST",
         body: JSON.stringify({
-          title: autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
-          limit: resolvedBatchLimit,
+          title: continuousAutoTrello ? "Auto AI Trello: chờ sản phẩm mới liên tục" : autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
+          limit: continuousAutoTrello ? 0 : resolvedBatchLimit,
           auto_trello: autoDiscoverTrello,
-          run_until_empty: runUntilReadyEmpty,
+          run_until_empty: continuousAutoTrello || runUntilReadyEmpty,
+          continuous: Boolean(continuousAutoTrello),
+          poll_interval_s: 30,
           job: {
             ...payload,
             title: autoDiscoverTrello ? "Auto image from Trello card" : "Automation image from sheet row",
           },
-          items: batchItems,
+          items: continuousAutoTrello ? [] : batchItems,
         }),
       });
     } else {
@@ -4580,7 +4619,9 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     saveAutomationConfig(state.automation);
     showMessage(
       autoDiscoverTrello
-        ? runUntilReadyEmpty
+        ? continuousAutoTrello
+          ? "Đã bật Auto AI Trello liên tục. App sẽ chờ card mới trong Ready for AI và chạy tới khi bạn bấm Dừng auto."
+          : runUntilReadyEmpty
           ? "Đã xếp hàng auto Trello. App sẽ quét toàn bộ card có ảnh trong Ready for AI và chạy tới khi hết danh sách hiện tại."
           : `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 4 ảnh mỗi card rồi đẩy về đúng card để duyệt trên Trello.`
         : batchItems.length > 1
@@ -5522,7 +5563,13 @@ elements.automationHistoryRefreshButton.addEventListener("click", () => loadStat
 elements.automationIncompleteRefreshButton.addEventListener("click", () => loadState());
 elements.automationRunButton.addEventListener("click", submitAutomationImage);
 elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
-elements.automationAutoRunButton?.addEventListener("click", () => submitAutomationImage({ autoTrello: true }));
+elements.automationAutoRunButton?.addEventListener("click", () => {
+  if (activeContinuousAutoTrelloJob()) {
+    void stopContinuousAutoTrello();
+    return;
+  }
+  void submitAutomationImage({ autoTrello: true, continuousAutoTrello: true });
+});
 elements.automationUseStudioButton.addEventListener("click", useAutomationPromptInStudio);
 elements.automationExportButton.addEventListener("click", exportAutomationConfig);
 elements.automationImportButton.addEventListener("click", () => elements.automationImportFile.click());

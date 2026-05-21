@@ -207,6 +207,12 @@ async def create_prompt_batch(request: Request, payload: PromptBatchRequest) -> 
     return {"job": job}
 
 
+@app.post("/api/jobs/{job_id}/stop")
+async def stop_job(request: Request, job_id: str) -> Dict[str, Any]:
+    job = await service(request).request_stop_prompt_batch(job_id)
+    return {"job": job}
+
+
 @app.get("/api/skills")
 async def list_skills(request: Request) -> Dict[str, Any]:
     return {"items": service(request).get_state()["skills"]}
