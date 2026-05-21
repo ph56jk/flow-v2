@@ -23,7 +23,7 @@ const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
 const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
 const FLOW_AI_SOURCE_TYPE = "flow_ai";
 const FLOW_AGENT_DEFAULT_IMAGE_COUNT = 4;
-const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "telegram", "review_hold", "log"];
+const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "review_hold", "log", "telegram"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
 const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
@@ -60,8 +60,8 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
   },
   telegram: {
     label: "Telegram",
-    title: "Telegram Review",
-    detail: "Gửi ảnh để duyệt",
+    title: "Telegram Optional",
+    detail: "Gửi thêm khi cần",
     icon: "TG",
     iconClass: "node-icon-telegram",
   },
@@ -73,9 +73,9 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
     iconClass: "node-icon-log",
   },
   approval: {
-    label: "Approval",
-    title: "Approval Log",
-    detail: "Ghi trạng thái sau duyệt",
+    label: "Review",
+    title: "Trello Review",
+    detail: "Duyệt trực tiếp trên card Trello",
     icon: "A",
     iconClass: "node-icon-log",
   },
@@ -105,16 +105,16 @@ const AUTOMATION_STEP_DEFAULTS = {
     detail: "Tác nhân Flow tạo ảnh",
   },
   telegram: {
-    title: "Telegram Review",
-    detail: "Gửi ảnh để duyệt",
+    title: "Telegram Optional",
+    detail: "Gửi thêm nếu cần",
   },
   log: {
     title: "Trello Archive",
     detail: "Lưu ảnh vào card/list Trello",
   },
   review_hold: {
-    title: "Pause for approval",
-    detail: "Dừng để chủ nhân duyệt trước khi ghi log",
+    title: "Trello Review",
+    detail: "Ảnh lên đúng card để duyệt trực tiếp",
   },
 };
 const ASPECT_DETAILS = {
@@ -472,7 +472,7 @@ function defaultAutomationConfig() {
     prompt: "",
     appEyebrow: "Flow v2",
     appTitle: "Flow v2",
-    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 4 ảnh và Telegram duyệt.",
+    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 4 ảnh rồi đẩy về đúng card Trello.",
     accentColor: "#7c2ee6",
     canvasZoom: 1,
     modules,
@@ -2172,12 +2172,14 @@ function renderModuleSettings(module) {
       <label class="field">
         <span>Trạng thái duyệt</span>
         <select data-module-setting="approvalMode">
-          <option value="manual"${(settings.approvalMode || "manual") === "manual" ? " selected" : ""}>Duyệt tay</option>
+          <option value="trello"${(settings.approvalMode || "trello") === "trello" ? " selected" : ""}>Duyệt trực tiếp trên Trello</option>
+          <option value="manual"${settings.approvalMode === "manual" ? " selected" : ""}>Duyệt tay</option>
           <option value="telegram"${settings.approvalMode === "telegram" ? " selected" : ""}>Duyệt bằng nút Telegram</option>
           <option value="auto"${settings.approvalMode === "auto" ? " selected" : ""}>Tự ghi log sau khi tạo</option>
         </select>
       </label>
-      <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ duyệt Telegram</button>
+      <small>Auto Trello sẽ upload ảnh tạo xong về đúng card đang chạy. Telegram chỉ dùng khi chủ nhân chọn riêng.</small>
+      <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ Telegram nếu dùng</button>
     `;
     return;
   }
@@ -2473,7 +2475,6 @@ function renderEasyPanel(stats) {
   const projectReady = Boolean(state.config?.project_id);
   const flowModuleReady = automationModuleEnabled("flow");
   const flowReady = flowModuleReady && projectReady && Boolean(state.auth?.authenticated);
-  const telegramReady = automationModuleEnabled("telegram") && Boolean(state.integrations?.telegram?.configured || state.automation.telegramChat);
   const trelloReady = automationModuleEnabled("trello") && Boolean(
     state.trello?.configured ||
     state.automation.trelloBoardId ||
@@ -2490,7 +2491,7 @@ function renderEasyPanel(stats) {
     elements.easyFlowStatus.textContent = flowReady ? "Đã sẵn sàng" : !flowModuleReady ? "Thiếu cục Flow" : projectReady ? "Cần đăng nhập" : "Cần project";
   }
   if (elements.easyReviewStatus) {
-    elements.easyReviewStatus.textContent = telegramReady || trelloReady ? "Đã có nơi nhận" : "Có thể bỏ qua";
+    elements.easyReviewStatus.textContent = trelloReady ? "Duyệt trên Trello" : "Cần Trello";
   }
   const runHint = elements.easyRunButton?.querySelector("small");
   if (runHint) {
@@ -2518,7 +2519,7 @@ function renderEasyPanel(stats) {
   }
   elements.easyPromptButton?.classList.toggle("ready", promptReady);
   elements.easyFlowButton?.classList.toggle("ready", flowReady);
-  elements.easyReviewButton?.classList.toggle("ready", telegramReady || trelloReady);
+  elements.easyReviewButton?.classList.toggle("ready", trelloReady);
   elements.easyRunButton?.classList.toggle("ready", promptReady && flowReady && !stats.active.length);
   if (elements.easyRunButton) {
     elements.easyRunButton.disabled = stats.active.length > 0;
@@ -2967,7 +2968,7 @@ function userAssistantContextSummary() {
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
   const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
   return [
-    "Quy trình chuẩn: Trello Ready for AI attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 4 ảnh -> Telegram duyệt -> upload lại đúng card Trello",
+    "Quy trình chuẩn: Trello Ready for AI attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 4 ảnh -> upload lại đúng card Trello để duyệt trực tiếp",
     "Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list Ready for AI",
     `Màn hình đang ở chế độ ${state.mode}`,
     `Module bật: ${enabledModules || "chưa có"}`,
@@ -2977,7 +2978,7 @@ function userAssistantContextSummary() {
     `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
     `đăng nhập ${state.auth?.authenticated ? "đã có" : "chưa thấy"}`,
     `Trello ${trello.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
-    `Telegram ${integrations.telegram?.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
+    `Telegram ${integrations.telegram?.configured ? "đã cấu hình tùy chọn" : "không bắt buộc"}`,
     `Gemini ${integrations.gemini?.configured ? "đã bật" : "chưa bật"}`,
     `prompt preview ${promptRows} dòng, ${activeRows} dòng active sau lọc`,
     `${activeJobs} job đang chạy`,
@@ -3002,7 +3003,7 @@ function renderUserAssistant() {
 
   if (!last?.answer) {
     elements.userAssistantAnswer.textContent =
-      "Hỏi lỗi Trello, Sheet, Flow hoặc Telegram tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.";
+      "Hỏi lỗi Trello, Sheet hoặc Flow tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.";
     return;
   }
 
@@ -4564,10 +4565,10 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     saveAutomationConfig(state.automation);
     showMessage(
       autoDiscoverTrello
-        ? `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 4 ảnh mỗi card rồi gửi Telegram duyệt.`
+        ? `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 4 ảnh mỗi card rồi đẩy về đúng card để duyệt trên Trello.`
         : batchItems.length > 1
-        ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi gửi Telegram để duyệt.`
-        : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, luồng sẽ dừng ở bước duyệt Telegram/log để chủ nhân xử lý.",
+        ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi đẩy về đúng card Trello để duyệt.`
+        : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, app sẽ lưu về Trello nếu cục Trello đang bật.",
       "success"
     );
     await loadState({ silent: true });

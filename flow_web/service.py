@@ -2404,9 +2404,9 @@ class FlowWebService:
                 "status": "sẵn sàng" if flow.get("project_set") and flow.get("authenticated") else "cần mở Flow",
             },
             {
-                "label": "Duyệt Telegram",
-                "detail": "Ảnh tạo xong gửi sang Telegram; chỉ ảnh được duyệt mới được lưu lại Trello.",
-                "status": "sẵn sàng" if telegram.get("configured") else "cần Telegram",
+                "label": "Duyệt trên Trello",
+                "detail": "Ảnh tạo xong upload thẳng về đúng card đang chạy để chủ nhân duyệt trực tiếp trên Trello.",
+                "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
             },
             {
                 "label": "Lưu lại Trello",
@@ -2480,7 +2480,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy automation Flow",
-                    "detail": "Quét Ready for AI, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo 4 ảnh, gửi Telegram duyệt rồi lưu lại Trello.",
+                    "detail": "Quét Ready for AI, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo 4 ảnh, rồi upload về đúng card Trello để duyệt.",
                     "action": "run_auto_trello",
                     "payload": {"limit": 1, "test_mode": True} if "test" in self._normalize_skill_token(instruction) else {},
                     "requires_confirmation": True,
@@ -2488,9 +2488,9 @@ class FlowWebService:
             )
         actions.append(
             {
-                "label": "Đồng bộ duyệt Telegram",
-                "detail": "Kiểm tra các ảnh đã được người dùng duyệt rồi đẩy kết quả về Trello.",
-                "action": "sync_telegram_approvals",
+                "label": "Duyệt trực tiếp Trello",
+                "detail": "Không cần đồng bộ Telegram: ảnh đã tạo sẽ nằm ngay trong attachment của card Trello nguồn.",
+                "action": "select_trello_source",
                 "requires_confirmation": False,
             }
         )
@@ -2510,7 +2510,7 @@ class FlowWebService:
             "title": "Flow AI Operator",
             "summary": (
                 "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, chuẩn bị lệnh cho Tác nhân Google Flow, "
-                "để Flow Agent tự viết prompt/tạo 4 ảnh, gửi Telegram duyệt và chỉ lưu ảnh đã duyệt về đúng card Trello."
+                "để Flow Agent tự viết prompt/tạo 4 ảnh rồi upload ngay về đúng card Trello để duyệt."
             ),
             "intent": "trello_sheet_flow_telegram_automation",
             "product_filter": product_filter,
@@ -2756,8 +2756,8 @@ class FlowWebService:
                 "product_source": "Trello card attachment trong list Ready for AI",
                 "prompt_source": "Tác nhân Google Flow tự viết prompt theo card Trello; Google Sheet/CSV chỉ là tùy chọn",
                 "flow_step": "Google Flow dùng ảnh nguồn từ đúng card và prompt do chính Tác nhân Flow viết để tạo/chỉnh ảnh",
-                "approval_step": "Telegram gửi ảnh để người dùng duyệt",
-                "archive_step": "Ảnh được duyệt upload lại đúng Trello card nguồn",
+                "approval_step": "Người dùng duyệt trực tiếp trong attachment của card Trello nguồn",
+                "archive_step": "Ảnh tạo xong upload lại đúng Trello card nguồn",
             },
         }
 
@@ -2768,11 +2768,11 @@ class FlowWebService:
         gemini = context.get("gemini", {})
         jobs = context.get("jobs", {})
         lines = [
-            "Quy trình chuẩn: Trello Ready for AI card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 4 ảnh -> Telegram duyệt -> upload lại đúng card Trello.",
+            "Quy trình chuẩn: Trello Ready for AI card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 4 ảnh -> upload lại đúng card Trello để duyệt trực tiếp.",
             "Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list Ready for AI; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
             f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, workflow {'đã chọn' if flow.get('workflow_set') else 'chưa chọn'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}.",
             f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
-            f"Telegram: {'đã cấu hình duyệt' if telegram.get('configured') else 'chưa đủ bot/chat để duyệt'}.",
+            f"Telegram: {'đã cấu hình tùy chọn' if telegram.get('configured') else 'không bắt buộc cho Auto Trello'}.",
             f"AI: {'Gemini ' + str(gemini.get('model') or '') if gemini.get('configured') else 'trợ lý nội bộ'}.",
             f"Jobs: {jobs.get('active', 0)} đang chạy, {jobs.get('completed', 0)} xong, {jobs.get('failed', 0)} lỗi; job mới nhất {jobs.get('latest_type') or 'chưa có'} / {jobs.get('latest_status') or 'chưa có'}.",
         ]
@@ -2991,9 +2991,9 @@ class FlowWebService:
         if any(term in normalized for term in ("duyet", "telegram", "approve", "chap_thuan")):
             actions.append(
                 {
-                    "label": "Đồng bộ duyệt",
-                    "detail": "Sau khi bấm duyệt trên Telegram, app sẽ đồng bộ approval rồi upload ảnh đã duyệt về đúng card Trello.",
-                    "action": "sync_telegram_approvals",
+                    "label": "Duyệt trên Trello",
+                    "detail": "Auto Trello sẽ upload ảnh tạo xong vào attachment của đúng card; chủ nhân duyệt trực tiếp trên Trello.",
+                    "action": "select_trello_source",
                     "requires_confirmation": False,
                 }
             )
@@ -3006,9 +3006,9 @@ class FlowWebService:
                 {
                     "label": "Chạy Auto Trello",
                     "detail": (
-                        "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Telegram."
+                        "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Trello."
                         if test_run
-                        else "App sẽ quét card Ready for AI có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo 4 ảnh rồi gửi Telegram duyệt."
+                        else "App sẽ quét card Ready for AI có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo 4 ảnh rồi upload về đúng card Trello."
                     ),
                     "action": "run_auto_trello",
                     "payload": payload,
@@ -3020,7 +3020,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy Auto Trello",
-                    "detail": "Khi Flow, Trello và Telegram sẵn sàng, bấm Auto Trello để app tự tìm card, gửi Tác nhân Flow viết prompt và chạy hàng loạt.",
+                    "detail": "Khi Flow và Trello sẵn sàng, bấm Auto Trello để app tự tìm card, gửi Tác nhân Flow viết prompt và chạy hàng loạt.",
                     "action": "run_auto_trello",
                     "requires_confirmation": True,
                 }
@@ -3368,7 +3368,7 @@ class FlowWebService:
             )
         elif any(term in normalized for term in ("trello", "ready", "card", "list", "attachment", "anh", "nham")):
             parts.append(
-                "Luồng Trello chuẩn là: app chỉ quét list Ready for AI, lấy ảnh attachment nằm trên chính card đó, gửi lệnh cho Tác nhân Flow tự viết prompt/tạo ảnh, gửi Telegram duyệt, rồi upload ảnh đã duyệt về lại đúng card nguồn."
+                "Luồng Trello chuẩn là: app chỉ quét list Ready for AI, lấy ảnh attachment nằm trên chính card đó, gửi lệnh cho Tác nhân Flow tự viết prompt/tạo ảnh, rồi upload ảnh tạo xong về lại đúng card nguồn để duyệt trực tiếp."
             )
             parts.append(
                 "Nếu thấy lấy nhầm ảnh, hãy kiểm tra card có còn nằm trong Ready for AI không, card đó có attachment ảnh thật không, và bộ lọc/card ghim có trỏ đúng sản phẩm không."
@@ -3382,7 +3382,7 @@ class FlowWebService:
             )
         elif any(term in normalized for term in ("telegram", "duyet", "approve", "chap_thuan")):
             parts.append(
-                "Ảnh tạo xong sẽ được gửi qua Telegram bằng bot đã lưu. Người dùng bấm duyệt, app đồng bộ quyết định đó, rồi mới upload ảnh được duyệt về Trello."
+                "Auto Trello hiện duyệt trực tiếp trên Trello: ảnh tạo xong được upload vào attachment của đúng card. Telegram chỉ còn là tùy chọn nếu chủ nhân bật riêng."
             )
             parts.append(
                 "Nếu không thấy nút duyệt hoạt động, kiểm tra bot token, chat id, và bấm refresh/đồng bộ approval trong app."
@@ -3399,14 +3399,14 @@ class FlowWebService:
                 "App là web local nên chạy được trên macOS, Windows và Ubuntu nếu có Python 3.11+, Node để kiểm tra frontend, và Playwright browser được cài đúng thư mục."
             )
             parts.append(
-                "Trên Windows nên chạy bằng PowerShell/venv, không phụ thuộc biến env thủ công vì Trello, Telegram và Gemini đều lưu được trong giao diện app."
+                "Trên Windows nên chạy bằng PowerShell/venv, không phụ thuộc biến env thủ công vì Trello và Gemini đều lưu được trong giao diện app."
             )
         else:
             parts.append(
-                "Mình có thể hỗ trợ ngay trong app về Trello, Google Sheet, Google Flow, Telegram duyệt, lỗi vòng lặp và cách chạy hàng loạt. Với những việc app đã có nút sẵn, trợ lý sẽ đưa nút thực thi để làm luôn trong giao diện."
+                "Mình có thể hỗ trợ ngay trong app về Trello, Google Sheet tùy chọn, Google Flow, lỗi vòng lặp và cách chạy hàng loạt. Với những việc app đã có nút sẵn, trợ lý sẽ đưa nút thực thi để làm luôn trong giao diện."
             )
             parts.append(
-                "Để chạy đúng luồng, cần có card ở Ready for AI, ảnh attachment trên card, Flow đã đăng nhập, Telegram bot đã lưu, rồi bấm Auto Trello. Sheet prompt chỉ là tùy chọn."
+                "Để chạy đúng luồng, cần có card ở Ready for AI, ảnh attachment trên card, Flow đã đăng nhập, Trello đã lưu, rồi bấm Auto Trello. Sheet prompt chỉ là tùy chọn."
             )
 
         parts.append(f"Trạng thái app hiện tại: {context_summary}")
@@ -3416,7 +3416,7 @@ class FlowWebService:
         prompt_text = "\n".join(
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
-                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 4 ảnh, gửi Telegram duyệt, rồi lưu lại đúng card Trello.",
+                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 4 ảnh, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
                 "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, chọn đúng card/ảnh và đưa các nút thao tác thật; prompt ảnh cuối do Tác nhân trong Google Flow viết.",
                 "Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list Ready for AI. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
                 "Nếu người dùng yêu cầu app làm việc gì, hãy nói app sẽ dùng các nút hành động kèm theo câu trả lời; không bịa hành động ngoài khả năng hiện có.",
@@ -5363,7 +5363,9 @@ exit 1
         if module.get("type") in {"trello", "trello_source"}:
             if settings.get("trelloBoard"):
                 payload["trello_board_id"] = str(settings.get("trelloBoard") or "").strip()
-            if settings.get("trelloCard"):
+            if settings.get("trelloCard") and (
+                module.get("type") == "trello_source" or not str(payload.get("trello_card_id") or "").strip()
+            ):
                 payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
             if settings.get("trelloList"):
                 payload["trello_list_id"] = str(settings.get("trelloList") or "").strip()
@@ -5373,6 +5375,29 @@ exit 1
             if attachment_ids:
                 payload["trello_attachment_ids"] = attachment_ids
         return CreateJobRequest(**payload)
+
+    def _trello_direct_review_enabled(self, request: CreateJobRequest, graph: Dict[str, Any]) -> bool:
+        if request.type != "image" or not request.trello_enabled:
+            return False
+
+        has_trello_archive = any(
+            module.get("enabled") and module.get("type") == "trello"
+            for module in graph.get("modules", [])
+        )
+        if not has_trello_archive:
+            return False
+
+        approval_modes = {
+            str((module.get("settings") or {}).get("approvalMode") or "").strip().lower()
+            for module in graph.get("modules", [])
+            if module.get("enabled") and module.get("type") == "approval"
+        }
+        if "telegram" in approval_modes:
+            return False
+        if approval_modes.intersection({"trello", "direct_trello", "auto"}):
+            return True
+
+        return bool(self._normalize_trello_card_id(request.trello_card_id))
 
     async def _run_automation_post_modules(
         self,
@@ -5386,6 +5411,7 @@ exit 1
     ) -> Dict[str, Any]:
         graph = self._automation_graph_payload(request)
         next_result = dict(result)
+        direct_trello_review = self._trello_direct_review_enabled(request, graph)
         waiting_for_start = bool(str(start_after_module_id or "").strip())
         for module in graph["modules"]:
             if waiting_for_start:
@@ -5402,6 +5428,27 @@ exit 1
             module_request = self._request_with_automation_module_settings(request, module)
             try:
                 if module_type == "telegram":
+                    if direct_trello_review:
+                        output = {
+                            "configured": True,
+                            "skipped": True,
+                            "reason": "trello_direct_review",
+                            "detail": "Auto Trello đang duyệt trực tiếp trên card Trello nên bỏ qua Telegram.",
+                        }
+                        await self._set_automation_module_status(
+                            job_id,
+                            request,
+                            module["id"],
+                            "skipped",
+                            input_data={"artifact_count": len(artifacts), "card_id": request.trello_card_id},
+                            output=output,
+                        )
+                        next_result["telegram"] = output
+                        await self.store.append_log(
+                            job_id,
+                            f"Module {module['title']}: bỏ qua Telegram vì ảnh sẽ được duyệt trực tiếp trên Trello.",
+                        )
+                        continue
                     await self._set_automation_module_status(
                         job_id,
                         request,
@@ -5429,9 +5476,39 @@ exit 1
                     trello_result = await self._archive_trello_artifacts(job_id, module_request, artifacts)
                     if trello_result:
                         next_result["trello"] = trello_result
+                        if direct_trello_review:
+                            next_result["trello_direct_review"] = {
+                                "enabled": True,
+                                "sent": trello_result.get("sent", 0),
+                                "failed": trello_result.get("failed", 0),
+                                "card_id": trello_result.get("card_id") or module_request.trello_card_id,
+                                "card_url": trello_result.get("card_url") or "",
+                                "attachments": trello_result.get("attachments") or [],
+                            }
                     status = "completed" if trello_result.get("configured", True) else "skipped"
                     await self._set_automation_module_status(job_id, request, module["id"], status, output=trello_result or {})
                 elif module_type == "approval":
+                    if direct_trello_review:
+                        output = {
+                            "awaiting_user_approval": False,
+                            "pending": 0,
+                            "trello_direct_review": True,
+                            "card_id": request.trello_card_id,
+                            "detail": "Ảnh tạo xong sẽ nằm ngay trên card Trello đang chạy để duyệt trực tiếp.",
+                        }
+                        await self._set_automation_module_status(
+                            job_id,
+                            request,
+                            module["id"],
+                            "completed",
+                            input_data={"artifact_count": len(artifacts), "card_id": request.trello_card_id},
+                            output=output,
+                        )
+                        await self.store.append_log(
+                            job_id,
+                            f"Module {module['title']}: duyệt trực tiếp trên Trello, không chờ Telegram.",
+                        )
+                        continue
                     waiting_for_telegram = bool(request.telegram_enabled and artifacts)
                     await self._set_automation_module_status(
                         job_id,
@@ -6530,7 +6607,13 @@ exit 1
                 )
 
         if stored:
-            await self.store.append_log(job_id, f"Đã lưu {stored} ảnh lên Trello.")
+            if self._normalize_trello_card_id(request.trello_card_id):
+                await self.store.append_log(
+                    job_id,
+                    f"Đã lưu {stored} ảnh lên đúng card Trello đang chạy để duyệt trực tiếp.",
+                )
+            else:
+                await self.store.append_log(job_id, f"Đã lưu {stored} ảnh lên Trello.")
         return {
             "configured": True,
             "sent": stored,

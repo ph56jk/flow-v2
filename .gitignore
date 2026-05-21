@@ -1,6 +1,7 @@
 .venv/
 .local/
 .pw-browsers/
+.playwright-cli/
 .env.local
 .codex/
 __pycache__/
@@ -16,6 +17,8 @@ data/uploads/*
 data/downloads/*
 data/state.json
 data/_state_dump.json
+.flow-web.log
+.flow-web.pid
 !data/uploads/.gitkeep
 !data/downloads/.gitkeep
 

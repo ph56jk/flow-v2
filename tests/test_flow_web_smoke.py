@@ -2772,7 +2772,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         trello_node = next(node for node in execution["nodes"] if node["type"] == "trello")
         self.assertEqual("card-1", trello_node["output"]["card_id"])
 
-    async def test_trello_source_feeds_flow_and_resume_archives_to_same_card(self) -> None:
+    async def test_trello_source_feeds_flow_and_archives_to_same_card_directly(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         source_image = self.uploads_dir / "trello-source.jpg"
         source_image.write_bytes(b"source-image")
@@ -2797,7 +2797,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     {"id": "telegram-1", "type": "telegram", "title": "Telegram Review"},
                     {"id": "approval-1", "type": "approval", "title": "Approval"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "wrong-card"}},
                 ]
             },
         )
@@ -2829,6 +2829,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         async def fake_telegram(job_id, module_request, artifacts):
             return {"configured": True, "sent": len(artifacts), "chat_id": module_request.telegram_chat_id}
 
+        archive_cards: list[str] = []
+
+        async def fake_archive(job_id, module_request, artifacts):
+            archive_cards.append(module_request.trello_card_id)
+            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
             self.service,
             "_trello_credentials",
@@ -2849,6 +2855,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             self.service,
             "_send_telegram_review_pack",
             side_effect=fake_telegram,
+        ), patch.object(
+            self.service,
+            "_archive_trello_artifacts",
+            side_effect=fake_archive,
         ):
             await self.service._run_flow_job(job.id, request)
 
@@ -2865,28 +2875,17 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         trello_source_node = next(node for node in execution["nodes"] if node["id"] == "trello-source-1")
         self.assertEqual("completed", trello_source_node["status"])
         self.assertEqual(1, trello_source_node["output"]["reference_image_count"])
+        telegram_node = next(node for node in execution["nodes"] if node["id"] == "telegram-1")
+        self.assertEqual("skipped", telegram_node["status"])
+        self.assertEqual("trello_direct_review", telegram_node["output"]["reason"])
         approval_node = next(node for node in execution["nodes"] if node["id"] == "approval-1")
-        self.assertEqual("running", approval_node["status"])
+        self.assertEqual("completed", approval_node["status"])
+        self.assertTrue(approval_node["output"]["trello_direct_review"])
         trello_node = next(node for node in execution["nodes"] if node["id"] == "trello-1")
-        self.assertEqual("pending", trello_node["status"])
-
-        updated_result = dict(saved.result)
-        updated_result["telegram_approvals"] = {"0": {"status": "approved"}}
-        await self.store.patch_job(job.id, result=updated_result)
-        archive_cards: list[str] = []
-
-        async def fake_archive(job_id, module_request, artifacts):
-            archive_cards.append(module_request.trello_card_id)
-            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
-
-        with patch.object(self.service, "_archive_trello_artifacts", side_effect=fake_archive):
-            await self.service._resume_automation_after_approval(job.id, "approval-1")
-
+        self.assertEqual("completed", trello_node["status"])
+        self.assertEqual("abc123", trello_node["output"]["card_id"])
         self.assertEqual(["abc123"], archive_cards)
-        resumed = self.store.get_job(job.id)
-        resumed_trello_node = next(node for node in resumed.result["automation_execution"]["nodes"] if node["id"] == "trello-1")
-        self.assertEqual("completed", resumed_trello_node["status"])
-        self.assertEqual("abc123", resumed_trello_node["output"]["card_id"])
+        self.assertEqual("abc123", saved.result["trello_direct_review"]["card_id"])
 
     async def test_trello_source_resolves_board_link_to_image_card(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
