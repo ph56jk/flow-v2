@@ -1820,6 +1820,8 @@ class FlowWebService:
                 status_code=400,
                 detail="Hãy nhập lệnh, hoặc bật Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
             )
+        if request.auto_trello:
+            base_request = self._auto_trello_flow_agent_request(base_request)
         if continuous:
             base_request, trello_source_hint = await self._continuous_auto_trello_base_request(base_request)
             batch_key = self._continuous_auto_trello_batch_key(base_request, trello_source_hint)
@@ -2061,24 +2063,22 @@ class FlowWebService:
         if module is None:
             raise HTTPException(status_code=400, detail="Auto AI Trello liên tục cần bật cục Trello Image Source.")
 
-        module_request = self._request_with_automation_module_settings(base_request, module)
-
         def _resolve_scope() -> Dict[str, Any]:
             key, token = self._trello_credentials()
             if not key or not token:
                 raise RuntimeError("Auto AI Trello liên tục cần API key/token Trello để quét card mới.")
             trello_config = self.store.snapshot().trello_config
             board_id = self._normalize_trello_board_id(
-                module_request.trello_board_id
-                or trello_config.board_id
+                trello_config.board_id
+                or base_request.trello_board_id
                 or os.getenv("TRELLO_BOARD_ID", "")
             )
             if not board_id:
                 raise RuntimeError("Auto AI Trello liên tục cần Board URL/Board ID để tìm card mới.")
             raw_list_id = self._normalize_trello_id(
-                module_request.trello_list_id
-                or trello_config.list_id
+                trello_config.list_id
                 or os.getenv("TRELLO_LIST_ID", "")
+                or self._default_trello_source_list_name()
             )
             list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
             if not list_id:
@@ -2100,12 +2100,86 @@ class FlowWebService:
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
 
-        payload = _model_dump(module_request)
+        payload = _model_dump(base_request)
+        self._force_auto_trello_flow_agent_policy(payload)
         payload["trello_board_id"] = str(discovery.get("board_id") or "")
         payload["trello_list_id"] = str(discovery.get("list_id") or "")
         payload["trello_card_id"] = ""
         payload["trello_attachment_ids"] = []
+        self._sync_trello_scope_into_automation_graph(
+            payload,
+            board_id=payload["trello_board_id"],
+            list_id=payload["trello_list_id"],
+            card_id="",
+            attachment_ids=[],
+            clear_card=True,
+        )
         return CreateJobRequest(**payload), discovery
+
+    def _auto_trello_flow_agent_request(self, request: CreateJobRequest) -> CreateJobRequest:
+        payload = _model_dump(request)
+        self._force_auto_trello_flow_agent_policy(payload)
+        return CreateJobRequest(**payload)
+
+    def _force_auto_trello_flow_agent_policy(self, payload: Dict[str, Any]) -> None:
+        payload["aspect"] = "square"
+        payload["count"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+        payload["flow_agent_enabled"] = True
+        payload["flow_agent_auto_approve"] = True
+        graph = payload.get("automation_graph")
+        if not isinstance(graph, dict):
+            return
+        modules = graph.get("modules")
+        if not isinstance(modules, list):
+            return
+        for module in modules:
+            if not isinstance(module, dict) or module.get("type") != "flow":
+                continue
+            settings = module.get("settings")
+            if not isinstance(settings, dict):
+                settings = {}
+                module["settings"] = settings
+            settings["imageAspect"] = "square"
+            settings["imageCount"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+            settings["flowAgentEnabled"] = True
+            settings["flowAgentAutoApprove"] = True
+
+    def _sync_trello_scope_into_automation_graph(
+        self,
+        payload: Dict[str, Any],
+        *,
+        board_id: str = "",
+        list_id: str = "",
+        card_id: str = "",
+        attachment_ids: List[str] | None = None,
+        clear_card: bool = False,
+    ) -> None:
+        graph = payload.get("automation_graph")
+        if not isinstance(graph, dict):
+            return
+        modules = graph.get("modules")
+        if not isinstance(modules, list):
+            return
+        normalized_attachments = self._normalize_trello_attachment_ids(attachment_ids or [])
+        for module in modules:
+            if not isinstance(module, dict) or module.get("type") not in {"trello_source", "trello"}:
+                continue
+            settings = module.get("settings")
+            if not isinstance(settings, dict):
+                settings = {}
+                module["settings"] = settings
+            if board_id:
+                settings["trelloBoard"] = board_id
+            if list_id:
+                settings["trelloList"] = list_id
+            if clear_card:
+                settings["trelloCard"] = ""
+                settings["trelloAttachmentIds"] = []
+                settings.pop("trelloAttachmentId", None)
+            elif card_id:
+                settings["trelloCard"] = card_id
+                settings["trelloAttachmentIds"] = normalized_attachments
+                settings.pop("trelloAttachmentId", None)
 
     def _continuous_auto_trello_batch_key(self, request: CreateJobRequest, trello_source_hint: Dict[str, Any]) -> str:
         board_id = str(trello_source_hint.get("board_id") or request.trello_board_id or "").strip()
@@ -2197,12 +2271,21 @@ class FlowWebService:
             payload["count"] = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             payload["flow_agent_enabled"] = True
             payload["flow_agent_auto_approve"] = True
+            self._force_auto_trello_flow_agent_policy(payload)
         if item.get("trello_card_id"):
             payload["trello_card_id"] = str(item.get("trello_card_id") or "").strip()
         if item.get("trello_list_id"):
             payload["trello_list_id"] = str(item.get("trello_list_id") or "").strip()
         if item.get("trello_attachment_ids"):
             payload["trello_attachment_ids"] = self._normalize_trello_attachment_ids(item.get("trello_attachment_ids"))
+        if item.get("trello_card_id") or item.get("trello_list_id"):
+            self._sync_trello_scope_into_automation_graph(
+                payload,
+                board_id=str(payload.get("trello_board_id") or "").strip(),
+                list_id=str(payload.get("trello_list_id") or "").strip(),
+                card_id=str(payload.get("trello_card_id") or "").strip(),
+                attachment_ids=self._normalize_trello_attachment_ids(payload.get("trello_attachment_ids") or []),
+            )
         return CreateJobRequest(**payload)
 
     async def _patch_prompt_batch_result(

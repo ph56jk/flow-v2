@@ -4484,6 +4484,46 @@ function automationImageJobPayload(prompt) {
   };
 }
 
+function forcePayloadToReadyTrelloScope(payload) {
+  if (!payload || typeof payload !== "object") {
+    return payload;
+  }
+  const boardId = String(state.trello?.board_id || payload.trello_board_id || "").trim();
+  const readyListId = String(state.trello?.list_id || payload.trello_list_id || "").trim();
+  payload.trello_board_id = boardId;
+  payload.trello_list_id = readyListId;
+  payload.trello_card_id = "";
+  payload.trello_attachment_ids = [];
+  payload.aspect = "square";
+  payload.count = FLOW_AGENT_DEFAULT_IMAGE_COUNT;
+  payload.flow_agent_enabled = true;
+  payload.flow_agent_auto_approve = true;
+  const modules = Array.isArray(payload.automation_graph?.modules) ? payload.automation_graph.modules : [];
+  modules.forEach((module) => {
+    if (!module || !["trello_source", "trello", "flow"].includes(module.type)) {
+      return;
+    }
+    module.settings = module.settings && typeof module.settings === "object" ? module.settings : {};
+    if (module.type === "flow") {
+      module.settings.imageAspect = "square";
+      module.settings.imageCount = FLOW_AGENT_DEFAULT_IMAGE_COUNT;
+      module.settings.flowAgentEnabled = true;
+      module.settings.flowAgentAutoApprove = true;
+      return;
+    }
+    if (boardId) {
+      module.settings.trelloBoard = boardId;
+    }
+    if (readyListId) {
+      module.settings.trelloList = readyListId;
+    }
+    module.settings.trelloCard = "";
+    module.settings.trelloAttachmentIds = [];
+    delete module.settings.trelloAttachmentId;
+  });
+  return payload;
+}
+
 async function stopContinuousAutoTrello() {
   const job = activeContinuousAutoTrelloJob();
   if (!job) {
@@ -4570,6 +4610,9 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
   const selectedImageDefaultLimit = selectedTrelloImageRun ? 1 : 0;
   const explicitBatchLimit = Number(batchLimit || 0);
   const runUntilReadyEmpty = Boolean(autoDiscoverTrello && !selectedTrelloImageRun && !(Number.isFinite(explicitBatchLimit) && explicitBatchLimit > 0));
+  if (autoDiscoverTrello && !selectedTrelloImageRun) {
+    forcePayloadToReadyTrelloScope(payload);
+  }
   const resolvedBatchLimit = runUntilReadyEmpty
     ? 0
     : Math.max(

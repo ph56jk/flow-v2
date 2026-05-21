@@ -100,6 +100,81 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(400, ctx.exception.status_code)
         self.assertIn("đăng nhập", str(ctx.exception.detail).lower())
 
+    def test_prompt_batch_child_request_syncs_trello_graph_scope_to_item(self) -> None:
+        base = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="board123",
+            trello_card_id="shirt-card",
+            trello_list_id="shirt-list",
+            trello_attachment_ids=["old-att"],
+            automation_graph={
+                "modules": [
+                    {
+                        "id": "trello-source",
+                        "type": "trello_source",
+                        "settings": {
+                            "trelloBoard": "board123",
+                            "trelloCard": "shirt-card",
+                            "trelloList": "shirt-list",
+                            "trelloAttachmentIds": ["old-att"],
+                        },
+                    },
+                    {
+                        "id": "flow",
+                        "type": "flow",
+                        "settings": {
+                            "flowAgentEnabled": False,
+                            "flowAgentAutoApprove": False,
+                            "imageAspect": "landscape",
+                            "imageCount": 1,
+                        },
+                    },
+                    {
+                        "id": "trello-log",
+                        "type": "trello",
+                        "settings": {
+                            "trelloBoard": "board123",
+                            "trelloCard": "shirt-card",
+                            "trelloList": "shirt-list",
+                            "trelloAttachmentIds": ["old-att"],
+                        },
+                    },
+                ]
+            },
+        )
+        child = self.service._prompt_batch_child_request(
+            base,
+            {
+                "prompt": "new prompt",
+                "flow_agent_instruction": True,
+                "trello_card_id": "ready-card",
+                "trello_list_id": "ready-list",
+                "trello_attachment_ids": ["ready-att"],
+            },
+            0,
+            1,
+        )
+
+        self.assertEqual("ready-card", child.trello_card_id)
+        self.assertEqual("ready-list", child.trello_list_id)
+        self.assertEqual(["ready-att"], child.trello_attachment_ids)
+        self.assertEqual("square", child.aspect)
+        self.assertEqual(4, child.count)
+        self.assertTrue(child.flow_agent_enabled)
+        self.assertTrue(child.flow_agent_auto_approve)
+        graph = child.automation_graph.model_dump(mode="json")
+        trello_modules = [module for module in graph["modules"] if module["type"] in {"trello_source", "trello"}]
+        for module in trello_modules:
+            self.assertEqual("ready-list", module["settings"]["trelloList"])
+            self.assertEqual("ready-card", module["settings"]["trelloCard"])
+            self.assertEqual(["ready-att"], module["settings"]["trelloAttachmentIds"])
+        flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
+        self.assertEqual("square", flow_module["settings"]["imageAspect"])
+        self.assertEqual(4, flow_module["settings"]["imageCount"])
+        self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
+        self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
+
     def test_resolve_job_request_applies_config_defaults(self) -> None:
         config = AppConfig(
             project_id="pid",
@@ -3952,6 +4027,87 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(0, saved.result["completed"])
         self.assertEqual(0, saved.result["failed"])
 
+    async def test_continuous_auto_trello_forces_configured_ready_list_over_stale_graph(self) -> None:
+        await self.store.replace_trello_config(
+            TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+        )
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="board123",
+            trello_card_id="shirt-card",
+            trello_list_id="shirt-list",
+            trello_attachment_ids=["old-att"],
+            automation_graph={
+                "modules": [
+                    {
+                        "id": "trello-source",
+                        "type": "trello_source",
+                        "settings": {
+                            "trelloBoard": "board123",
+                            "trelloCard": "shirt-card",
+                            "trelloList": "shirt-list",
+                            "trelloAttachmentIds": ["old-att"],
+                        },
+                    },
+                    {
+                        "id": "flow",
+                        "type": "flow",
+                        "settings": {
+                            "flowAgentEnabled": False,
+                            "flowAgentAutoApprove": False,
+                            "imageAspect": "landscape",
+                            "imageCount": 1,
+                        },
+                    },
+                    {
+                        "id": "trello-log",
+                        "type": "trello",
+                        "settings": {
+                            "trelloBoard": "board123",
+                            "trelloCard": "shirt-card",
+                            "trelloList": "shirt-list",
+                            "trelloAttachmentIds": ["old-att"],
+                        },
+                    },
+                ]
+            },
+        )
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ) as resolve_list, patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ):
+            base, hint = await self.service._continuous_auto_trello_base_request(request)
+
+        resolve_list.assert_called_once_with("key", "token", "board123", "ready-list")
+        self.assertEqual("ready-list", hint["list_id"])
+        self.assertEqual("Ready for AI", hint["list_name"])
+        self.assertEqual("ready-list", base.trello_list_id)
+        self.assertEqual("", base.trello_card_id)
+        self.assertEqual([], base.trello_attachment_ids)
+        self.assertEqual("square", base.aspect)
+        self.assertEqual(4, base.count)
+        self.assertTrue(base.flow_agent_enabled)
+        self.assertTrue(base.flow_agent_auto_approve)
+        graph = base.automation_graph.model_dump(mode="json")
+        trello_modules = [module for module in graph["modules"] if module["type"] in {"trello_source", "trello"}]
+        self.assertEqual(2, len(trello_modules))
+        for module in trello_modules:
+            self.assertEqual("ready-list", module["settings"]["trelloList"])
+            self.assertEqual("", module["settings"]["trelloCard"])
+            self.assertEqual([], module["settings"]["trelloAttachmentIds"])
+        flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
+        self.assertEqual("square", flow_module["settings"]["imageAspect"])
+        self.assertEqual(4, flow_module["settings"]["imageCount"])
+        self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
+        self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
+
     async def test_auto_trello_uses_flow_agent_instruction_without_sheet_items(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
@@ -3959,6 +4115,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 type="image",
                 prompt="Tạo ảnh sản phẩm thương mại để gửi Telegram duyệt",
                 count=1,
+                aspect="landscape",
+                flow_agent_enabled=False,
+                flow_agent_auto_approve=False,
                 prompt_product="gấu bông",
                 prompt_product_key="gấu bông",
                 trello_board_id="https://trello.com/b/board123/demo-board",
@@ -3970,7 +4129,17 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                             "title": "Trello Image Source",
                             "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
                         },
-                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                        {
+                            "id": "flow-1",
+                            "type": "flow",
+                            "title": "Google Flow",
+                            "settings": {
+                                "flowAgentEnabled": False,
+                                "flowAgentAutoApprove": False,
+                                "imageAspect": "landscape",
+                                "imageCount": 1,
+                            },
+                        },
                     ]
                 },
             ),
@@ -3978,7 +4147,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             auto_trello=True,
             items=[],
         )
-        seen: list[tuple[str, str, int, bool, bool]] = []
+        seen: list[tuple[str, str, str, int, bool, bool]] = []
         cards = [
             {
                 "id": "card-bear",
@@ -3995,6 +4164,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 (
                     child_request.prompt,
                     child_request.trello_card_id,
+                    child_request.aspect,
                     child_request.count,
                     child_request.flow_agent_enabled,
                     child_request.flow_agent_auto_approve,
@@ -4049,9 +4219,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             saved.input["items"][0]["shot_labels"],
         )
         self.assertEqual("card-bear", seen[0][1])
-        self.assertEqual(4, seen[0][2])
-        self.assertTrue(seen[0][3])
+        self.assertEqual("square", seen[0][2])
+        self.assertEqual(4, seen[0][3])
         self.assertTrue(seen[0][4])
+        self.assertTrue(seen[0][5])
         self.assertIn("Google Flow Agent", seen[0][0])
         self.assertIn("generate exactly 4", seen[0][0])
         self.assertIn("selected Trello attachment", seen[0][0])
