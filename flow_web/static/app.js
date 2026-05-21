@@ -2947,10 +2947,10 @@ function renderUserAssistant() {
   const canRunSelectedTrelloImage = Boolean(trelloCandidates.length && state.automation?.trelloCardId && selectedAttachmentCount);
   const planButtonLabel = state.userAssistant?.executing
     ? "Đang làm..."
-    : hasRunAction
-      ? "Làm theo kế hoạch"
-      : canRunSelectedTrelloImage
-        ? "Chạy ảnh đã chọn"
+    : canRunSelectedTrelloImage
+      ? "Chạy ảnh đã chọn"
+      : hasRunAction
+        ? "Làm theo kế hoạch"
         : trelloCandidates.length
           ? "Bấm thumbnail ảnh trước"
           : "Làm theo kế hoạch";
@@ -2992,6 +2992,7 @@ function renderUserAssistant() {
             const status = inReady ? "Đúng Ready for AI" : "Có thể chọn trực tiếp";
             const value = candidate.short_link || candidate.card_id || candidate.url || "";
             const previews = Array.isArray(candidate.image_previews) ? candidate.image_previews.filter(Boolean).slice(0, 4) : [];
+            const firstAttachmentId = previews.map((preview) => String(preview?.id || "").trim()).find(Boolean) || "";
             const previewHtml = previews.length
               ? `<div class="assistant-candidate-thumbs" aria-label="Ảnh trong card Trello">
                   ${previews
@@ -3016,9 +3017,11 @@ function renderUserAssistant() {
               value
                 ? `<button type="button" class="ghost-button card-button assistant-candidate-pin" data-assistant-card-value="${escapeHtml(
                     value,
-                  )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" ${
+                  )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
+                    firstAttachmentId,
+                  )}" ${firstAttachmentId ? "data-assistant-run-after-select=\"true\"" : ""} ${
                     state.userAssistant?.executing ? "disabled" : ""
-                  }>${inReady ? "Chọn card" : "Chọn card"}</button>`
+                  }>${firstAttachmentId ? "Chọn & chạy" : "Chọn card"}</button>`
                 : "";
             return `
               <div class="assistant-candidate-item" data-ready="${inReady ? "true" : "false"}">
@@ -5521,10 +5524,15 @@ elements.userAssistantQuickButtons.forEach((button) => {
 elements.userAssistantAnswer?.addEventListener("click", (event) => {
   const candidateButton = event.target.closest("[data-assistant-card-value]");
   if (candidateButton) {
-    setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "", {
+    const selected = setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "", {
       listId: candidateButton.dataset.assistantListId || "",
       attachmentId: candidateButton.dataset.assistantAttachmentId || "",
     });
+    if (selected && candidateButton.dataset.assistantRunAfterSelect === "true") {
+      window.setTimeout(() => {
+        void executeUserAssistantPlan();
+      }, 0);
+    }
     return;
   }
   const planButton = event.target.closest("[data-assistant-action-plan]");

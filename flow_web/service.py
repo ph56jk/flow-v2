@@ -3270,15 +3270,29 @@ class FlowWebService:
             if not value:
                 continue
             in_ready = bool(item.get("in_ready_list"))
+            image_previews = item.get("image_previews") if isinstance(item.get("image_previews"), list) else []
+            first_attachment_id = ""
+            for preview in image_previews:
+                if isinstance(preview, dict) and str(preview.get("id") or "").strip():
+                    first_attachment_id = str(preview.get("id") or "").strip()
+                    break
             refined.append(
                 {
                     "label": f"Chọn card: {item.get('name') or value}",
                     "detail": (
                         f"Card có {item.get('image_count') or 0} ảnh attachment; "
-                        + ("đang ở Ready for AI." if in_ready else "app sẽ chạy trực tiếp card đã chọn, không tự lấy card khác.")
+                        + (
+                            "app sẽ tự dùng ảnh attachment đầu tiên để chạy."
+                            if first_attachment_id
+                            else ("đang ở Ready for AI." if in_ready else "app sẽ chạy trực tiếp card đã chọn, không tự lấy card khác.")
+                        )
                     ),
                     "action": "set_trello_card",
-                    "payload": {"value": value, "list_id": item.get("list_id") or ""},
+                    "payload": {
+                        "value": value,
+                        "list_id": item.get("list_id") or "",
+                        **({"attachment_id": first_attachment_id} if first_attachment_id else {}),
+                    },
                     "requires_confirmation": False,
                 }
             )

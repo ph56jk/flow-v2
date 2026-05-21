@@ -798,6 +798,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertNotIn("run_auto_trello", action_names)
         self.assertIn("set_trello_card", action_names)
+        pin_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_trello_card")
+        self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
         self.assertIn("Trello scan theo", result["context_summary"])
 
     def test_user_assistant_can_pin_ready_trello_candidate(self) -> None:
@@ -813,7 +815,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "shortLink": "bear",
                 "url": "https://trello.com/c/bear",
                 "idList": "ready-list",
-                "attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
+                "attachments": [{"id": "att-bear", "name": "gau-bong.png", "mimeType": "image/png"}],
             }
         ]
 
@@ -845,7 +847,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             for action in result["suggested_actions"]
             if action.get("action") == "set_trello_card" and action.get("payload", {}).get("value") == "bear"
         )
-        self.assertIn("Ready for AI", pin_action["detail"])
+        self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
+        self.assertIn("ảnh attachment đầu tiên", pin_action["detail"])
 
     def test_user_assistant_searches_child_shirt_candidates_by_synonym(self) -> None:
         asyncio.run(
