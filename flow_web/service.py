@@ -241,6 +241,7 @@ class FlowWebService:
         self._apply_runtime_integration_env()
         self._tasks: Dict[str, asyncio.Task] = {}
         self._browser_session_lock = asyncio.Lock()
+        self._prompt_batch_lock = asyncio.Lock()
         self._telegram_approval_sync_lock = asyncio.Lock()
         self._last_telegram_approval_sync_error = ""
         self._shared_browser: Any | None = None
@@ -1832,61 +1833,62 @@ class FlowWebService:
         else:
             items = items[:limit]
         batch_key = self._prompt_batch_key(base_request, items, trello_source_hint)
-        active_batch = self._active_prompt_batch_by_key(batch_key)
-        if active_batch is not None:
-            return active_batch
+        async with self._prompt_batch_lock:
+            active_batch = self._active_prompt_batch_by_key(batch_key)
+            if active_batch is not None:
+                return active_batch
 
-        validation_payload = _model_dump(base_request)
-        validation_payload["prompt"] = items[0]["prompt"]
-        self._validate_job_request(CreateJobRequest(**validation_payload))
+            validation_payload = _model_dump(base_request)
+            validation_payload["prompt"] = items[0]["prompt"]
+            self._validate_job_request(CreateJobRequest(**validation_payload))
 
-        title = (
-            str(request.title or "").strip()
-            or (
-                f"Auto Trello Flow Agent: tạo 4 ảnh cho {len(items)} card"
-                if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
-                else f"Auto Trello Flow Agent: chạy đến hết Ready for AI ({len(items)} card)"
-                if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
-                else f"Auto Trello AI: tạo {len(items)} ảnh từ card có ảnh"
-                if request.auto_trello and not run_until_empty and any(item.get("generated_by_ai") for item in items)
-                else f"Auto Trello AI: chạy đến hết Ready for AI ({len(items)} card)"
-                if request.auto_trello and run_until_empty and any(item.get("generated_by_ai") for item in items)
-                else f"Auto Trello: tạo {len(items)} ảnh từ card có ảnh"
-                if request.auto_trello and not run_until_empty
-                else f"Auto Trello: chạy đến hết Ready for AI ({len(items)} card)"
-                if request.auto_trello and run_until_empty
-                else f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}"
-                if trello_source_hint.get("card_name")
-                else f"Chạy batch {len(items)} prompt từ sheet"
+            title = (
+                str(request.title or "").strip()
+                or (
+                    f"Auto Trello Flow Agent: tạo 4 ảnh cho {len(items)} card"
+                    if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                    else f"Auto Trello Flow Agent: chạy đến hết Ready for AI ({len(items)} card)"
+                    if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                    else f"Auto Trello AI: tạo {len(items)} ảnh từ card có ảnh"
+                    if request.auto_trello and not run_until_empty and any(item.get("generated_by_ai") for item in items)
+                    else f"Auto Trello AI: chạy đến hết Ready for AI ({len(items)} card)"
+                    if request.auto_trello and run_until_empty and any(item.get("generated_by_ai") for item in items)
+                    else f"Auto Trello: tạo {len(items)} ảnh từ card có ảnh"
+                    if request.auto_trello and not run_until_empty
+                    else f"Auto Trello: chạy đến hết Ready for AI ({len(items)} card)"
+                    if request.auto_trello and run_until_empty
+                    else f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}"
+                    if trello_source_hint.get("card_name")
+                    else f"Chạy batch {len(items)} prompt từ sheet"
+                )
             )
-        )
-        batch_job = JobRecord(
-            type="batch_image",
-            status="queued",
-            title=title,
-            input={
-                "type": "batch_image",
-                "total": len(items),
-                "limit": limit,
-                "run_until_empty": run_until_empty,
-                "job": _model_dump(base_request),
-                "items": items,
-                "trello_source_hint": trello_source_hint,
-                "batch_key": batch_key,
-            },
-            result={
-                "total": len(items),
-                "completed": 0,
-                "failed": 0,
-                "child_job_ids": [],
-                "trello_source_hint": trello_source_hint,
-                "batch_key": batch_key,
-                "run_until_empty": run_until_empty,
-            },
-        )
-        await self.store.add_job(batch_job)
-        self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
-        return batch_job
+            batch_job = JobRecord(
+                type="batch_image",
+                status="queued",
+                title=title,
+                input={
+                    "type": "batch_image",
+                    "total": len(items),
+                    "limit": limit,
+                    "run_until_empty": run_until_empty,
+                    "job": _model_dump(base_request),
+                    "items": items,
+                    "trello_source_hint": trello_source_hint,
+                    "batch_key": batch_key,
+                },
+                result={
+                    "total": len(items),
+                    "completed": 0,
+                    "failed": 0,
+                    "child_job_ids": [],
+                    "trello_source_hint": trello_source_hint,
+                    "batch_key": batch_key,
+                    "run_until_empty": run_until_empty,
+                },
+            )
+            await self.store.add_job(batch_job)
+            self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
+            return batch_job
 
     def _prompt_batch_items(self, items: List[PromptBatchItemRequest], limit: int) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
@@ -3205,7 +3207,6 @@ class FlowWebService:
                 {
                     "id": attachment_id,
                     "name": str(attachment.get("name") or "").strip(),
-                    "url": url,
                     "preview_url": preview_url,
                     "mime_type": str(attachment.get("mimeType") or "").strip(),
                 }
@@ -6499,6 +6500,11 @@ exit 1
             request.trello_card_id or trello_config.card_id or os.getenv("TRELLO_CARD_ID", "")
         )
         list_id = self._normalize_trello_id(request.trello_list_id or trello_config.list_id or os.getenv("TRELLO_LIST_ID", ""))
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id or trello_config.board_id or os.getenv("TRELLO_BOARD_ID", "")
+        )
+        if list_id and board_id:
+            list_id = await asyncio.to_thread(self._trello_resolve_board_list_id, key, token, board_id, list_id)
         set_cover = bool(request.trello_set_cover and trello_config.set_cover is not False)
         card_url = ""
         created_card = False
@@ -6657,6 +6663,15 @@ exit 1
         token = str(config.token or "").strip() or os.getenv("TRELLO_TOKEN", "").strip()
         return key, token
 
+    def _redact_trello_secret(self, value: Any, key: str = "", token: str = "") -> str:
+        text = str(value or "")
+        for secret in {str(key or "").strip(), str(token or "").strip()}:
+            if secret:
+                text = text.replace(secret, "[redacted]")
+        text = re.sub(r"(?i)([?&](?:key|token)=)[^&\s]+", r"\1[redacted]", text)
+        text = re.sub(r"(?i)\b(key|token)=([^&\s]+)", r"\1=[redacted]", text)
+        return text
+
     def _normalize_trello_id(self, value: str) -> str:
         raw = str(value or "").strip()
         if not raw:
@@ -6762,9 +6777,10 @@ exit 1
                 return json.loads(raw_payload) if raw_payload else {}
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail or exc.reason}") from exc
+            detail = self._redact_trello_secret(detail or exc.reason, key, token)
+            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
         except URLError as exc:
-            raise RuntimeError(str(exc.reason or exc)) from exc
+            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
 
     def _download_trello_card_image_attachments(
         self,
@@ -7812,6 +7828,8 @@ exit 1
             image_attachments = [
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
+            if any(self._trello_attachment_is_flow_output(item) for item in image_attachments):
+                continue
             if image_attachments:
                 card["_image_attachments"] = image_attachments
                 image_cards.append(card)
@@ -7831,6 +7849,10 @@ exit 1
         name = str(attachment.get("name") or "").lower()
         mime = str(attachment.get("mimeType") or "").lower()
         return mime.startswith("image/") or Path(name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+    def _trello_attachment_is_flow_output(self, attachment: Dict[str, Any]) -> bool:
+        name = str(attachment.get("name") or "").strip().lower()
+        return name.startswith("flow-")
 
     def _trello_download_attachment_bytes(
         self,
@@ -7886,9 +7908,10 @@ exit 1
                 return json.loads(raw_payload) if raw_payload else {}
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail or exc.reason}") from exc
+            detail = self._redact_trello_secret(detail or exc.reason, key, token)
+            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
         except URLError as exc:
-            raise RuntimeError(str(exc.reason or exc)) from exc
+            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
 
     def _trello_create_card(self, key: str, token: str, list_id: str, name: str, description: str) -> Dict[str, Any]:
         payload = self._trello_request_json(

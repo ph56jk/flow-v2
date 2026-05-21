@@ -1727,7 +1727,6 @@ function syncAutomationFromForm() {
   state.automation.trelloBoardId =
     elements.automationTrelloBoardInput?.value?.trim() ||
     elements.automationTrelloBoardStorageInput?.value?.trim() ||
-    state.automation.trelloBoardId ||
     "";
   state.automation.trelloCardId = elements.automationTrelloCardInput.value.trim();
   state.automation.trelloListId = elements.automationTrelloListInput.value.trim();
@@ -1753,7 +1752,7 @@ function syncAutomationFromForm() {
 }
 
 function automationJobs() {
-  return (state.jobs || []).filter((job) => job.type === "image");
+  return (state.jobs || []).filter((job) => job.type === "image" || job.type === "batch_image");
 }
 
 function automationStepTone(module, stats) {
@@ -2512,7 +2511,7 @@ function renderEasyPanel(stats) {
   }
   if (elements.automationAutoRunButton) {
     elements.automationAutoRunButton.textContent = autoTrelloReady && !batchItems.length ? "Auto AI Trello" : "Auto Trello";
-    elements.automationAutoRunButton.disabled = stats.active.length > 0 || !automationModuleEnabled("trello_source");
+    elements.automationAutoRunButton.disabled = stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
   }
   if (elements.automationRunButton) {
     elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
@@ -4357,6 +4356,8 @@ function syncModuleSettingFromControl(control) {
       .filter(Boolean);
     state.automation.trelloAttachmentIds = ids;
     module.settings[setting] = ids;
+  } else if (setting === "trelloAttachmentLimit") {
+    module.settings[setting] = Math.max(1, Math.min(4, Number(value || 1)));
   } else if (setting === "trelloUploadMode") {
     state.trello.upload_mode = value || "file";
     if (elements.automationTrelloUploadMode) {
@@ -4480,7 +4481,11 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     ? state.automation.trelloAttachmentIds.filter(Boolean)
     : [];
   const selectedTrelloCard = String(state.automation.trelloCardId || "").trim();
-  const selectedTrelloImageRun = Boolean(autoTrello && selectedTrelloCard && selectedTrelloAttachmentIds.length);
+  const selectedTrelloImageCandidate = Boolean(selectedTrelloCard && selectedTrelloAttachmentIds.length);
+  const selectedTrelloImageRun = Boolean(
+    selectedTrelloImageCandidate &&
+      (autoTrello || shouldAutoDiscoverTrello([]) || String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE) === FLOW_AI_SOURCE_TYPE)
+  );
   let batchItems = selectedTrelloImageRun ? [] : activePromptSourceItems({ limit: autoTrello ? Infinity : 500 });
   const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
   const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
@@ -4516,6 +4521,11 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
   if (autoDiscoverTrello && !automationModuleEnabled("trello_source")) {
     showMessage("Auto Trello cần bật cục Trello Image Source để tự tìm ảnh trong card.", "error");
     selectAutomationModuleByType("trello_source", { create: true });
+    return;
+  }
+  if (autoDiscoverTrello && !automationModuleEnabled("trello")) {
+    showMessage("Auto Trello cần bật cục Trello Archive để ảnh tạo xong được lưu về đúng card.", "error");
+    selectAutomationModuleByType("trello", { create: true });
     return;
   }
 

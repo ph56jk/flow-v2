@@ -555,6 +555,45 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual([], cards)
         get_json.assert_not_called()
 
+    def test_trello_image_card_scan_skips_cards_already_generated_by_flow(self) -> None:
+        cards_payload = [
+            {"id": "done-card", "name": "Done", "idList": "ready-list"},
+            {"id": "fresh-card", "name": "Fresh", "idList": "ready-list"},
+        ]
+        done_attachments = [
+            {"id": "source", "name": "source.png", "mimeType": "image/png"},
+            {"id": "flow-output", "name": "flow-abc12345-1.jpg", "mimeType": "image/jpeg"},
+        ]
+        fresh_attachments = [{"id": "fresh-source", "name": "fresh.png", "mimeType": "image/png"}]
+
+        with patch.object(
+            self.service,
+            "_trello_get_json",
+            side_effect=[cards_payload, done_attachments, fresh_attachments],
+        ):
+            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+
+        self.assertEqual(["fresh-card"], [card["id"] for card in cards])
+        self.assertEqual("fresh-source", cards[0]["_image_attachments"][0]["id"])
+
+    def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
+        previews = self.service._trello_candidate_image_previews(
+            "card-1",
+            [{"id": "att-1", "name": "source.png", "url": "https://trello.local/source.png", "mimeType": "image/png"}],
+        )
+
+        self.assertEqual("/api/trello/cards/card-1/attachments/att-1/preview", previews[0]["preview_url"])
+        self.assertNotIn("url", previews[0])
+
+    def test_trello_secret_redaction_masks_query_tokens(self) -> None:
+        message = "failed: https://api.trello.com/1/cards?key=mykey&token=mytoken token=mytoken"
+
+        redacted = self.service._redact_trello_secret(message, "mykey", "mytoken")
+
+        self.assertNotIn("mykey", redacted)
+        self.assertNotIn("mytoken", redacted)
+        self.assertIn("[redacted]", redacted)
+
     def test_download_trello_card_image_attachments_uses_selected_attachment_only(self) -> None:
         attachments = [
             {"id": "att-wrong", "name": "wrong.png", "url": "https://trello.local/wrong.png", "mimeType": "image/png"},
