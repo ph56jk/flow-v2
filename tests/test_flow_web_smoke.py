@@ -800,6 +800,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("set_trello_card", action_names)
         pin_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_trello_card")
         self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
+        self.assertTrue(pin_action["payload"]["run_after_select"])
+        self.assertTrue(pin_action["label"].startswith("Chọn & chạy"))
         self.assertIn("Trello scan theo", result["context_summary"])
 
     def test_user_assistant_can_pin_ready_trello_candidate(self) -> None:
@@ -848,6 +850,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             if action.get("action") == "set_trello_card" and action.get("payload", {}).get("value") == "bear"
         )
         self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
+        self.assertTrue(pin_action["payload"]["run_after_select"])
+        self.assertTrue(pin_action["label"].startswith("Chọn & chạy"))
         self.assertIn("ảnh attachment đầu tiên", pin_action["detail"])
 
     def test_user_assistant_searches_child_shirt_candidates_by_synonym(self) -> None:

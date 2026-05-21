@@ -3047,10 +3047,11 @@ function renderUserAssistant() {
     ? `<div class="assistant-action-list">${actions
         .map((action, index) => {
           const canExecute = Boolean(action.action);
+          const buttonLabel = action.action === "set_trello_card" && action.payload?.run_after_select ? "Chọn & chạy" : "Thực hiện";
           const button = canExecute
             ? `<button type="button" class="ghost-button card-button assistant-action-button" data-assistant-action-index="${index}" ${
                 state.userAssistant?.executing ? "disabled" : ""
-              }>Thực hiện</button>`
+              }>${buttonLabel}</button>`
             : "";
           return `
             <div class="assistant-action-item">
@@ -4954,10 +4955,16 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
     if (actionName === "apply_product_filter") {
       setAssistantProductFilter(action.payload?.value || "");
     } else if (actionName === "set_trello_card") {
-      setAssistantTrelloCard(action.payload?.value || "", {
+      const selected = setAssistantTrelloCard(action.payload?.value || "", {
         listId: action.payload?.list_id || "",
         attachmentId: action.payload?.attachment_id || "",
       });
+      if (selected && action.payload?.run_after_select) {
+        await submitAutomationImage({
+          autoTrello: true,
+          batchLimit: assistantPlanBatchLimit(state.userAssistant?.last?.suggested_actions || []),
+        });
+      }
     } else if (actionName === "plan_flow_ai_operator") {
       await requestFlowAiOperatorPlan(action.payload?.instruction || "");
     } else if (actionName === "apply_flow_ai_prompt") {

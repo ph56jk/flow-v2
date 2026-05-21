@@ -3278,7 +3278,7 @@ class FlowWebService:
                     break
             refined.append(
                 {
-                    "label": f"Chọn card: {item.get('name') or value}",
+                    "label": f"{'Chọn & chạy' if first_attachment_id else 'Chọn card'}: {item.get('name') or value}",
                     "detail": (
                         f"Card có {item.get('image_count') or 0} ảnh attachment; "
                         + (
@@ -3291,7 +3291,11 @@ class FlowWebService:
                     "payload": {
                         "value": value,
                         "list_id": item.get("list_id") or "",
-                        **({"attachment_id": first_attachment_id} if first_attachment_id else {}),
+                        **(
+                            {"attachment_id": first_attachment_id, "run_after_select": True}
+                            if first_attachment_id
+                            else {}
+                        ),
                     },
                     "requires_confirmation": False,
                 }
