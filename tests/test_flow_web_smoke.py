@@ -3539,6 +3539,85 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
         self.assertEqual(["card-bear", "card-hoop"], [job.input["trello_card_id"] for job in child_jobs])
 
+    async def test_auto_trello_run_until_empty_processes_all_ready_cards(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    ]
+                },
+            ),
+            limit=0,
+            auto_trello=True,
+            run_until_empty=True,
+        )
+        cards = [
+            {
+                "id": f"card-{index}",
+                "name": f"Ready product {index}",
+                "shortLink": f"short-{index}",
+                "url": f"https://trello.com/c/card-{index}",
+                "idList": "ready-list",
+                "_image_attachments": [{"id": f"att-{index}", "name": f"image-{index}.jpg", "mimeType": "image/jpeg"}],
+            }
+            for index in range(45)
+        ]
+        seen_cards: list[str] = []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_cards.append(child_request.trello_card_id)
+            await self.store.patch_job(job_id, status="completed", result={"count": child_request.count, "mode": "image"})
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertTrue(saved.input["run_until_empty"])
+        self.assertTrue(saved.result["run_until_empty"])
+        self.assertEqual(45, saved.input["limit"])
+        self.assertEqual(45, saved.result["total"])
+        self.assertEqual(45, saved.result["completed"])
+        self.assertEqual([f"card-{index}" for index in range(45)], seen_cards)
+
     async def test_auto_trello_uses_flow_agent_instruction_without_sheet_items(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(

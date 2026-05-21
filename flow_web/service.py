@@ -1800,7 +1800,13 @@ class FlowWebService:
         if base_request.type != "image":
             raise HTTPException(status_code=400, detail="Batch prompt từ sheet hiện chỉ hỗ trợ tạo ảnh.")
 
-        limit = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(request.limit or self.MAX_PROMPT_BATCH_ITEMS)))
+        raw_limit = int(request.limit or 0)
+        run_until_empty = bool(request.auto_trello and (request.run_until_empty or raw_limit <= 0))
+        limit = (
+            max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit or self.MAX_PROMPT_BATCH_ITEMS))
+            if not run_until_empty
+            else max(1, len(request.items or []), self.MAX_PROMPT_BATCH_ITEMS)
+        )
         source_item_count = len(request.items or [])
         items = self._prompt_batch_items(request.items, max(limit, source_item_count))
         if not items and not request.auto_trello:
@@ -1812,7 +1818,7 @@ class FlowWebService:
             base_request, items, trello_source_hint = await self._expand_prompt_batch_with_trello_images(
                 base_request,
                 items,
-                limit,
+                0 if run_until_empty else limit,
             )
         else:
             base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
@@ -1821,7 +1827,10 @@ class FlowWebService:
             raise HTTPException(status_code=400, detail="Không tìm thấy card Trello có ảnh trong list nguồn để gửi cho Tác nhân Flow.")
         if not request.auto_trello and trello_source_hint.get("card_id") and len(items) > 1:
             items = items[:1]
-        items = items[:limit]
+        if run_until_empty:
+            limit = len(items)
+        else:
+            items = items[:limit]
         batch_key = self._prompt_batch_key(base_request, items, trello_source_hint)
         active_batch = self._active_prompt_batch_by_key(batch_key)
         if active_batch is not None:
@@ -1835,11 +1844,17 @@ class FlowWebService:
             str(request.title or "").strip()
             or (
                 f"Auto Trello Flow Agent: tạo 4 ảnh cho {len(items)} card"
-                if request.auto_trello and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                else f"Auto Trello Flow Agent: chạy đến hết Ready for AI ({len(items)} card)"
+                if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
                 else f"Auto Trello AI: tạo {len(items)} ảnh từ card có ảnh"
-                if request.auto_trello and any(item.get("generated_by_ai") for item in items)
+                if request.auto_trello and not run_until_empty and any(item.get("generated_by_ai") for item in items)
+                else f"Auto Trello AI: chạy đến hết Ready for AI ({len(items)} card)"
+                if request.auto_trello and run_until_empty and any(item.get("generated_by_ai") for item in items)
                 else f"Auto Trello: tạo {len(items)} ảnh từ card có ảnh"
-                if request.auto_trello
+                if request.auto_trello and not run_until_empty
+                else f"Auto Trello: chạy đến hết Ready for AI ({len(items)} card)"
+                if request.auto_trello and run_until_empty
                 else f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}"
                 if trello_source_hint.get("card_name")
                 else f"Chạy batch {len(items)} prompt từ sheet"
@@ -1853,12 +1868,21 @@ class FlowWebService:
                 "type": "batch_image",
                 "total": len(items),
                 "limit": limit,
+                "run_until_empty": run_until_empty,
                 "job": _model_dump(base_request),
                 "items": items,
                 "trello_source_hint": trello_source_hint,
                 "batch_key": batch_key,
             },
-            result={"total": len(items), "completed": 0, "failed": 0, "child_job_ids": [], "trello_source_hint": trello_source_hint, "batch_key": batch_key},
+            result={
+                "total": len(items),
+                "completed": 0,
+                "failed": 0,
+                "child_job_ids": [],
+                "trello_source_hint": trello_source_hint,
+                "batch_key": batch_key,
+                "run_until_empty": run_until_empty,
+            },
         )
         await self.store.add_job(batch_job)
         self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
@@ -2078,6 +2102,7 @@ class FlowWebService:
         existing_result = existing.result if existing is not None and isinstance(existing.result, dict) else {}
         trello_source_hint = existing_result.get("trello_source_hint") or existing_input.get("trello_source_hint") or {}
         batch_key = str(existing_result.get("batch_key") or existing_input.get("batch_key") or "").strip()
+        run_until_empty = bool(existing_result.get("run_until_empty") or existing_input.get("run_until_empty"))
         result = {
             "total": total,
             "completed": completed,
@@ -2091,6 +2116,8 @@ class FlowWebService:
             result["trello_source_hint"] = trello_source_hint
         if batch_key:
             result["batch_key"] = batch_key
+        if run_until_empty:
+            result["run_until_empty"] = True
         await self.store.patch_job(
             batch_id,
             result=result,
@@ -7130,7 +7157,6 @@ exit 1
                     f"Auto Trello chỉ quét cột {self._default_trello_source_list_name()}. "
                     "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
                 )
-        max_items = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(limit or self.MAX_PROMPT_BATCH_ITEMS)))
         if explicit_card_id:
             selected_card = self._trello_image_card_by_id(key, token, explicit_card_id)
             if not selected_card:
@@ -7149,6 +7175,8 @@ exit 1
                 list_id = card_list_id
         else:
             cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
+        raw_limit = int(limit or 0)
+        max_items = max(1, len(cards)) if raw_limit <= 0 else max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit))
         expanded: List[Dict[str, Any]] = []
         used_pairs: set[tuple[str, int, str]] = set()
 

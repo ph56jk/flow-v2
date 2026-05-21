@@ -2463,7 +2463,7 @@ function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 
 }
 
 function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
-  return automationModuleEnabled("trello_source") && !autoTrello ? 1 : 40;
+  return automationModuleEnabled("trello_source") && !autoTrello ? 1 : (autoTrello ? 0 : 40);
 }
 
 function renderEasyPanel(stats) {
@@ -2498,7 +2498,7 @@ function renderEasyPanel(stats) {
     runHint.textContent = stats.active.length
       ? "Đang tạo ảnh"
       : autoTrelloReady && flowReady
-        ? "Tự quét Trello rồi tạo"
+        ? "Chạy đến hết Ready for AI"
       : batchItems.length > 1 && flowReady
         ? batchLimit === 1
           ? "Chạy 1 prompt/card Trello"
@@ -2507,7 +2507,7 @@ function renderEasyPanel(stats) {
   }
   if (elements.automationRunImageButton) {
     elements.automationRunImageButton.textContent = autoTrelloReady
-      ? (displayedBatchCount ? `Auto ${displayedBatchCount} prompt` : "Auto AI từ Trello")
+      ? (displayedBatchCount ? `Auto ${displayedBatchCount} prompt` : "Auto hết Ready for AI")
       : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
   }
   if (elements.automationAutoRunButton) {
@@ -4481,7 +4481,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     : [];
   const selectedTrelloCard = String(state.automation.trelloCardId || "").trim();
   const selectedTrelloImageRun = Boolean(autoTrello && selectedTrelloCard && selectedTrelloAttachmentIds.length);
-  let batchItems = selectedTrelloImageRun ? [] : activePromptSourceItems({ limit: 500 });
+  let batchItems = selectedTrelloImageRun ? [] : activePromptSourceItems({ limit: autoTrello ? Infinity : 500 });
   const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
   const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
@@ -4521,12 +4521,16 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
 
   const payload = automationImageJobPayload(prompt);
   const selectedImageDefaultLimit = selectedTrelloImageRun ? 1 : 0;
-  const resolvedBatchLimit = Math.max(
-    1,
-    Math.min(40, Number(batchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)),
-  );
+  const explicitBatchLimit = Number(batchLimit || 0);
+  const runUntilReadyEmpty = Boolean(autoDiscoverTrello && !selectedTrelloImageRun && !(Number.isFinite(explicitBatchLimit) && explicitBatchLimit > 0));
+  const resolvedBatchLimit = runUntilReadyEmpty
+    ? 0
+    : Math.max(
+        1,
+        Math.min(40, Number(explicitBatchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)),
+      );
   const queuedCount = autoDiscoverTrello
-    ? (batchItems.length ? Math.min(batchItems.length, resolvedBatchLimit) : resolvedBatchLimit)
+    ? (runUntilReadyEmpty ? 0 : (batchItems.length ? Math.min(batchItems.length, resolvedBatchLimit) : resolvedBatchLimit))
     : batchItems.length > 1 ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
 
   automationSubmitInFlight = true;
@@ -4546,6 +4550,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
           title: autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
           limit: resolvedBatchLimit,
           auto_trello: autoDiscoverTrello,
+          run_until_empty: runUntilReadyEmpty,
           job: {
             ...payload,
             title: autoDiscoverTrello ? "Auto image from Trello card" : "Automation image from sheet row",
@@ -4565,7 +4570,9 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     saveAutomationConfig(state.automation);
     showMessage(
       autoDiscoverTrello
-        ? `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 4 ảnh mỗi card rồi đẩy về đúng card để duyệt trên Trello.`
+        ? runUntilReadyEmpty
+          ? "Đã xếp hàng auto Trello. App sẽ quét toàn bộ card có ảnh trong Ready for AI và chạy tới khi hết danh sách hiện tại."
+          : `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 4 ảnh mỗi card rồi đẩy về đúng card để duyệt trên Trello.`
         : batchItems.length > 1
         ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi đẩy về đúng card Trello để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, app sẽ lưu về Trello nếu cục Trello đang bật.",

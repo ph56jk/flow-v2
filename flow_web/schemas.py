@@ -369,6 +369,7 @@ class PromptBatchRequest(BaseModel):
     title: str = ""
     limit: int = 40
     auto_trello: bool = False
+    run_until_empty: bool = False
 
 
 class DownloadRequest(BaseModel):
