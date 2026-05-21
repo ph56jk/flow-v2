@@ -326,6 +326,38 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
 
+    def test_trello_archive_retries_url_upload_without_cover_when_preview_generation_fails(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="url",
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_trello_attach_url",
+            side_effect=[
+                RuntimeError('Trello API lỗi 400: {"message":"Failed to generate previews for attachment to set as cover"}'),
+                {"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            ],
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        self.assertEqual(2, attach_url.call_count)
+        self.assertTrue(attach_url.call_args_list[0].args[5])
+        self.assertFalse(attach_url.call_args_list[1].args[5])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+
     def test_update_trello_config_saves_without_exposing_credentials(self) -> None:
         result = asyncio.run(
             self.service.update_trello_config(

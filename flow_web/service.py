@@ -6561,8 +6561,9 @@ exit 1
             name = self._trello_attachment_name(job_id, artifact, index)
             try:
                 if upload_mode == "url":
-                    attachment_payload = await asyncio.to_thread(
-                        self._trello_attach_url,
+                    attachment_payload = await self._trello_attach_url_with_cover_fallback(
+                        job_id,
+                        index,
                         key,
                         token,
                         card_id,
@@ -6620,8 +6621,9 @@ exit 1
                             job_id,
                             f"Upload file ảnh {index + 1} lên Trello chưa được, thử attach bằng URL: {humanize_flow_error(str(file_exc))}",
                         )
-                        attachment_payload = await asyncio.to_thread(
-                            self._trello_attach_url,
+                        attachment_payload = await self._trello_attach_url_with_cover_fallback(
+                            job_id,
+                            index,
                             key,
                             token,
                             card_id,
@@ -6656,6 +6658,45 @@ exit 1
             "created_card": created_card,
             "attachments": attachments,
         }
+
+    async def _trello_attach_url_with_cover_fallback(
+        self,
+        job_id: str,
+        index: int,
+        key: str,
+        token: str,
+        card_id: str,
+        artifact_url: str,
+        name: str,
+        set_cover: bool,
+    ) -> Dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                self._trello_attach_url,
+                key,
+                token,
+                card_id,
+                artifact_url,
+                name,
+                set_cover,
+            )
+        except Exception as exc:
+            detail = str(exc or "").lower()
+            if not set_cover or ("cover" not in detail and "preview" not in detail):
+                raise
+            await self.store.append_log(
+                job_id,
+                f"Trello không set được cover cho ảnh {index + 1}, upload lại ảnh đó không đặt cover.",
+            )
+            return await asyncio.to_thread(
+                self._trello_attach_url,
+                key,
+                token,
+                card_id,
+                artifact_url,
+                name,
+                False,
+            )
 
     def _trello_credentials(self) -> tuple[str, str]:
         config = self.store.snapshot().trello_config
