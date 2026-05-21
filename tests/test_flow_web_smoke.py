@@ -292,6 +292,53 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
+    def test_trello_archive_locally_forces_2k_when_flow_upsample_keeps_original(self) -> None:
+        from PIL import Image
+
+        source_image = io.BytesIO()
+        Image.new("RGB", (512, 512), (210, 180, 140)).save(source_image, format="JPEG", quality=90)
+        source_bytes = source_image.getvalue()
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_read_remote_file",
+            return_value=(source_bytes, "image/jpeg"),
+        ), patch.object(
+            self.service,
+            "_with_client",
+            new=AsyncMock(return_value=source_bytes),
+        ) as flow_upscale, patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_bytes:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        self.assertGreaterEqual(flow_upscale.await_count, 1)
+        attach_bytes.assert_called_once()
+        uploaded_bytes = attach_bytes.call_args.args[3]
+        with Image.open(io.BytesIO(uploaded_bytes)) as uploaded:
+            self.assertEqual((2048, 2048), uploaded.size)
+        self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
+        self.assertTrue(result["configured"])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+
     def test_trello_archive_materializes_flow_url_before_file_upload(self) -> None:
         asyncio.run(
             self.service.update_trello_config(

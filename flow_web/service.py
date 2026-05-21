@@ -79,6 +79,9 @@ from .schemas import (
 from .store import StateStore
 
 
+log = logging.getLogger(__name__)
+
+
 def _model_dump(model: Any) -> Dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump(mode="json")
@@ -122,6 +125,7 @@ class FlowWebService:
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
     TRELLO_TIMEOUT_S = 30
+    TRELLO_UPSCALE_LONG_EDGE_PX = 2048
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
     DEFAULT_IMAGE_MODEL = "NARWHAL"
@@ -8497,6 +8501,55 @@ exit 1
                     return found
         return ""
 
+    def _ensure_image_long_edge_2k(
+        self,
+        image_bytes: bytes,
+        mime_type: str = "",
+    ) -> tuple[bytes, str, bool, tuple[int, int], tuple[int, int]]:
+        """Return JPEG bytes whose long edge is at least 2048px.
+
+        Flow's upsampler is preferred because it can recover detail, but it may
+        occasionally return the original asset. This local pass guarantees the
+        Trello file itself is not a low-resolution thumbnail.
+        """
+        if not image_bytes:
+            return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
+        try:
+            from PIL import Image, ImageOps
+        except Exception:
+            return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as opened:
+                image = ImageOps.exif_transpose(opened)
+                source_size = tuple(int(part) for part in image.size)
+                long_edge = max(source_size) if source_size else 0
+                if long_edge >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+                    return image_bytes, mime_type or Image.MIME.get(opened.format, "image/jpeg"), False, source_size, source_size
+
+                scale = self.TRELLO_UPSCALE_LONG_EDGE_PX / max(1, long_edge)
+                target_size = (
+                    max(1, int(round(source_size[0] * scale))),
+                    max(1, int(round(source_size[1] * scale))),
+                )
+                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+                resized = image.resize(target_size, resampling)
+
+                if resized.mode in {"RGBA", "LA"} or (resized.mode == "P" and "transparency" in resized.info):
+                    rgba = resized.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, (255, 255, 255))
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    output_image = background
+                else:
+                    output_image = resized.convert("RGB")
+
+                output = io.BytesIO()
+                output_image.save(output, format="JPEG", quality=95, subsampling=0, optimize=True)
+                return output.getvalue(), "image/jpeg", True, source_size, target_size
+        except Exception as exc:
+            log.warning("local 2K image upscaling failed: %s", exc)
+            return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
+
     async def _upsample_artifact_bytes(
         self,
         artifact: JobArtifact,
@@ -8531,11 +8584,26 @@ exit 1
         async def _go(client: Any) -> bytes:
             return await self._upsample_image_via_flow(client, source_bytes)
 
-        upscaled = await self._with_client(_go, workflow_id=workflow_id)
-        if not upscaled or upscaled == source_bytes:
-            return None, ""
-        # The Flow upsampler returns JPEG bytes regardless of input mime.
-        return upscaled, "image/jpeg"
+        flow_upscaled: bytes = b""
+        try:
+            flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
+        except Exception as exc:
+            log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
+
+        candidate_bytes = flow_upscaled if flow_upscaled and flow_upscaled != source_bytes else source_bytes
+        candidate_mime = "image/jpeg" if flow_upscaled and flow_upscaled != source_bytes else source_mime
+        ensured, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
+            self._ensure_image_long_edge_2k,
+            candidate_bytes,
+            candidate_mime,
+        )
+        if changed:
+            log.info("Upscaled Trello image from %sx%s to %sx%s", *source_size, *target_size)
+            return ensured, ensured_mime
+        if flow_upscaled and flow_upscaled != source_bytes:
+            # The Flow upsampler returns JPEG bytes regardless of input mime.
+            return ensured, ensured_mime or "image/jpeg"
+        return None, ""
 
     def _read_remote_file(self, url: str) -> tuple[bytes, str]:
         request = Request(url, headers={"User-Agent": "FlowWebUI/0.1"})
