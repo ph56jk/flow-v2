@@ -6554,13 +6554,15 @@ exit 1
         upscale_announced = False
         for index, artifact in enumerate(artifacts):
             artifact_url = str(artifact.url or artifact.public_url or "").strip()
-            if not artifact_url:
+            artifact_local_path = str(artifact.local_path or "").strip()
+            has_local_artifact = bool(artifact_local_path and Path(artifact_local_path).expanduser().is_file())
+            if not artifact_url and not has_local_artifact:
                 failed += 1
                 continue
 
             name = self._trello_attachment_name(job_id, artifact, index)
             try:
-                if upload_mode == "url":
+                if upload_mode == "url" and artifact_url:
                     attachment_payload = await self._trello_attach_url_with_cover_fallback(
                         job_id,
                         index,
@@ -6595,27 +6597,26 @@ exit 1
                                 upscale_announced = True
                     try:
                         if upscaled_bytes:
-                            attachment_payload = await asyncio.to_thread(
-                                self._trello_attach_file_bytes,
-                                key,
-                                token,
-                                card_id,
-                                upscaled_bytes,
-                                upscaled_mime or artifact.mime_type or "image/jpeg",
-                                name,
-                                set_cover and index == 0,
-                            )
+                            source_bytes = upscaled_bytes
+                            source_mime = upscaled_mime or artifact.mime_type or "image/jpeg"
                         else:
-                            attachment_payload = await asyncio.to_thread(
-                                self._trello_attach_file_from_url,
-                                key,
-                                token,
-                                card_id,
+                            source_bytes, source_mime = await self._trello_artifact_file_bytes(
+                                job_id,
+                                artifact,
+                                index,
                                 artifact_url,
-                                name,
-                                artifact.mime_type or "image/jpeg",
-                                set_cover and index == 0,
                             )
+                        attachment_payload = await self._trello_attach_file_bytes_with_cover_fallback(
+                            job_id,
+                            index,
+                            key,
+                            token,
+                            card_id,
+                            source_bytes,
+                            source_mime or artifact.mime_type or "image/jpeg",
+                            name,
+                            set_cover and index == 0,
+                        )
                     except Exception as file_exc:
                         await self.store.append_log(
                             job_id,
@@ -6658,6 +6659,70 @@ exit 1
             "created_card": created_card,
             "attachments": attachments,
         }
+
+    async def _trello_artifact_file_bytes(
+        self,
+        job_id: str,
+        artifact: JobArtifact,
+        artifact_index: int,
+        artifact_url: str,
+    ) -> tuple[bytes, str]:
+        local_path = str(artifact.local_path or "").strip()
+        if not local_path or not Path(local_path).expanduser().is_file():
+            try:
+                local_path = await self._materialize_artifact_file(job_id, artifact, artifact_index)
+            except Exception:
+                local_path = ""
+
+        if local_path and Path(local_path).expanduser().is_file():
+            path = Path(local_path).expanduser()
+            return path.read_bytes(), mimetypes.guess_type(str(path))[0] or artifact.mime_type or "image/jpeg"
+
+        if artifact_url:
+            return await asyncio.to_thread(self._read_remote_file, artifact_url)
+        raise RuntimeError("Không có file ảnh cục bộ hoặc URL ảnh để upload lên Trello.")
+
+    async def _trello_attach_file_bytes_with_cover_fallback(
+        self,
+        job_id: str,
+        index: int,
+        key: str,
+        token: str,
+        card_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+        name: str,
+        set_cover: bool,
+    ) -> Dict[str, Any]:
+        try:
+            return await asyncio.to_thread(
+                self._trello_attach_file_bytes,
+                key,
+                token,
+                card_id,
+                file_bytes,
+                mime_type,
+                name,
+                set_cover,
+            )
+        except Exception as exc:
+            detail = str(exc or "").lower()
+            if not set_cover or ("cover" not in detail and "preview" not in detail):
+                raise
+            await self.store.append_log(
+                job_id,
+                f"Trello không set được cover cho file ảnh {index + 1}, upload lại file đó không đặt cover.",
+            )
+            return await asyncio.to_thread(
+                self._trello_attach_file_bytes,
+                key,
+                token,
+                card_id,
+                file_bytes,
+                mime_type,
+                name,
+                False,
+            )
 
     async def _trello_attach_url_with_cover_fallback(
         self,

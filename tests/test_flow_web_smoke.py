@@ -292,6 +292,90 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
+    def test_trello_archive_materializes_flow_url_before_file_upload(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=False,
+                )
+            )
+        )
+        local_file = self.downloads_dir / "flow-image.jpg"
+        local_file.write_bytes(b"flow-image-bytes")
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(
+            label="Ảnh 1",
+            media_name="media",
+            url="https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=media",
+            mime_type="image/jpeg",
+        )
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_materialize_artifact_file",
+            new=AsyncMock(return_value=str(local_file)),
+        ) as materialize, patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_bytes, patch.object(
+            self.service,
+            "_trello_attach_url",
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        materialize.assert_awaited_once()
+        attach_bytes.assert_called_once()
+        self.assertEqual(b"flow-image-bytes", attach_bytes.call_args.args[3])
+        attach_url.assert_not_called()
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+
+    def test_trello_archive_retries_file_upload_without_cover_when_preview_generation_fails(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=False,
+                )
+            )
+        )
+        local_file = self.downloads_dir / "flow-image.jpg"
+        local_file.write_bytes(b"flow-image-bytes")
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(local_file), mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            side_effect=[
+                RuntimeError('Trello API lỗi 400: {"message":"Failed to generate previews for attachment to set as cover"}'),
+                {"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            ],
+        ) as attach_bytes, patch.object(
+            self.service,
+            "_trello_attach_url",
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        self.assertEqual(2, attach_bytes.call_count)
+        self.assertTrue(attach_bytes.call_args_list[0].args[6])
+        self.assertFalse(attach_bytes.call_args_list[1].args[6])
+        attach_url.assert_not_called()
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+
     def test_trello_archive_skips_upsample_in_url_mode(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
