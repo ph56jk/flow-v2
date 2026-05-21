@@ -139,6 +139,33 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(self.service._flow_image_call_uses_selected_image(good_call, "media-source", "workflow-source"))
         self.assertFalse(self.service._flow_image_call_uses_selected_image(prompt_only_call, "media-source", "workflow-source"))
 
+    def test_auto_trello_generic_title_does_not_filter_ready_cards(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        cards = [
+            {
+                "id": "card-1",
+                "shortLink": "short-1",
+                "idList": "ready",
+                "name": "baby pillowcase",
+                "url": "https://trello.example/c/card-1",
+                "_image_attachments": [{"id": "att-1", "name": "source.jpg", "mimeType": "image/jpeg"}],
+            },
+            {
+                "id": "card-2",
+                "shortLink": "short-2",
+                "idList": "ready",
+                "name": "embroidered apron",
+                "url": "https://trello.example/c/card-2",
+                "_image_attachments": [{"id": "att-2", "name": "source.png", "mimeType": "image/png"}],
+            },
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(2, len(items))
+        self.assertEqual("", self.service._trello_auto_search_query(request))
+        self.assertEqual({"card-1", "card-2"}, {item["trello_card_id"] for item in items})
+
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
         project_data = {
             "projectContents": {

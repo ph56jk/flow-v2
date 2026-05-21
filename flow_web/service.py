@@ -8156,6 +8156,14 @@ exit 1
         return expanded
 
     def _trello_auto_search_query(self, request: CreateJobRequest) -> str:
+        generic_titles = {
+            "auto_image_from_trello_card",
+            "automation_image_from_sheet_row",
+            "auto_trello_quet_card_co_anh",
+            "auto_trello_ai_chay_den_het_ready_for_ai",
+            "auto_trello_flow_agent_chay_den_het_ready_for_ai",
+            "auto_ai_trello_cho_san_pham_moi_lien_tuc",
+        }
         for value in (
             request.prompt_product_key,
             request.prompt_product,
@@ -8163,6 +8171,8 @@ exit 1
             request.title,
         ):
             cleaned = str(value or "").strip()
+            if cleaned and self._normalize_skill_token(cleaned) in generic_titles:
+                continue
             if cleaned:
                 return cleaned[:80]
         return ""
