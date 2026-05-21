@@ -13883,15 +13883,30 @@ exit 1
                         el.getAttribute('title') || '',
                         el.getAttribute('data-testid') || '',
                       ].join(' ').replace(/\\s+/g, ' ').trim();
+                      const deepQuery = (selector, root = document, seen = new Set()) => {
+                        const found = [];
+                        const visit = (node) => {
+                          if (!node || seen.has(node)) return;
+                          seen.add(node);
+                          try {
+                            found.push(...node.querySelectorAll(selector));
+                            for (const el of node.querySelectorAll('*')) {
+                              if (el.shadowRoot) visit(el.shadowRoot);
+                            }
+                          } catch (_) {}
+                        };
+                        visit(root);
+                        return found;
+                      };
                       const bodyText = document.body?.innerText || '';
                       const isApproveLabel = (label) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm/i.test(label)
                         && !/Từ\\s*chối|Tu\\s*choi|Reject|Cancel|không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
-                      const approveButtons = [...document.querySelectorAll('button, [role="button"]')]
+                      const approveButtons = deepQuery('button, [role="button"]')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                         .filter(({ label }) => isApproveLabel(label))
                         .sort((a, b) => (b.rect.right - a.rect.right) || (b.rect.bottom - a.rect.bottom));
-                      const textCandidates = [...document.querySelectorAll('span, div, p, label, a, mat-label')]
+                      const textCandidates = deepQuery('span, div, p, label, a, mat-label')
                         .filter(visible)
                         .map((el) => {
                           const rect = el.getBoundingClientRect();
@@ -13907,7 +13922,7 @@ exit 1
                         const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
                         return { ok: false, waiting, detail: waiting ? 'approval text visible, approve button not found' : 'approval dialog not visible' };
                       }
-                      const rememberControls = [...document.querySelectorAll('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], label, button, [role="button"], div')]
+                      const rememberControls = deepQuery('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], label, button, [role="button"], div')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                         .filter(({ label }) => /không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label))
