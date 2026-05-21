@@ -117,6 +117,7 @@ class FlowWebService:
     USER_ASSISTANT_CONTEXT_LIMIT = 1200
     USER_ASSISTANT_ANSWER_LIMIT = 1400
     AI_PROMPT_SUITE_SIZE = 6
+    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 4
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
@@ -1805,7 +1806,7 @@ class FlowWebService:
         if not items and not request.auto_trello:
             raise HTTPException(
                 status_code=400,
-                detail="Hãy nhập prompt, hoặc bật Auto Trello để AI tự viết prompt từ card có ảnh.",
+                detail="Hãy nhập lệnh, hoặc bật Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
             )
         if request.auto_trello:
             base_request, items, trello_source_hint = await self._expand_prompt_batch_with_trello_images(
@@ -1817,7 +1818,7 @@ class FlowWebService:
             base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
 
         if not items:
-            raise HTTPException(status_code=400, detail="Không tìm thấy card Trello có ảnh trong list nguồn để AI tự viết prompt.")
+            raise HTTPException(status_code=400, detail="Không tìm thấy card Trello có ảnh trong list nguồn để gửi cho Tác nhân Flow.")
         if not request.auto_trello and trello_source_hint.get("card_id") and len(items) > 1:
             items = items[:1]
         items = items[:limit]
@@ -1833,7 +1834,9 @@ class FlowWebService:
         title = (
             str(request.title or "").strip()
             or (
-                f"Auto Trello AI: tạo {len(items)} ảnh từ card có ảnh"
+                f"Auto Trello Flow Agent: tạo 4 ảnh cho {len(items)} card"
+                if request.auto_trello and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                else f"Auto Trello AI: tạo {len(items)} ảnh từ card có ảnh"
                 if request.auto_trello and any(item.get("generated_by_ai") for item in items)
                 else f"Auto Trello: tạo {len(items)} ảnh từ card có ảnh"
                 if request.auto_trello
@@ -2024,6 +2027,9 @@ class FlowWebService:
         return None
 
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
+        if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
+            label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
+            return f"Flow Agent {index + 1}/{total} · {label} · 4 ảnh"[:120]
         if item.get("generated_by_ai"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
             shot_label = str(item.get("shot_label") or "").strip()
@@ -2044,6 +2050,10 @@ class FlowWebService:
         payload["prompt_product_key"] = str(item.get("product_key") or "").strip()
         payload["prompt_index"] = str(item.get("index") or "").strip()
         payload["prompt_notes"] = str(item.get("notes") or "").strip()
+        if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
+            payload["count"] = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            payload["flow_agent_enabled"] = True
+            payload["flow_agent_auto_approve"] = True
         if item.get("trello_card_id"):
             payload["trello_card_id"] = str(item.get("trello_card_id") or "").strip()
         if item.get("trello_list_id"):
@@ -2091,8 +2101,14 @@ class FlowWebService:
         child_job_ids: List[str] = []
         completed = 0
         failed = 0
+        uses_flow_agent = any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
         await self.store.patch_job(batch_id, status="running")
-        await self.store.append_log(batch_id, f"Bắt đầu vòng lặp {total} prompt active từ sheet.")
+        await self.store.append_log(
+            batch_id,
+            f"Bắt đầu vòng lặp {total} card bằng Tác nhân Flow."
+            if uses_flow_agent
+            else f"Bắt đầu vòng lặp {total} prompt active từ sheet.",
+        )
 
         try:
             for index, item in enumerate(items):
@@ -2118,19 +2134,38 @@ class FlowWebService:
                 await self.store.set_progress_hint(
                     batch_id,
                     stage="sending_request",
-                    detail=f"Đang chạy prompt {index + 1}/{total}: {child_request.title}",
+                    detail=(
+                        f"Đang gửi card {index + 1}/{total} cho Tác nhân Flow: {child_request.title}"
+                        if uses_flow_agent
+                        else f"Đang chạy prompt {index + 1}/{total}: {child_request.title}"
+                    ),
                 )
-                await self.store.append_log(batch_id, f"Đang chạy prompt {index + 1}/{total}: {child_request.title}")
+                await self.store.append_log(
+                    batch_id,
+                    f"Đang gửi card {index + 1}/{total} cho Tác nhân Flow: {child_request.title}"
+                    if uses_flow_agent
+                    else f"Đang chạy prompt {index + 1}/{total}: {child_request.title}",
+                )
 
                 await self._run_flow_job(child_job.id, child_request)
                 saved_child = self.store.get_job(child_job.id)
                 if saved_child is not None and saved_child.status == "completed":
                     completed += 1
-                    await self.store.append_log(batch_id, f"Prompt {index + 1}/{total} đã tạo ảnh và gửi qua các module sau Flow.")
+                    await self.store.append_log(
+                        batch_id,
+                        f"Card {index + 1}/{total} đã tạo ảnh bằng Tác nhân Flow và gửi qua các module sau Flow."
+                        if uses_flow_agent
+                        else f"Prompt {index + 1}/{total} đã tạo ảnh và gửi qua các module sau Flow.",
+                    )
                 else:
                     failed += 1
                     detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
-                    await self.store.append_log(batch_id, f"Prompt {index + 1}/{total} bị lỗi: {detail}")
+                    await self.store.append_log(
+                        batch_id,
+                        f"Card {index + 1}/{total} bị lỗi: {detail}"
+                        if uses_flow_agent
+                        else f"Prompt {index + 1}/{total} bị lỗi: {detail}",
+                    )
 
                 await self._patch_prompt_batch_result(
                     batch_id,
@@ -2143,9 +2178,14 @@ class FlowWebService:
                 )
 
             final_status = "failed" if failed == total else "completed"
-            error = f"{failed}/{total} prompt bị lỗi trong batch." if failed == total else ""
+            error = f"{failed}/{total} card bị lỗi trong batch." if failed == total and uses_flow_agent else f"{failed}/{total} prompt bị lỗi trong batch." if failed == total else ""
             await self.store.patch_job(batch_id, status=final_status, error=error)
-            await self.store.append_log(batch_id, f"Batch sheet hoàn tất: {completed} xong, {failed} lỗi.")
+            await self.store.append_log(
+                batch_id,
+                f"Batch Flow Agent hoàn tất: {completed} xong, {failed} lỗi."
+                if uses_flow_agent
+                else f"Batch sheet hoàn tất: {completed} xong, {failed} lỗi.",
+            )
         except Exception as exc:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(batch_id, status="failed", error=detail)
@@ -2311,22 +2351,22 @@ class FlowWebService:
         return "Dựa trên ảnh sản phẩm nguồn từ Trello card, tạo ảnh thương mại sạch, thật, dễ duyệt và sẵn sàng lưu lại Trello."
 
     def _local_flow_operator_prompt(self, instruction: str, product_filter: str) -> str:
-        request = PromptCreateRequest(
-            mode="image",
-            brief=self._flow_operator_brief(instruction, product_filter),
-            style="photorealistic commercial product image, clean composition, realistic lighting",
-            must_include=(
-                "use the selected Trello attachment as the exact source product, preserve product identity, "
-                "make the edited/generated result look like a real product photo"
-            ),
-            avoid="wrong product, random unrelated item, extra text, watermark, distorted logo, mismatched design",
-            audience="Telegram approval and Trello product archive",
-            aspect="square",
-        )
-        selected = self._select_prompt_skills("image", request.brief, request.style, request.must_include)
-        baseline = self._compose_prompt_draft(request, selected)
-        prompt, _ = self._ensure_prompt_detail(baseline, baseline, "image")
-        return prompt
+        target = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+        product_text = f" for {product_filter}" if product_filter else ""
+        user_text = re.sub(r"\s+", " ", str(instruction or "").strip())
+        parts = [
+            "Use Google Flow Agent as the prompt writer and image-generation operator.",
+            "First analyze the selected Trello attachment/reference image: product category, silhouette, material, print or embroidery, color, proportions, and any handmade cues.",
+            f"Then write your own internal image prompts and generate exactly {target} commercial product images{product_text}.",
+            "Use the selected Trello attachment as the exact source product reference; preserve product identity, shape, design, colors, and material texture.",
+            "Only change scene, styling, lighting, composition, model/background, and merchandising context.",
+            "The image set should include: 1 detail/craft proof close-up, 1 full product hero, 1 lifestyle use scene, and 1 flat lay or gift-ready merchandising shot.",
+            "If the product appears hand embroidered, one image must clearly prove it with visible thread texture and raised stitches.",
+            "Do not rely on Google Sheet prompts; do not ask the local app AI to write the final prompt.",
+        ]
+        if user_text:
+            parts.append(f"User request: {user_text}.")
+        return " ".join(parts)
 
     def _flow_operator_steps(
         self,
@@ -2350,11 +2390,11 @@ class FlowWebService:
                 "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
             },
             {
-                "label": "AI viết prompt",
+                "label": "Tác nhân Flow viết prompt",
                 "detail": (
                     f"Dùng '{product_filter}' làm từ khóa tìm card; nếu có Sheet thì vẫn ưu tiên Product_Key/Product_Name/Card_URL."
                     if product_filter
-                    else "Không cần Sheet: AI sẽ viết prompt từ tên card và attachment; Sheet chỉ dùng khi chủ nhân muốn prompt có sẵn."
+                    else "Không cần Sheet: Tác nhân Flow sẽ viết prompt từ tên card và attachment; Sheet chỉ dùng khi chủ nhân muốn prompt có sẵn."
                 ),
                 "status": "sẵn sàng",
             },
@@ -2400,8 +2440,8 @@ class FlowWebService:
     ) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = [
             {
-                "label": "Áp dụng prompt Flow Agent",
-                "detail": "Đổ prompt AI operator vào app; khi chạy Flow, app sẽ ưu tiên nút Tác nhân nếu Google Flow đang có.",
+                "label": "Chuẩn bị lệnh cho Tác nhân Flow",
+                "detail": "Lưu yêu cầu vận hành để gửi vào Tác nhân Flow; prompt ảnh cuối sẽ do chính Flow Agent viết.",
                 "action": "apply_flow_ai_prompt",
                 "payload": {"prompt": flow_prompt},
                 "requires_confirmation": False,
@@ -2440,7 +2480,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy automation Flow",
-                    "detail": "Quét Ready for AI, lấy ảnh đúng card, AI tự viết prompt, gửi Telegram duyệt rồi lưu lại Trello.",
+                    "detail": "Quét Ready for AI, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo 4 ảnh, gửi Telegram duyệt rồi lưu lại Trello.",
                     "action": "run_auto_trello",
                     "payload": {"limit": 1, "test_mode": True} if "test" in self._normalize_skill_token(instruction) else {},
                     "requires_confirmation": True,
@@ -2469,8 +2509,8 @@ class FlowWebService:
         return {
             "title": "Flow AI Operator",
             "summary": (
-                "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, viết prompt cho Google Flow, "
-                "gửi Telegram duyệt và chỉ lưu ảnh đã duyệt về đúng card Trello."
+                "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, chuẩn bị lệnh cho Tác nhân Google Flow, "
+                "để Flow Agent tự viết prompt/tạo 4 ảnh, gửi Telegram duyệt và chỉ lưu ảnh đã duyệt về đúng card Trello."
             ),
             "intent": "trello_sheet_flow_telegram_automation",
             "product_filter": product_filter,
@@ -2491,12 +2531,12 @@ class FlowWebService:
             [
                 "Bạn là Flow AI Operator trong app Flow v2.",
                 "Nhiệm vụ: biến yêu cầu người dùng thành kế hoạch automation có thể thao tác Google Flow.",
-                "Quy trình bắt buộc: Trello Ready for AI attachment -> Flow AI Operator tự viết prompt -> ưu tiên nút Tác nhân/Agent trong Google Flow nếu có -> Google Flow tạo/chỉnh ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
+                "Quy trình bắt buộc: Trello Ready for AI attachment -> app chọn đúng card/ảnh -> ưu tiên nút Tác nhân/Agent trong Google Flow -> Flow Agent tự viết prompt và tạo/chỉnh 4 ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
                 "Bạn không được yêu cầu secret trong chat và không in API key/token/cookie.",
                 "Trả về duy nhất JSON object, không markdown.",
                 "Schema JSON:",
                 '{"title": str, "summary": str, "product_filter": str, "flow_prompt": str, "steps": [{"label": str, "detail": str, "status": str}], "safety_notes": [str]}',
-                "flow_prompt phải là prompt ảnh chi tiết có thể dán vào Google Flow, nhấn mạnh dùng selected Trello attachment/reference image và giữ đúng sản phẩm gốc.",
+                "flow_prompt phải là lệnh vận hành gửi cho Tác nhân Flow, không phải prompt ảnh cuối; Flow Agent sẽ tự phân tích ảnh và tự viết prompt nội bộ.",
                 "steps dùng tiếng Việt rất dễ hiểu, tối đa 5 bước.",
                 "",
                 "Trạng thái app đã lọc secret:",
@@ -2714,8 +2754,8 @@ class FlowWebService:
             },
             "workflow": {
                 "product_source": "Trello card attachment trong list Ready for AI",
-                "prompt_source": "Flow AI Operator tự viết prompt theo card Trello; Google Sheet/CSV chỉ là tùy chọn",
-                "flow_step": "Google Flow dùng ảnh nguồn từ đúng card và prompt do AI viết để tạo/chỉnh ảnh",
+                "prompt_source": "Tác nhân Google Flow tự viết prompt theo card Trello; Google Sheet/CSV chỉ là tùy chọn",
+                "flow_step": "Google Flow dùng ảnh nguồn từ đúng card và prompt do chính Tác nhân Flow viết để tạo/chỉnh ảnh",
                 "approval_step": "Telegram gửi ảnh để người dùng duyệt",
                 "archive_step": "Ảnh được duyệt upload lại đúng Trello card nguồn",
             },
@@ -2728,7 +2768,7 @@ class FlowWebService:
         gemini = context.get("gemini", {})
         jobs = context.get("jobs", {})
         lines = [
-            "Quy trình chuẩn: Trello Ready for AI card attachment -> Flow AI Operator tự viết prompt -> Google Flow tạo/chỉnh ảnh -> Telegram duyệt -> upload lại đúng card Trello.",
+            "Quy trình chuẩn: Trello Ready for AI card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 4 ảnh -> Telegram duyệt -> upload lại đúng card Trello.",
             "Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list Ready for AI; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
             f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, workflow {'đã chọn' if flow.get('workflow_set') else 'chưa chọn'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}.",
             f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
@@ -2914,7 +2954,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": f"Lọc sản phẩm: {product_filter}",
-                    "detail": "Điền từ khóa này để app tìm đúng card Trello; AI sẽ tự viết prompt nếu không dùng Sheet.",
+                    "detail": "Điền từ khóa này để app tìm đúng card Trello; Tác nhân Flow sẽ tự viết prompt nếu không dùng Sheet.",
                     "action": "apply_product_filter",
                     "payload": {"value": product_filter},
                     "requires_confirmation": False,
@@ -2968,7 +3008,7 @@ class FlowWebService:
                     "detail": (
                         "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Telegram."
                         if test_run
-                        else "App sẽ quét card Ready for AI có ảnh, AI tự viết prompt, tạo/chỉnh bằng Flow rồi gửi Telegram duyệt."
+                        else "App sẽ quét card Ready for AI có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo 4 ảnh rồi gửi Telegram duyệt."
                     ),
                     "action": "run_auto_trello",
                     "payload": payload,
@@ -2980,7 +3020,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy Auto Trello",
-                    "detail": "Khi Flow, Trello và Telegram sẵn sàng, bấm Auto Trello để app tự tìm card, tự viết prompt và chạy hàng loạt.",
+                    "detail": "Khi Flow, Trello và Telegram sẵn sàng, bấm Auto Trello để app tự tìm card, gửi Tác nhân Flow viết prompt và chạy hàng loạt.",
                     "action": "run_auto_trello",
                     "requires_confirmation": True,
                 }
@@ -3321,21 +3361,21 @@ class FlowWebService:
 
         if self._flow_operator_requested(f"{question} {ui_context}"):
             parts.append(
-                "Flow AI Operator là lớp AI trong app dùng để hiểu yêu cầu của chủ nhân, viết prompt cho Google Flow, mở đúng project Flow và sắp thứ tự các bước Trello -> Sheet -> Flow -> Telegram -> Trello."
+                "Flow AI Operator là lớp AI trong app dùng để hiểu yêu cầu của chủ nhân, chọn đúng Trello card/ảnh, mở đúng project Flow và gửi lệnh cho Tác nhân Google Flow tự viết prompt."
             )
             parts.append(
                 "Nó không tự lấy secret từ chat. Khi cần tạo thật, app vẫn yêu cầu xác nhận trước khi chạy Auto Trello để tránh lấy nhầm card hoặc tạo hàng loạt ngoài ý muốn."
             )
         elif any(term in normalized for term in ("trello", "ready", "card", "list", "attachment", "anh", "nham")):
             parts.append(
-                "Luồng Trello chuẩn là: app chỉ quét list Ready for AI, lấy ảnh attachment nằm trên chính card đó, để AI tự viết prompt, tạo ảnh bằng Flow, gửi Telegram duyệt, rồi upload ảnh đã duyệt về lại đúng card nguồn."
+                "Luồng Trello chuẩn là: app chỉ quét list Ready for AI, lấy ảnh attachment nằm trên chính card đó, gửi lệnh cho Tác nhân Flow tự viết prompt/tạo ảnh, gửi Telegram duyệt, rồi upload ảnh đã duyệt về lại đúng card nguồn."
             )
             parts.append(
                 "Nếu thấy lấy nhầm ảnh, hãy kiểm tra card có còn nằm trong Ready for AI không, card đó có attachment ảnh thật không, và bộ lọc/card ghim có trỏ đúng sản phẩm không."
             )
         elif any(term in normalized for term in ("sheet", "prompt", "active", "product", "loc")):
             parts.append(
-                "Sheet không còn bắt buộc. Nếu chủ nhân không dán Sheet, AI sẽ tự viết prompt từ card Trello và attachment; nếu vẫn dùng Sheet thì Active=TRUE và Product_Key/Product_Name/Card_URL giúp khớp chính xác hơn."
+                "Sheet không còn bắt buộc. Nếu chủ nhân không dán Sheet, app sẽ dùng card Trello và attachment để nhờ Tác nhân Flow tự viết prompt; nếu vẫn dùng Sheet thì Active=TRUE và Product_Key/Product_Name/Card_URL giúp khớp chính xác hơn."
             )
             parts.append(
                 "Các dòng đã dùng nên được đánh dấu Used/Used_At nếu sheet có cột đó, để vòng lặp không chạy lại cùng prompt."
@@ -3376,9 +3416,9 @@ class FlowWebService:
         prompt_text = "\n".join(
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
-                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, để Flow AI Operator tự viết prompt, tạo/chỉnh ảnh bằng Google Flow, gửi Telegram duyệt, rồi lưu lại đúng card Trello.",
-                "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, viết prompt cho Google Flow và đưa các nút thao tác thật trong app.",
-                "Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list Ready for AI. Prompt do AI viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
+                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 4 ảnh, gửi Telegram duyệt, rồi lưu lại đúng card Trello.",
+                "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, chọn đúng card/ảnh và đưa các nút thao tác thật; prompt ảnh cuối do Tác nhân trong Google Flow viết.",
+                "Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list Ready for AI. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
                 "Nếu người dùng yêu cầu app làm việc gì, hãy nói app sẽ dùng các nút hành động kèm theo câu trả lời; không bịa hành động ngoài khả năng hiện có.",
                 "Không yêu cầu người dùng dán secret vào chat. Không in API key, token, cookie hay biến môi trường.",
                 "Trả lời ngắn, thực dụng, ưu tiên các bước người dùng bấm được trong giao diện.",
@@ -5300,6 +5340,10 @@ exit 1
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         payload = _model_dump(request)
         if module.get("type") == "flow":
+            flow_agent_enabled = self._config_bool(payload.get("flow_agent_enabled"), default=True)
+            if "flowAgentEnabled" in settings:
+                flow_agent_enabled = self._config_bool(settings.get("flowAgentEnabled"), default=True)
+                payload["flow_agent_enabled"] = flow_agent_enabled
             if settings.get("imageModel"):
                 payload["model"] = str(settings.get("imageModel") or "").strip()
             if settings.get("imageAspect"):
@@ -5309,8 +5353,6 @@ exit 1
                     payload["count"] = max(1, min(4, int(settings.get("imageCount") or 1)))
                 except Exception:
                     pass
-            if "flowAgentEnabled" in settings:
-                payload["flow_agent_enabled"] = self._config_bool(settings.get("flowAgentEnabled"), default=True)
             if "flowAgentAutoApprove" in settings:
                 payload["flow_agent_auto_approve"] = self._config_bool(
                     settings.get("flowAgentAutoApprove"),
@@ -5841,6 +5883,20 @@ exit 1
         await self.store.append_log(job_id, f"Đã lấy {len(selected_paths)} {detail} từ card Trello để đưa vào Flow.")
         return CreateJobRequest(**payload)
 
+    def _request_with_flow_module_settings(self, request: CreateJobRequest) -> CreateJobRequest:
+        graph = self._automation_graph_payload(request)
+        module = next(
+            (
+                item
+                for item in graph["modules"]
+                if item["enabled"] and item["type"] == "flow"
+            ),
+            None,
+        )
+        if module is None:
+            return request
+        return self._request_with_automation_module_settings(request, module)
+
     async def _resume_automation_after_approval(self, job_id: str, approval_module_id: str) -> None:
         job = self.store.get_job(job_id)
         if job is None or not approval_module_id:
@@ -5895,6 +5951,7 @@ exit 1
         await self._ensure_automation_execution(job_id, request)
         await self._run_automation_pre_modules(job_id, request)
         try:
+            request = self._request_with_flow_module_settings(request)
             request = await self._request_with_trello_source_images(job_id, request)
             await self.store.patch_job(job_id, input=_model_dump(request))
             await self._set_automation_module_status(
@@ -7016,7 +7073,7 @@ exit 1
             expanded = self._trello_ai_prompt_items_for_image_cards(cards, request, max_items)
             if not expanded:
                 raise RuntimeError(
-                    "Auto Trello chưa tìm thấy card ảnh phù hợp để AI tự viết prompt. "
+                    "Auto Trello chưa tìm thấy card ảnh phù hợp để gửi Tác nhân Flow. "
                     "Hãy chọn card trong trợ lý, dán link card Trello, hoặc điền Lọc sản phẩm rõ hơn."
                 )
             discovery = {
@@ -7026,8 +7083,8 @@ exit 1
                 "list_name": self._trello_list_name(key, token, list_id),
                 "matched_cards": len({item.get("trello_card_id") for item in expanded if item.get("trello_card_id")}),
                 "matched_items": len(expanded),
-                "match_mode": "ai_prompt",
-                "prompt_mode": "ai_generated",
+                "match_mode": "flow_agent",
+                "prompt_mode": "flow_agent",
             }
             return expanded, discovery
 
@@ -7348,46 +7405,30 @@ exit 1
         query = self._trello_auto_search_query(request)
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         product_hint = query or card_name or f"card Trello {index + 1}"
-        shot = shot or {}
-        shot_label = str(shot.get("label") or f"Shot {index}").strip()
-        shot_brief = str(shot.get("brief") or "").strip()
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
+        shots = self._flow_operator_shot_suite_for_trello_card(request, card)[: self.FLOW_AGENT_DEFAULT_IMAGE_COUNT]
+        shot_summary = "; ".join(
+            f"{position + 1}. {item.get('label')}: {item.get('brief')}"
+            for position, item in enumerate(shots)
+            if item.get("label") or item.get("brief")
+        )
         brief_parts = [
+            "Use Google Flow Agent as the prompt writer and image-generation operator.",
             design_analysis,
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
-            f"Shot {index} - {shot_label}: {shot_brief}" if shot_brief else f"Shot {index}: create a distinct commercial product image.",
-            f"Create or edit a commercial product image for {product_hint}.",
-            "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity.",
-            "Only change the scene, styling, lighting, composition, model/background, and presentation around the source product.",
+            f"First analyze the product, then write your own internal prompts and generate exactly {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} commercial product images for {product_hint}.",
+            "Create a coherent image set, not one unrelated one-off image.",
+            f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
+            "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
+            "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
             "Do not change the source product into a different category; if the source is a doll or plush, it must remain a doll or plush, not an apron, shirt, mug, or unrelated object.",
-            "Analyze the visible product first, then create the requested commercial variation around that exact item.",
+            "Do not use Google Sheet prompts; do not ask the local app AI to write the final prompt.",
         ]
         if user_instruction:
             brief_parts.append(f"User automation instruction: {user_instruction}.")
         if card_url:
             brief_parts.append(f"Source card: {card_url}.")
-        prompt_request = PromptCreateRequest(
-            mode="image",
-            brief=" ".join(brief_parts),
-            style="photorealistic ecommerce product photography, clean commercial styling, realistic lighting",
-            must_include=(
-                "selected Trello attachment/reference image, exact source product, believable product photo, "
-                f"clear hero composition, Telegram approval ready, {shot.get('must_include') or shot_label}"
-            ),
-            avoid="wrong product, unrelated design, extra text, watermark, distorted logo, deformed product, low quality",
-            audience="automation review in Telegram and archive back to the same Trello card",
-            aspect=request.aspect or "square",
-        )
-        selected = self._select_prompt_skills("image", prompt_request.brief, prompt_request.style, prompt_request.must_include)
-        baseline = self._compose_prompt_draft(prompt_request, selected)
-        prompt = baseline
-        if self._gemini_api_key():
-            try:
-                prompt = self._generate_prompt_with_gemini(prompt_request, selected, baseline)
-            except Exception:
-                prompt = baseline
-        prompt, _ = self._ensure_prompt_detail(prompt, baseline, "image")
-        return prompt
+        return " ".join(part for part in brief_parts if part)
 
     def _trello_ai_prompt_items_for_image_cards(
         self,
@@ -7416,41 +7457,44 @@ exit 1
             card_url = str(card.get("url") or "").strip()
             selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
-            shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-            remaining = max_items - len(expanded)
-            for shot in shots[: max(1, min(self.AI_PROMPT_SUITE_SIZE, remaining))]:
-                prompt = self._flow_operator_prompt_for_trello_card(
-                    request,
-                    card,
-                    len(expanded) + 1,
-                    shot=shot,
-                    design_analysis=design_analysis,
-                )
-                expanded.append(
-                    {
-                        "row": 0,
-                        "active": True,
-                        "used": False,
-                        "prompt": prompt,
-                        "product": query or card_name,
-                        "product_key": query or str(card.get("shortLink") or card_id).strip(),
-                        "product_name": card_name,
-                        "index": str(len(expanded) + 1),
-                        "notes": f"{design_analysis} Shot: {shot.get('label') or 'AI image'}. Google Sheet prompt not required.",
-                        "trello_card_id": card_id,
-                        "trello_list_id": card_list_id,
-                        "trello_attachment_ids": selected_attachment_ids,
-                        "trello_card_name": card_name,
-                        "trello_card_url": card_url,
-                        "trello_match_mode": "ai_prompt",
-                        "trello_search_query": query,
-                        "shot_label": shot.get("label") or "",
-                        "design_analysis": design_analysis,
-                        "generated_by_ai": True,
-                    }
-                )
-                if len(expanded) >= max_items:
-                    break
+            shots = self._flow_operator_shot_suite_for_trello_card(request, card)[: self.FLOW_AGENT_DEFAULT_IMAGE_COUNT]
+            shot_labels = [str(shot.get("label") or "").strip() for shot in shots if str(shot.get("label") or "").strip()]
+            prompt = self._flow_operator_prompt_for_trello_card(
+                request,
+                card,
+                len(expanded) + 1,
+                design_analysis=design_analysis,
+            )
+            expanded.append(
+                {
+                    "row": 0,
+                    "active": True,
+                    "used": False,
+                    "prompt": prompt,
+                    "product": query or card_name,
+                    "product_key": query or str(card.get("shortLink") or card_id).strip(),
+                    "product_name": card_name,
+                    "index": str(len(expanded) + 1),
+                    "notes": (
+                        f"{design_analysis} Flow Agent will write the final prompts and generate "
+                        f"{self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} images. Google Sheet prompt not required."
+                    ),
+                    "trello_card_id": card_id,
+                    "trello_list_id": card_list_id,
+                    "trello_attachment_ids": selected_attachment_ids,
+                    "trello_card_name": card_name,
+                    "trello_card_url": card_url,
+                    "trello_match_mode": "flow_agent",
+                    "trello_search_query": query,
+                    "shot_label": "Flow Agent image set",
+                    "shot_labels": shot_labels,
+                    "design_analysis": design_analysis,
+                    "flow_agent_instruction": True,
+                    "flow_agent_image_count": self.FLOW_AGENT_DEFAULT_IMAGE_COUNT,
+                    "generated_by_ai": False,
+                    "generated_by_flow_agent": True,
+                }
+            )
         return expanded
 
     def _trello_query_aliases(self, query: str) -> List[str]:

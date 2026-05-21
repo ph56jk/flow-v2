@@ -1061,6 +1061,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("local", result["engine"])
         self.assertEqual("áo trẻ em", result["product_filter"])
         self.assertIn("Trello", result["summary"])
+        self.assertIn("Google Flow Agent", result["flow_prompt"])
+        self.assertIn("generate exactly 4", result["flow_prompt"])
         self.assertIn("selected Trello attachment", result["flow_prompt"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertIn("apply_product_filter", action_names)
@@ -1117,7 +1119,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "title": "Flow AI Gemini",
             "summary": "Gemini đã lập kế hoạch operator.",
             "product_filter": "gấu bông",
-            "flow_prompt": "Use the selected Trello attachment as the exact teddy bear product reference, preserve the original product identity, create a photorealistic commercial product image with cozy nursery styling, soft daylight, clean composition, realistic fabric texture, and no extra text or watermark.",
+            "flow_prompt": "Use Google Flow Agent as the prompt writer and image-generation operator. Use the selected Trello attachment as the exact teddy bear product reference, analyze the product first, then write internal prompts and generate exactly 4 commercial product images with coherent teddy bear styling, soft daylight, clean composition, realistic fabric texture, and no extra text or watermark.",
             "steps": [{"label": "Tìm ảnh", "detail": "Dùng card Ready for AI.", "status": "sẵn sàng"}],
             "safety_notes": ["Không chạy nếu chưa thấy card đúng."],
         }
@@ -1132,6 +1134,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("gemini", result["engine"])
         self.assertEqual("Flow AI Gemini", result["title"])
         self.assertEqual("gấu bông", result["product_filter"])
+        self.assertIn("Google Flow Agent", result["flow_prompt"])
+        self.assertIn("generate exactly 4", result["flow_prompt"])
         self.assertIn("apply_flow_ai_prompt", [action.get("action") for action in result["suggested_actions"]])
 
     def test_flow_module_setting_can_disable_flow_agent(self) -> None:
@@ -2628,6 +2632,62 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("completed", saved.status)
         self.assertEqual(2, len(saved.artifacts))
 
+    async def test_run_flow_job_applies_flow_module_image_count(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="meo de thuong",
+            count=1,
+            aspect="square",
+            model="IMAGEN_3",
+            automation_graph={
+                "modules": [
+                    {
+                        "id": "flow",
+                        "type": "flow",
+                        "settings": {
+                            "imageCount": 4,
+                            "flowAgentEnabled": True,
+                        },
+                    }
+                ]
+            },
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        fake_images = [
+            SimpleNamespace(
+                media_name=f"img-{index}",
+                workflow_id="wf-1",
+                fife_url=f"https://example.com/img-{index}.jpg",
+                prompt=request.prompt,
+                dimensions={"width": 1024, "height": 1024},
+            )
+            for index in range(1, 5)
+        ]
+        fake_client = SimpleNamespace(
+            _api=SimpleNamespace(generate_image=AsyncMock(return_value=fake_images)),
+        )
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(fake_client)
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client):
+            await self.service._run_flow_job(job.id, request)
+
+        kwargs = fake_client._api.generate_image.await_args.kwargs
+        self.assertEqual(4, kwargs["count"])
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual(4, saved.input["count"])
+        self.assertEqual(4, len(saved.artifacts))
+
     async def test_run_flow_job_records_make_style_automation_modules(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(
@@ -3480,7 +3540,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
         self.assertEqual(["card-bear", "card-hoop"], [job.input["trello_card_id"] for job in child_jobs])
 
-    async def test_auto_trello_generates_ai_prompts_without_sheet_items(self) -> None:
+    async def test_auto_trello_uses_flow_agent_instruction_without_sheet_items(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -3506,7 +3566,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             auto_trello=True,
             items=[],
         )
-        seen: list[tuple[str, str]] = []
+        seen: list[tuple[str, str, int, bool, bool]] = []
         cards = [
             {
                 "id": "card-bear",
@@ -3519,8 +3579,16 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
 
         async def fake_run_flow_job(job_id, child_request):
-            seen.append((child_request.prompt, child_request.trello_card_id))
-            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+            seen.append(
+                (
+                    child_request.prompt,
+                    child_request.trello_card_id,
+                    child_request.count,
+                    child_request.flow_agent_enabled,
+                    child_request.flow_agent_auto_approve,
+                )
+            )
+            await self.store.patch_job(job_id, status="completed", result={"count": child_request.count, "mode": "image"})
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
             self.service,
@@ -3552,22 +3620,28 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
-        self.assertEqual("ai_generated", saved.result["trello_source_hint"]["prompt_mode"])
-        self.assertEqual(6, saved.result["total"])
+        self.assertEqual("flow_agent", saved.result["trello_source_hint"]["prompt_mode"])
+        self.assertEqual(1, saved.result["total"])
         self.assertEqual("card-bear", saved.input["items"][0]["trello_card_id"])
-        self.assertTrue(saved.input["items"][0]["generated_by_ai"])
+        self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
+        self.assertTrue(saved.input["items"][0]["generated_by_flow_agent"])
+        self.assertFalse(saved.input["items"][0]["generated_by_ai"])
+        self.assertEqual(4, saved.input["items"][0]["flow_agent_image_count"])
         self.assertEqual(
             [
                 "Craft detail proof",
                 "Full collection hero",
                 "Lifestyle nursery scene",
                 "Angle and scale",
-                "Flat lay styling",
-                "Gift ready scene",
             ],
-            [item["shot_label"] for item in saved.input["items"]],
+            saved.input["items"][0]["shot_labels"],
         )
         self.assertEqual("card-bear", seen[0][1])
+        self.assertEqual(4, seen[0][2])
+        self.assertTrue(seen[0][3])
+        self.assertTrue(seen[0][4])
+        self.assertIn("Google Flow Agent", seen[0][0])
+        self.assertIn("generate exactly 4", seen[0][0])
         self.assertIn("selected Trello attachment", seen[0][0])
 
     async def test_auto_trello_runs_explicit_card_outside_ready(self) -> None:
@@ -3726,20 +3800,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
-        self.assertEqual(6, saved.result["total"])
+        self.assertEqual(1, saved.result["total"])
         self.assertEqual(
             [
                 "Hand embroidery detail",
                 "Full front hero",
                 "Lifestyle baking action",
                 "Back tie fit",
-                "Flat lay styling",
-                "Gift artisan scene",
             ],
-            [item["shot_label"] for item in saved.input["items"]],
+            saved.input["items"][0]["shot_labels"],
         )
+        self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
+        self.assertEqual(4, saved.input["items"][0]["flow_agent_image_count"])
         self.assertIn("hand-embroidered", seen_prompts[0])
         self.assertIn("Extreme macro close-up", seen_prompts[0])
+        self.assertIn("generate exactly 4", seen_prompts[0])
         self.assertTrue(all("Before creating images, carefully analyze" in prompt for prompt in seen_prompts))
         self.assertIn("apron silhouette", saved.input["items"][0]["design_analysis"])
 
@@ -3819,17 +3894,18 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
+        self.assertEqual(1, saved.result["total"])
         self.assertEqual(
             [
                 "Craft detail proof",
                 "Full collection hero",
                 "Lifestyle nursery scene",
                 "Angle and scale",
-                "Flat lay styling",
-                "Gift ready scene",
             ],
-            [item["shot_label"] for item in saved.input["items"]],
+            saved.input["items"][0]["shot_labels"],
         )
+        self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
+        self.assertEqual(4, saved.input["items"][0]["flow_agent_image_count"])
         combined = "\n".join([*seen_prompts, saved.input["items"][0]["design_analysis"]]).lower()
         self.assertIn("doll", combined)
         self.assertNotIn("apron silhouette", combined)

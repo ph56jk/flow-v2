@@ -22,6 +22,7 @@ const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jk
 const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
 const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
 const FLOW_AI_SOURCE_TYPE = "flow_ai";
+const FLOW_AGENT_DEFAULT_IMAGE_COUNT = 4;
 const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "telegram", "review_hold", "log"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
@@ -30,9 +31,9 @@ let promptSourceAutoPreviewStarted = false;
 let automationSubmitInFlight = false;
 const AUTOMATION_MODULE_TYPE_CONFIG = {
   source: {
-    label: "AI prompt",
-    title: "Flow AI Prompt",
-    detail: "Flow AI tự viết prompt",
+    label: "Flow Agent",
+    title: "Flow Agent Request",
+    detail: "Yêu cầu cho Tác nhân Flow",
     icon: "T",
     iconClass: "node-icon-trello",
   },
@@ -44,9 +45,9 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
     iconClass: "node-icon-trello",
   },
   normalize: {
-    label: "Normalize",
-    title: "Normalize Prompt",
-    detail: "Lọc dòng mới, lấy prompt sạch",
+    label: "Prepare",
+    title: "Prepare Request",
+    detail: "Chuẩn hóa lệnh cho Flow Agent",
     icon: "S",
     iconClass: "node-icon-sheet",
   },
@@ -88,16 +89,16 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
 };
 const AUTOMATION_STEP_DEFAULTS = {
   source: {
-    title: "Flow AI Prompt",
-    detail: "Flow AI tự viết prompt",
+    title: "Flow Agent Request",
+    detail: "Yêu cầu cho Tác nhân Flow",
   },
   trello_source: {
     title: "Trello Image Source",
     detail: "Lấy ảnh sản phẩm gốc từ card Trello",
   },
   normalize: {
-    title: "Normalize Prompt",
-    detail: "Lọc dòng mới, lấy prompt sạch",
+    title: "Prepare Request",
+    detail: "Chuẩn hóa lệnh cho Flow Agent",
   },
   flow: {
     title: "Google Flow",
@@ -347,6 +348,32 @@ function moduleTypeConfig(type) {
   return AUTOMATION_MODULE_TYPE_CONFIG[type] || AUTOMATION_MODULE_TYPE_CONFIG.custom;
 }
 
+function boundedGenerationCount(value, fallback = 1) {
+  const numeric = Number(value);
+  const fallbackNumeric = Number(fallback);
+  const resolved = Number.isFinite(numeric) && numeric > 0
+    ? numeric
+    : Number.isFinite(fallbackNumeric) && fallbackNumeric > 0
+      ? fallbackNumeric
+      : 1;
+  return Math.max(1, Math.min(4, resolved));
+}
+
+function flowAgentEnabledFromSettings(settings = {}) {
+  return settings?.flowAgentEnabled !== false;
+}
+
+function flowModuleImageCount(settings = {}, fallbackCount = 1) {
+  const hasExplicitCount = Boolean(settings) && Object.prototype.hasOwnProperty.call(settings, "imageCount");
+  if (hasExplicitCount) {
+    return boundedGenerationCount(settings.imageCount, FLOW_AGENT_DEFAULT_IMAGE_COUNT);
+  }
+  return boundedGenerationCount(
+    flowAgentEnabledFromSettings(settings) ? FLOW_AGENT_DEFAULT_IMAGE_COUNT : fallbackCount,
+    fallbackCount,
+  );
+}
+
 function createAutomationModule(type = "custom", seed = {}) {
   const safeType = moduleTypeConfig(type) === AUTOMATION_MODULE_TYPE_CONFIG.custom ? (type === "custom" ? "custom" : moduleTypeForLegacyKey(type)) : type;
   const config = moduleTypeConfig(safeType);
@@ -445,7 +472,7 @@ function defaultAutomationConfig() {
     prompt: "",
     appEyebrow: "Flow v2",
     appTitle: "Flow v2",
-    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, AI tự viết prompt, Flow tạo ảnh và Telegram duyệt.",
+    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 4 ảnh và Telegram duyệt.",
     accentColor: "#7c2ee6",
     canvasZoom: 1,
     modules,
@@ -2007,7 +2034,7 @@ function renderModuleSettings(module) {
       <label class="field">
         <span>Nguồn của cục này</span>
         <select data-module-setting="sourceType">
-          <option value="flow_ai"${sourceType === FLOW_AI_SOURCE_TYPE ? " selected" : ""}>Flow AI tự viết prompt</option>
+          <option value="flow_ai"${sourceType === FLOW_AI_SOURCE_TYPE ? " selected" : ""}>Tác nhân Flow tự viết prompt</option>
           <option value="manual"${sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
           <option value="trello"${sourceType === "trello" ? " selected" : ""}>Trello list</option>
           <option value="sheets"${sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
@@ -2032,8 +2059,8 @@ function renderModuleSettings(module) {
   if (type === "flow") {
     const imageModel = settings.imageModel || state.drafts.image.model;
     const imageAspect = settings.imageAspect || state.drafts.image.aspect;
-    const imageCount = settings.imageCount || state.drafts.image.count || 1;
-    const flowAgentEnabled = settings.flowAgentEnabled !== false;
+    const imageCount = flowModuleImageCount(settings, state.drafts.image.count || MODE_CONFIG.image.defaultCount);
+    const flowAgentEnabled = flowAgentEnabledFromSettings(settings);
     const flowAgentAutoApprove = settings.flowAgentAutoApprove !== false;
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
@@ -2212,7 +2239,7 @@ function renderPromptSourcePreview() {
     elements.automationSheetPreviewList.innerHTML =
       state.automation.sourceType === "sheets"
         ? `<p class="empty-automation-history">Dán link, upload file hoặc paste bảng rồi bấm lấy prompt.</p>`
-        : `<p class="empty-automation-history">Đang dùng Flow AI: app sẽ phân tích ảnh Trello rồi tự viết prompt, không cần Google Sheet.</p>`;
+        : `<p class="empty-automation-history">Đang dùng Tác nhân Flow: app chỉ chọn ảnh Trello và gửi lệnh, prompt ảnh cuối do Google Flow tự viết.</p>`;
     return;
   }
   const totalActive = Number(preview?.active_count || items.length || 0);
@@ -2456,7 +2483,7 @@ function renderEasyPanel(stats) {
 
   if (elements.easyPromptStatus) {
     elements.easyPromptStatus.textContent = autoTrelloReady && !batchItems.length
-      ? "AI tự viết prompt"
+      ? "Tác nhân Flow viết prompt"
       : batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Nhập yêu cầu hoặc Auto Trello";
   }
   if (elements.easyFlowStatus) {
@@ -2912,7 +2939,7 @@ function renderPromptAssistant() {
   elements.promptAiBadge.dataset.state = ready ? "ready" : "pending";
   elements.promptAiSummary.textContent =
     assistant.headline ||
-    "AI sẽ viết prompt chi tiết hơn để dùng ngay.";
+    "Công cụ gợi ý lệnh đang sẵn sàng nếu chủ nhân muốn chỉnh tay.";
   elements.promptAiHint.textContent = ready
     ? (assistant.summary || `Đã nạp ${skillCount} skill để gợi ý prompt.`)
     : "Kho skill viết prompt đang được chuẩn bị. Bạn vẫn có thể thử bấm viết prompt.";
@@ -2940,11 +2967,11 @@ function userAssistantContextSummary() {
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
   const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
   return [
-    "Quy trình chuẩn: Trello Ready for AI attachment -> Flow AI Operator tự viết prompt -> Google Flow tạo/chỉnh ảnh -> Telegram duyệt -> upload lại đúng card Trello",
+    "Quy trình chuẩn: Trello Ready for AI attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 4 ảnh -> Telegram duyệt -> upload lại đúng card Trello",
     "Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list Ready for AI",
     `Màn hình đang ở chế độ ${state.mode}`,
     `Module bật: ${enabledModules || "chưa có"}`,
-    `Nguồn prompt ${state.automation.sourceType || "ai"} tại ${state.automation.sourceLocation || "AI tự viết, Sheet tùy chọn"}`,
+    `Nguồn prompt ${state.automation.sourceType || "flow_ai"} tại ${state.automation.sourceLocation || "Tác nhân Flow tự viết, Sheet tùy chọn"}`,
     `Bộ lọc sản phẩm ${state.automation.promptProductFilter || "chưa lọc"}`,
     `Sản phẩm/prompt mẫu ${sampleProducts || "chưa preview"}`,
     `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
@@ -3009,7 +3036,6 @@ function renderUserAssistant() {
       }>${planButtonLabel}</button>`
     : "";
   const flowPlanSteps = Array.isArray(flowPlan?.steps) ? flowPlan.steps.filter(Boolean).slice(0, 5) : [];
-  const flowPrompt = String(flowPlan?.flow_prompt || "").trim();
   const flowPlanHtml = flowPlan
     ? `<div class="assistant-flow-plan">
         <div class="assistant-flow-plan-head">
@@ -3029,7 +3055,7 @@ function renderUserAssistant() {
                 .join("")}</div>`
             : ""
         }
-        ${flowPrompt ? `<div class="assistant-flow-prompt">${escapeHtml(flowPrompt)}</div>` : ""}
+        <div class="assistant-flow-prompt">Prompt ảnh cuối sẽ do Tác nhân Flow tự viết bên trong Google Flow.</div>
       </div>`
     : "";
   const candidateHtml = trelloCandidates.length
@@ -4412,6 +4438,7 @@ function automationImageJobPayload(prompt) {
   const graph = automationExecutionGraphPayload();
   const flowModule = graph.modules.find((module) => module.enabled && module.type === "flow") || {};
   const flowSettings = flowModule.settings || {};
+  const flowAgentEnabled = flowAgentEnabledFromSettings(flowSettings);
   const telegramEnabled = automationModuleEnabled("telegram");
   const trelloEnabled = automationModuleEnabled("trello");
   return {
@@ -4420,12 +4447,12 @@ function automationImageJobPayload(prompt) {
     prompt: String(prompt || "").trim(),
     model: flowSettings.imageModel || imageDraft.model || defaultModelForMode("image"),
     aspect: flowSettings.imageAspect || imageDraft.aspect || "square",
-    count: Math.max(1, Math.min(4, Number(flowSettings.imageCount || imageDraft.count || 1))),
+    count: flowModuleImageCount(flowSettings, imageDraft.count || MODE_CONFIG.image.defaultCount),
     timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
     telegram_enabled: telegramEnabled,
     telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
     trello_enabled: trelloEnabled,
-    flow_agent_enabled: flowSettings.flowAgentEnabled !== false,
+    flow_agent_enabled: flowAgentEnabled,
     flow_agent_auto_approve: flowSettings.flowAgentAutoApprove !== false,
     automation_graph: graph,
     trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
@@ -4473,8 +4500,8 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
   if (!prompt && !aiWillWritePrompt) {
     showMessage(
       trelloSearchQuery
-        ? `Chưa có prompt nhập tay. Có thể bấm Auto Trello để AI tự viết prompt cho "${trelloSearchQuery}".`
-        : "Hãy nhập yêu cầu ngắn, hoặc bấm Auto Trello để AI tự viết prompt từ card có ảnh.",
+        ? `Chưa có lệnh nhập tay. Có thể bấm Auto Trello để Tác nhân Flow tự viết prompt cho "${trelloSearchQuery}".`
+        : "Hãy nhập yêu cầu ngắn, hoặc bấm Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
       "error",
     );
     elements.automationPromptInput.focus();
@@ -4492,7 +4519,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
   }
 
   const payload = automationImageJobPayload(prompt);
-  const selectedImageDefaultLimit = selectedTrelloImageRun ? 6 : 0;
+  const selectedImageDefaultLimit = selectedTrelloImageRun ? 1 : 0;
   const resolvedBatchLimit = Math.max(
     1,
     Math.min(40, Number(batchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)),
@@ -4537,7 +4564,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null } =
     saveAutomationConfig(state.automation);
     showMessage(
       autoDiscoverTrello
-        ? `Đã xếp hàng auto Trello. App sẽ quét card có ảnh, AI tự viết prompt, tạo tối đa ${queuedCount} ảnh rồi gửi Telegram duyệt.`
+        ? `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 4 ảnh mỗi card rồi gửi Telegram duyệt.`
         : batchItems.length > 1
         ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi gửi Telegram để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, luồng sẽ dừng ở bước duyệt Telegram/log để chủ nhân xử lý.",
@@ -4820,7 +4847,7 @@ async function requestFlowAiOperatorPlan(instructionOverride = "") {
 function applyFlowAiPrompt(prompt) {
   const text = String(prompt || "").trim();
   if (!text) {
-    showMessage("Flow AI chưa có prompt để áp dụng.", "error");
+    showMessage("Flow Agent chưa có lệnh để chuẩn bị.", "error");
     return false;
   }
   applyGeneratedPromptToComposer(text);
@@ -4831,7 +4858,7 @@ function applyFlowAiPrompt(prompt) {
   state.automation.prompt = text;
   saveAutomationConfig(state.automation);
   renderAll();
-  showMessage("Đã áp dụng prompt Flow AI vào luồng tạo ảnh.", "success");
+  showMessage("Đã chuẩn bị lệnh cho Tác nhân Flow. Prompt ảnh cuối sẽ do Google Flow tự viết.", "success");
   return true;
 }
 
@@ -4966,7 +4993,7 @@ function assistantRequestedNumericBatchLimit() {
   if (!text) {
     return null;
   }
-  const numberMatch = text.match(/\b(\d{1,2})\s*(anh|image|prompt|card|san pham)\b/);
+  const numberMatch = text.match(/\b(\d{1,2})\s*(prompt|card|san pham)\b/);
   if (numberMatch) {
     return Math.max(1, Math.min(6, Number(numberMatch[1] || 1)));
   }
@@ -4985,7 +5012,7 @@ function assistantRequestedNumericBatchLimit() {
     six: 6,
   };
   for (const [word, value] of Object.entries(words)) {
-    if (new RegExp(`\\b${word}\\s*(anh|image|prompt|card|san pham)\\b`).test(text)) {
+    if (new RegExp(`\\b${word}\\s*(prompt|card|san pham)\\b`).test(text)) {
       return value;
     }
   }
