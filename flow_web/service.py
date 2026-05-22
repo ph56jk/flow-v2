@@ -2563,7 +2563,12 @@ class FlowWebService:
             f"boards/{quote(board_id, safe='')}/cards",
             key,
             token,
-            fields={"fields": "id,name,idList,closed,url", "filter": "open"},
+            fields={
+                "fields": "id,name,idList,closed,url",
+                "filter": "open",
+                "attachments": "true",
+                "attachment_fields": "id,name,mimeType,date",
+            },
         )
         cards = [
             card
@@ -2580,13 +2585,13 @@ class FlowWebService:
             card_id = self._normalize_trello_card_id(str(card.get("id") or ""))
             if not card_id:
                 continue
-            attachments_payload = self._trello_get_json(
-                f"cards/{quote(card_id, safe='')}/attachments",
+            attachments = self._trello_card_attachments_or_fetch(
+                card,
                 key,
                 token,
-                fields={"fields": "id,name,mimeType,date"},
+                card_id,
+                field_names="id,name,mimeType,date",
             )
-            attachments = attachments_payload if isinstance(attachments_payload, list) else []
             image_attachments = [
                 item
                 for item in attachments
@@ -2630,6 +2635,26 @@ class FlowWebService:
                 f"{complete} card đã đủ {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} ảnh output; {no_source} card chưa có ảnh nguồn."
             ),
         }
+
+    def _trello_card_attachments_or_fetch(
+        self,
+        card: Dict[str, Any],
+        key: str,
+        token: str,
+        card_id: str,
+        *,
+        field_names: str = "id,name,url,mimeType,date",
+    ) -> List[Dict[str, Any]]:
+        if "attachments" in card:
+            attachments = card.get("attachments")
+            return attachments if isinstance(attachments, list) else []
+        attachments_payload = self._trello_get_json(
+            f"cards/{quote(card_id, safe='')}/attachments",
+            key,
+            token,
+            fields={"fields": field_names},
+        )
+        return attachments_payload if isinstance(attachments_payload, list) else []
 
     def _reset_ready_trello_outputs_sync(self, key: str, token: str, board_id: str, list_ids: List[str]) -> Dict[str, Any]:
         normalized_list_ids = {
@@ -9037,7 +9062,12 @@ exit 1
             f"boards/{quote(board_id, safe='')}/cards",
             key,
             token,
-            fields={"fields": "id,name,desc,shortLink,url,idList,closed", "filter": "open"},
+            fields={
+                "fields": "id,name,desc,shortLink,url,idList,closed",
+                "filter": "open",
+                "attachments": "true",
+                "attachment_fields": "id,name,url,mimeType,date",
+            },
         )
         cards = payload if isinstance(payload, list) else []
         image_cards: List[Dict[str, Any]] = []
@@ -9049,13 +9079,7 @@ exit 1
                 continue
             if list_ids and self._normalize_trello_id(str(card.get("idList") or "")) not in list_ids:
                 continue
-            attachments_payload = self._trello_get_json(
-                f"cards/{quote(card_id, safe='')}/attachments",
-                key,
-                token,
-                fields={"fields": "id,name,url,mimeType,date"},
-            )
-            attachments = attachments_payload if isinstance(attachments_payload, list) else []
+            attachments = self._trello_card_attachments_or_fetch(card, key, token, card_id)
             image_attachments = [
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]

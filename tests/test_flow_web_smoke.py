@@ -1266,6 +1266,47 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("eligible", card_statuses["new-card"])
         self.assertEqual("no_source", card_statuses["empty-card"])
 
+    def test_ready_trello_status_uses_board_card_attachments_when_available(self) -> None:
+        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+        cards_payload = [
+            {
+                "id": "done-card",
+                "name": "Done",
+                "idList": "ready-list",
+                "url": "https://trello.test/done",
+                "attachments": [
+                    {"id": "source", "name": "source.png", "mimeType": "image/png"},
+                    {"id": "flow-1", "name": "flow-done-1.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-2", "name": "flow-done-2.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-3", "name": "flow-done-3.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-4", "name": "flow-done-4.jpg", "mimeType": "image/jpeg"},
+                ],
+            },
+            {
+                "id": "new-card",
+                "name": "New",
+                "idList": "ready-list",
+                "url": "https://trello.test/new",
+                "attachments": [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}],
+            },
+        ]
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            return_value=cards_payload,
+        ) as get_json:
+            result = asyncio.run(self.service.ready_trello_status(request))
+
+        self.assertEqual(2, result["cards_seen"])
+        self.assertEqual(1, result["complete"])
+        self.assertEqual(1, result["eligible"])
+        self.assertEqual(1, get_json.call_count)
+
     def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
         previews = self.service._trello_candidate_image_previews(
             "card-1",
