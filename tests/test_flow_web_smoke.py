@@ -175,6 +175,36 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
         self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
 
+    def test_prompt_batch_child_request_uses_missing_flow_agent_count(self) -> None:
+        base = CreateJobRequest(
+            type="image",
+            prompt="",
+            count=4,
+            automation_graph={
+                "modules": [
+                    {"id": "flow", "type": "flow", "settings": {"imageCount": 4}},
+                ]
+            },
+        )
+
+        child = self.service._prompt_batch_child_request(
+            base,
+            {
+                "prompt": "finish missing outputs",
+                "flow_agent_instruction": True,
+                "flow_agent_image_count": 2,
+                "trello_card_name": "partial card",
+            },
+            0,
+            1,
+        )
+
+        self.assertEqual(2, child.count)
+        self.assertIn("2 ảnh", child.title)
+        graph = child.automation_graph.model_dump(mode="json")
+        flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
+        self.assertEqual(2, flow_module["settings"]["imageCount"])
+
     def test_resolve_job_request_applies_config_defaults(self) -> None:
         config = AppConfig(
             project_id="pid",
@@ -283,6 +313,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("", self.service._trello_auto_search_query(request))
         self.assertEqual({"card-apron", "card-pillow"}, {item["trello_card_id"] for item in items})
+
+    def test_auto_trello_partial_flow_outputs_generate_only_missing_images(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        cards = [
+            {
+                "id": "partial-card",
+                "shortLink": "partial",
+                "idList": "ready",
+                "name": "embroidered apron",
+                "url": "https://trello.example/c/partial",
+                "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["source-att"],
+                "_flow_output_count": 3,
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertEqual(1, items[0]["flow_agent_image_count"])
+        self.assertEqual(3, items[0]["flow_agent_existing_output_count"])
+        self.assertEqual(["source-att"], items[0]["trello_attachment_ids"])
+        self.assertIn("already has 3 Flow output", items[0]["prompt"])
+        self.assertIn("Generate only the 1 missing", items[0]["prompt"])
 
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
         project_data = {
@@ -935,6 +989,52 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["partial-source"], cards[0]["_selected_attachment_ids"])
         self.assertEqual(1, cards[0]["_flow_output_count"])
         self.assertEqual("fresh-source", cards[1]["_image_attachments"][0]["id"])
+
+    def test_trello_image_card_scan_counts_numbered_generated_series_as_outputs(self) -> None:
+        cards_payload = [
+            {"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"},
+            {"id": "done-card", "name": "done pillow", "idList": "ready-list"},
+        ]
+        partial_attachments = [
+            {"id": "source", "name": "baby_pillowcase.png", "mimeType": "image/png", "date": "2026-05-21T10:00:00.000Z"},
+            {"id": "old-output-1", "name": "baby_pillowcase_9.png", "mimeType": "image/png", "date": "2026-05-21T10:30:00.000Z"},
+            {"id": "old-output-2", "name": "baby_pillowcase_10.png", "mimeType": "image/png", "date": "2026-05-21T10:31:00.000Z"},
+        ]
+        done_attachments = [
+            {"id": "done-source", "name": "done_pillow.png", "mimeType": "image/png"},
+            {"id": "done-output-1", "name": "done_pillow_1.png", "mimeType": "image/png"},
+            {"id": "done-output-2", "name": "done_pillow_2.png", "mimeType": "image/png"},
+            {"id": "done-output-3", "name": "done_pillow_3.png", "mimeType": "image/png"},
+            {"id": "done-output-4", "name": "done_pillow_4.png", "mimeType": "image/png"},
+        ]
+
+        with patch.object(
+            self.service,
+            "_trello_get_json",
+            side_effect=[cards_payload, partial_attachments, done_attachments],
+        ):
+            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+
+        self.assertEqual(["partial-card"], [card["id"] for card in cards])
+        self.assertEqual(["source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual(["source"], [item["id"] for item in cards[0]["_image_attachments"]])
+        self.assertEqual(2, cards[0]["_flow_output_count"])
+
+    def test_trello_image_card_scan_skips_when_only_generated_series_remains(self) -> None:
+        cards_payload = [{"id": "output-only-card", "name": "baby_pillowcase", "idList": "ready-list"}]
+        attachments = [
+            {"id": "old-output-1", "name": "baby_pillowcase_9.png", "mimeType": "image/png"},
+            {"id": "old-output-2", "name": "baby_pillowcase_10.png", "mimeType": "image/png"},
+        ]
+
+        with patch.object(
+            self.service,
+            "_trello_get_json",
+            side_effect=[cards_payload, attachments],
+        ):
+            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+
+        self.assertEqual([], cards)
 
     def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
         previews = self.service._trello_candidate_image_previews(

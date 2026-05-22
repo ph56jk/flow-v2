@@ -2246,7 +2246,8 @@ class FlowWebService:
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
-            return f"Flow Agent {index + 1}/{total} · {label} · 4 ảnh"[:120]
+            image_count = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            return f"Flow Agent {index + 1}/{total} · {label} · {image_count} ảnh"[:120]
         if item.get("generated_by_ai"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
             shot_label = str(item.get("shot_label") or "").strip()
@@ -2268,10 +2269,19 @@ class FlowWebService:
         payload["prompt_index"] = str(item.get("index") or "").strip()
         payload["prompt_notes"] = str(item.get("notes") or "").strip()
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
-            payload["count"] = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            image_count = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            payload["count"] = image_count
             payload["flow_agent_enabled"] = True
             payload["flow_agent_auto_approve"] = True
             self._force_auto_trello_flow_agent_policy(payload)
+            payload["count"] = image_count
+            graph = payload.get("automation_graph")
+            modules = graph.get("modules") if isinstance(graph, dict) else []
+            for module in modules if isinstance(modules, list) else []:
+                if isinstance(module, dict) and module.get("type") == "flow":
+                    settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+                    settings["imageCount"] = image_count
+                    module["settings"] = settings
         if item.get("trello_card_id"):
             payload["trello_card_id"] = str(item.get("trello_card_id") or "").strip()
         if item.get("trello_list_id"):
@@ -3501,7 +3511,7 @@ class FlowWebService:
                 "fields": "id,name,desc,shortLink,url,idList,closed",
                 "filter": "open",
                 "attachments": "true",
-                "attachment_fields": "id,name,url,mimeType",
+                "attachment_fields": "id,name,url,mimeType,date",
             },
         )
         cards = payload if isinstance(payload, list) else []
@@ -3565,11 +3575,12 @@ class FlowWebService:
         for card in cards:
             if not isinstance(card, dict) or card.get("closed"):
                 continue
-            image_attachments = [
+            all_image_attachments = [
                 item
                 for item in card.get("attachments") or []
                 if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
+            image_attachments, _generated_attachments = self._trello_source_and_flow_output_attachments(all_image_attachments)
             if not image_attachments:
                 continue
             card["_image_attachments"] = image_attachments
@@ -7351,11 +7362,7 @@ exit 1
                 raise RuntimeError("Ảnh Trello đã chọn không nằm trên card này hoặc không phải attachment ảnh.")
             image_attachments = selected_attachments
         else:
-            source_attachments = [
-                item
-                for item in image_attachments
-                if not self._trello_attachment_is_flow_output(item)
-            ]
+            source_attachments, _generated_attachments = self._trello_source_and_flow_output_attachments(image_attachments)
             if source_attachments:
                 image_attachments = source_attachments
         image_attachments = image_attachments[: max(1, min(4, int(limit or 4)))]
@@ -7551,7 +7558,7 @@ exit 1
             fields={
                 "fields": "id,name,desc,shortLink,url,idList,closed",
                 "attachments": "true",
-                "attachment_fields": "id,name,url,mimeType",
+                "attachment_fields": "id,name,url,mimeType,date",
             },
         )
         if not isinstance(card, dict) or card.get("closed"):
@@ -7562,15 +7569,22 @@ exit 1
                 f"cards/{quote(card_id, safe='')}/attachments",
                 key,
                 token,
-                fields={"fields": "id,name,url,mimeType"},
+                fields={"fields": "id,name,url,mimeType,date"},
             )
             attachments = attachments_payload if isinstance(attachments_payload, list) else []
-        image_attachments = [
+        all_image_attachments = [
             item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
         ]
+        image_attachments, generated_attachments = self._trello_source_and_flow_output_attachments(all_image_attachments)
         if not image_attachments:
             return {}
         card["_image_attachments"] = image_attachments
+        card["_selected_attachment_ids"] = [
+            self._normalize_trello_id(str(item.get("id") or ""))
+            for item in image_attachments[:1]
+            if str(item.get("id") or "").strip()
+        ]
+        card["_flow_output_count"] = len(generated_attachments)
         return card
 
     def _select_trello_card_attachments(
@@ -7676,14 +7690,16 @@ exit 1
                         f"cards/{quote(card_id, safe='')}/attachments",
                         key,
                         token,
-                        fields={"fields": "id,name,url,mimeType"},
+                        fields={"fields": "id,name,url,mimeType,date"},
                     )
                     attachments = attachments_payload if isinstance(attachments_payload, list) else []
-                    attachment_cache[card_id] = any(
-                        self._trello_attachment_is_image(attachment)
+                    image_attachments = [
+                        attachment
                         for attachment in attachments
-                        if isinstance(attachment, dict)
-                    )
+                        if isinstance(attachment, dict) and self._trello_attachment_is_image(attachment)
+                    ]
+                    source_attachments, _generated_attachments = self._trello_source_and_flow_output_attachments(image_attachments)
+                    attachment_cache[card_id] = bool(source_attachments)
                 if attachment_cache[card_id]:
                     return card
         return {}
@@ -8074,6 +8090,8 @@ exit 1
         index: int,
         shot: Dict[str, str] | None = None,
         design_analysis: str = "",
+        image_count: int | None = None,
+        existing_flow_count: int = 0,
     ) -> str:
         card_name = str(card.get("name") or "").strip()
         card_url = str(card.get("url") or "").strip()
@@ -8081,17 +8099,27 @@ exit 1
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
-        shots = self._flow_operator_shot_suite_for_trello_card(request, card)[: self.FLOW_AGENT_DEFAULT_IMAGE_COUNT]
+        target_count = max(1, min(4, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        existing_flow_count = max(0, min(4, int(existing_flow_count or 0)))
+        all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
+        shots = all_shots[existing_flow_count : existing_flow_count + target_count] or all_shots[:target_count]
         shot_summary = "; ".join(
             f"{position + 1}. {item.get('label')}: {item.get('brief')}"
             for position, item in enumerate(shots)
             if item.get("label") or item.get("brief")
         )
+        resume_note = (
+            f"This Trello card already has {existing_flow_count} Flow output image(s). "
+            f"Generate only the {target_count} missing standalone image(s), not a full new 4-image set."
+            if existing_flow_count
+            else ""
+        )
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             design_analysis,
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
-            f"First analyze the product, then write your own internal prompts and generate exactly {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} commercial product images for {product_hint}.",
+            resume_note,
+            f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
@@ -8131,14 +8159,19 @@ exit 1
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
             selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
+            existing_flow_count = max(0, min(4, int(card.get("_flow_output_count") or 0)))
+            missing_image_count = max(1, self.FLOW_AGENT_DEFAULT_IMAGE_COUNT - existing_flow_count)
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
-            shots = self._flow_operator_shot_suite_for_trello_card(request, card)[: self.FLOW_AGENT_DEFAULT_IMAGE_COUNT]
+            all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
+            shots = all_shots[existing_flow_count : existing_flow_count + missing_image_count] or all_shots[:missing_image_count]
             shot_labels = [str(shot.get("label") or "").strip() for shot in shots if str(shot.get("label") or "").strip()]
             prompt = self._flow_operator_prompt_for_trello_card(
                 request,
                 card,
                 len(expanded) + 1,
                 design_analysis=design_analysis,
+                image_count=missing_image_count,
+                existing_flow_count=existing_flow_count,
             )
             expanded.append(
                 {
@@ -8152,7 +8185,7 @@ exit 1
                     "index": str(len(expanded) + 1),
                     "notes": (
                         f"{design_analysis} Flow Agent will write the final prompts and generate "
-                        f"{self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} images. Google Sheet prompt not required."
+                        f"{missing_image_count} missing image(s). Google Sheet prompt not required."
                     ),
                     "trello_card_id": card_id,
                     "trello_list_id": card_list_id,
@@ -8165,7 +8198,8 @@ exit 1
                     "shot_labels": shot_labels,
                     "design_analysis": design_analysis,
                     "flow_agent_instruction": True,
-                    "flow_agent_image_count": self.FLOW_AGENT_DEFAULT_IMAGE_COUNT,
+                    "flow_agent_image_count": missing_image_count,
+                    "flow_agent_existing_output_count": existing_flow_count,
                     "generated_by_ai": False,
                     "generated_by_flow_agent": True,
                 }
@@ -8384,18 +8418,13 @@ exit 1
                 f"cards/{quote(card_id, safe='')}/attachments",
                 key,
                 token,
-                fields={"fields": "id,name,url,mimeType"},
+                fields={"fields": "id,name,url,mimeType,date"},
             )
             attachments = attachments_payload if isinstance(attachments_payload, list) else []
             image_attachments = [
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
-            flow_outputs = [
-                item for item in image_attachments if self._trello_attachment_is_flow_output(item)
-            ]
-            source_attachments = [
-                item for item in image_attachments if not self._trello_attachment_is_flow_output(item)
-            ]
+            source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
             if len(flow_outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
                 continue
             if source_attachments:
@@ -8424,9 +8453,102 @@ exit 1
         mime = str(attachment.get("mimeType") or "").lower()
         return mime.startswith("image/") or Path(name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
+    def _trello_attachment_order_key(self, attachment: Dict[str, Any], index: int = 0) -> tuple[int, float, int]:
+        parsed = _parse_iso_datetime(str(attachment.get("date") or ""))
+        if parsed is None:
+            return (1, 0.0, index)
+        return (0, parsed.timestamp(), index)
+
     def _trello_attachment_is_flow_output(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").strip().lower()
-        return name.startswith("flow-")
+        stem = Path(name).stem.lower()
+        return (
+            name.startswith("flow-")
+            or name.startswith("flow_")
+            or stem.startswith("flow-")
+            or stem.startswith("flow_")
+            or "generated image" in name
+            or "generated_image" in name
+            or "google flow" in name
+        )
+
+    def _trello_generated_series_prefix(self, attachment: Dict[str, Any]) -> str:
+        stem = Path(str(attachment.get("name") or "")).stem.strip().lower()
+        if not stem:
+            return ""
+        normalized = re.sub(r"[\s-]+", "_", stem).strip("_")
+        match = re.match(r"^(.+?)_(\d{1,3})$", normalized)
+        if not match:
+            return ""
+        prefix = match.group(1).strip("_")
+        if len(prefix) < 5 or not re.search(r"[a-z]", prefix):
+            return ""
+        generic_prefixes = {
+            "anh",
+            "back",
+            "front",
+            "image",
+            "img",
+            "photo",
+            "reference",
+            "ref",
+            "side",
+            "source",
+        }
+        if prefix in generic_prefixes:
+            return ""
+        tokens = [token for token in re.split(r"[_]+", prefix) if token]
+        code_like_tokens = [
+            token
+            for token in tokens
+            if token.isdigit() or re.fullmatch(r"[a-z]\d{1,4}", token)
+        ]
+        if len(code_like_tokens) >= 2:
+            return ""
+        return prefix
+
+    def _trello_source_and_flow_output_attachments(
+        self,
+        image_attachments: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        images = [
+            item
+            for item in image_attachments
+            if isinstance(item, dict) and self._trello_attachment_is_image(item)
+        ]
+        if not images:
+            return [], []
+        series_counts: Dict[str, int] = {}
+        for item in images:
+            prefix = self._trello_generated_series_prefix(item)
+            if prefix:
+                series_counts[prefix] = series_counts.get(prefix, 0) + 1
+
+        source_attachments: List[Dict[str, Any]] = []
+        flow_outputs: List[Dict[str, Any]] = []
+        for item in images:
+            series_prefix = self._trello_generated_series_prefix(item)
+            is_generated_series = bool(series_prefix and series_counts.get(series_prefix, 0) >= 2)
+            if self._trello_attachment_is_flow_output(item) or is_generated_series:
+                flow_outputs.append(item)
+            else:
+                source_attachments.append(item)
+
+        source_attachments = [
+            item
+            for index, item in sorted(
+                enumerate(source_attachments),
+                key=lambda pair: self._trello_attachment_order_key(pair[1], pair[0]),
+            )
+        ]
+        flow_outputs = [
+            item
+            for index, item in sorted(
+                enumerate(flow_outputs),
+                key=lambda pair: self._trello_attachment_order_key(pair[1], pair[0]),
+            )
+        ]
+        return source_attachments, flow_outputs
 
     def _trello_download_attachment_bytes(
         self,
