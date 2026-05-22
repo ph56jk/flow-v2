@@ -111,6 +111,20 @@ Nếu dùng macOS và thích double-click:
 
 Script `.sh` hiện gọi launcher Python chung nên hành vi trên macOS/Linux bám cùng một đường chạy với Windows có Python 3.11.
 
+### Test nhanh sau khi cài
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\run_flow_web_tests.ps1
+```
+
+macOS / Linux:
+
+```bash
+./scripts/run_flow_web_tests.sh
+```
+
 ### ⚠️ Windows lưu ý đặc biệt
 
 - **Path cài Chromium KHÔNG được có khoảng trắng.** Thư mục `C:\Users\HAVI GROUP\...` sẽ gây lỗi `side-by-side configuration is incorrect` / `spawn UNKNOWN`. Script `run_flow_web.ps1` sẽ tự chọn path kiểu `D:\pw-flow` hoặc `C:\pw-flow` theo ổ còn trống.

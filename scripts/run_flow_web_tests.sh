@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /Users/admin/VibeCoding/flow
-source .venv/bin/activate
-python -m unittest discover -s tests -v
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON="python3"
+else
+  PYTHON="python"
+fi
+
+"$PYTHON" -m unittest discover -s tests -v
