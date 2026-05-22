@@ -1605,6 +1605,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("búp bê", product)
 
+    def test_user_assistant_does_not_extract_generic_trello_status_text(self) -> None:
+        product = self.service._extract_user_assistant_product_filter(
+            "kiểm tra Trello Ready for AI và cho biết app sẽ lấy ảnh nào, không chạy tạo ảnh"
+        )
+
+        self.assertEqual("", product)
+
+    def test_flow_operator_sanitizes_generic_gemini_product_filter(self) -> None:
+        local_plan = {"product_filter": "", "flow_prompt": "x" * 200, "steps": []}
+        raw_plan = {"product_filter": "tạo ảnh", "flow_prompt": "y" * 200, "steps": []}
+
+        plan = self.service._normalize_flow_operator_plan(raw_plan, local_plan, "kiểm tra Ready for AI")
+
+        self.assertEqual("", plan["product_filter"])
+
     def test_flow_operator_uses_gemini_json_when_configured(self) -> None:
         asyncio.run(
             self.service.update_integration_config(

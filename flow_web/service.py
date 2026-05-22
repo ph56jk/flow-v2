@@ -3064,7 +3064,9 @@ class FlowWebService:
         *,
         run_mode: str = "plan",
     ) -> Dict[str, Any]:
-        product_filter = str(raw_plan.get("product_filter") or local_plan.get("product_filter") or "").strip()
+        product_filter = self._sanitize_user_assistant_product_filter(
+            str(raw_plan.get("product_filter") or local_plan.get("product_filter") or "").strip()
+        )
         flow_prompt = self._clean_prompt_text(str(raw_plan.get("flow_prompt") or local_plan.get("flow_prompt") or ""))
         if len(flow_prompt) < 160:
             flow_prompt = str(local_plan.get("flow_prompt") or flow_prompt).strip()
@@ -3273,6 +3275,7 @@ class FlowWebService:
                 flags=re.IGNORECASE,
             ).strip()
             value = re.sub(r"^(?:ảnh|anh|image|sản phẩm|san pham)\s+", "", value, flags=re.IGNORECASE).strip()
+            value = self._sanitize_user_assistant_product_filter(value)
             if 2 <= len(value) <= 48:
                 return value
 
@@ -3307,6 +3310,67 @@ class FlowWebService:
             if matched:
                 return value
         return ""
+
+    def _sanitize_user_assistant_product_filter(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip(" .,:;\"'"))
+        if not cleaned:
+            return ""
+        normalized = self._normalize_skill_token(cleaned)
+        compact = self._compact_match_text(cleaned)
+        stripped = self._strip_accents(cleaned).lower()
+        generic_exact = {
+            "auto",
+            "auto_trello",
+            "auto_ai_trello",
+            "board",
+            "card",
+            "flow",
+            "google_flow",
+            "kiem_tra",
+            "lay_anh",
+            "ready_for_ai",
+            "sheet",
+            "tao",
+            "tao_anh",
+            "trello",
+        }
+        generic_compact = {item.replace("_", "") for item in generic_exact}
+        if normalized in generic_exact or compact in generic_compact:
+            return ""
+        generic_phrases = (
+            "app se lay",
+            "anh nao",
+            "chay tao anh",
+            "chay thu",
+            "khong chay",
+            "ready for ai",
+            "tao anh",
+            "trello ready",
+        )
+        if any(phrase in stripped for phrase in generic_phrases):
+            return ""
+        generic_tokens = {
+            "ai",
+            "anh",
+            "app",
+            "auto",
+            "biet",
+            "card",
+            "chay",
+            "cho",
+            "flow",
+            "kiem",
+            "lay",
+            "nao",
+            "ready",
+            "tao",
+            "test",
+            "trello",
+        }
+        tokens = set(self._tokenize_match_words(cleaned))
+        if tokens and tokens <= generic_tokens:
+            return ""
+        return cleaned
 
     def _extract_user_assistant_batch_limit(self, question: str) -> int | None:
         raw = re.sub(r"\s+", " ", str(question or "").strip()).lower()
