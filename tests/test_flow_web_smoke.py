@@ -991,6 +991,64 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, cards[0]["_flow_output_count"])
         self.assertEqual("fresh-source", cards[1]["_image_attachments"][0]["id"])
 
+    def test_auto_trello_default_scope_includes_ready_and_ideas_lists(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="board123",
+            trello_list_id=self.service.DEFAULT_TRELLO_SOURCE_LIST_ID,
+        )
+        ready_card = {
+            "id": "ready-card",
+            "shortLink": "ready",
+            "idList": "ready-list",
+            "name": "ready product",
+            "url": "https://trello.example/c/ready",
+            "_image_attachments": [{"id": "ready-att", "name": "ready.jpg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["ready-att"],
+        }
+        ideas_card = {
+            "id": "ideas-card",
+            "shortLink": "ideas",
+            "idList": "ideas-list",
+            "name": "ideas product",
+            "url": "https://trello.example/c/ideas",
+            "_image_attachments": [{"id": "ideas-att", "name": "ideas.jpg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["ideas-att"],
+        }
+
+        def resolve_list(_key: str, _token: str, _board_id: str, value: str = "") -> str:
+            if value == self.service.DEFAULT_TRELLO_SOURCE_LIST_ID or self.service._compact_match_text(value) == "readyforai":
+                return "ready-list"
+            if self.service._compact_match_text(value) == "ideas":
+                return "ideas-list"
+            return ""
+
+        def image_cards(_key: str, _token: str, _board_id: str, list_id: str = "") -> list[dict]:
+            return {"ready-list": [ready_card], "ideas-list": [ideas_card]}.get(list_id, [])
+
+        def list_name(_key: str, _token: str, list_id: str) -> str:
+            return {"ready-list": "Ready for AI", "ideas-list": "Ideas"}.get(list_id, "")
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            side_effect=resolve_list,
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            side_effect=image_cards,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            side_effect=list_name,
+        ):
+            items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 0)
+
+        self.assertEqual(["ready-card", "ideas-card"], [item["trello_card_id"] for item in items])
+        self.assertEqual(["ready-list", "ideas-list"], discovery["list_ids"])
+        self.assertEqual("Ready for AI / Ideas", discovery["list_name"])
+
     def test_trello_image_card_scan_counts_numbered_generated_series_as_outputs(self) -> None:
         cards_payload = [
             {"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"},
@@ -1211,7 +1269,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             hint = self.service._trello_matching_image_card_hint(request, items)
 
-        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list")
+        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list,ideas-list")
         self.assertEqual("ready-card", hint["card_id"])
         self.assertEqual("ready-list", hint["list_id"])
         self.assertEqual("Ready for AI", hint["list_name"])
