@@ -4638,6 +4638,95 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(all("Before creating images, carefully analyze" in prompt for prompt in seen_prompts))
         self.assertIn("apron silhouette", saved.input["items"][0]["design_analysis"])
 
+    async def test_auto_trello_flow_agent_uses_learned_product_prompt_style_for_pillowcase(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="tạo bộ ảnh giống phong cách prompt mẫu, mỗi ảnh riêng biệt, có ảnh chứng minh thêu tay",
+                count=1,
+                prompt_product="vỏ gối em bé thêu tay",
+                prompt_product_key="vỏ gối em bé thêu tay",
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    ]
+                },
+            ),
+            limit=10,
+            auto_trello=True,
+            items=[],
+        )
+        cards = [
+            {
+                "id": "card-pillow",
+                "name": "Embroidered Baby Pillow Collection",
+                "shortLink": "pillow",
+                "url": "https://trello.com/c/pillow",
+                "idList": "ready-list",
+                "_image_attachments": [{"name": "baby_pillowcase_fox_bunny_embroidery.png", "mimeType": "image/png"}],
+            }
+        ]
+        seen_prompts: list[str] = []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_prompts.append(child_request.prompt)
+            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(
+            [
+                "Embroidery craft proof",
+                "Nursery hero arrangement",
+                "Lifestyle baby room scene",
+                "Gift box presentation",
+            ],
+            saved.input["items"][0]["shot_labels"],
+        )
+        self.assertIn("baby pillowcase or cushion shape", saved.input["items"][0]["design_analysis"])
+        prompt = seen_prompts[0]
+        self.assertIn("learned product-prompt style", prompt)
+        self.assertIn("numbered shot brief", prompt)
+        self.assertIn("separate standalone 1:1 images", prompt)
+        self.assertIn("never make a collage", prompt)
+        self.assertIn("visible thread fibers", prompt)
+
     async def test_auto_trello_ai_suite_does_not_reuse_apron_template_for_doll_query(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(

@@ -3027,11 +3027,24 @@ class FlowWebService:
             "Only change scene, styling, lighting, composition, model/background, and merchandising context.",
             "The image set should include: 1 detail/craft proof close-up, 1 full product hero, 1 lifestyle use scene, and 1 flat lay or gift-ready merchandising shot.",
             "If the product appears hand embroidered, one image must clearly prove it with visible thread texture and raised stitches.",
+            self._flow_agent_reference_prompt_style_guide(target),
             "Do not rely on Google Sheet prompts; do not ask the local app AI to write the final prompt.",
         ]
         if user_text:
             parts.append(f"User request: {user_text}.")
         return " ".join(parts)
+
+    def _flow_agent_reference_prompt_style_guide(self, target_count: int) -> str:
+        target = max(1, min(4, int(target_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        return (
+            "Use the learned product-prompt style: write like a meticulous ecommerce art director. "
+            "Before generating, state a compact design analysis of the reference product, then create a numbered shot brief. "
+            f"Request exactly {target} separate standalone 1:1 images, generated one by one; never make a collage, contact sheet, grid, or multiple small frames inside one image. "
+            "For every shot, specify the subject count, exact product placement, background, props, lighting direction, camera angle, and which source details must stay unchanged. "
+            "Keep all source motifs, embroidery/print placement, names, colors, fabric texture, proportions, and handmade irregularities consistent. "
+            "For handmade or embroidered products, include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
+            "Use soft bright natural light, airy clean styling, warm nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography, no watermark, no extra text overlay."
+        )
 
     def _flow_operator_steps(
         self,
@@ -8134,9 +8147,13 @@ exit 1
             "is_apron": any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact,
             "is_doll": any(term in normalized for term in ("bup_be", "bupbe", "doll", "baby_doll", "babydoll", "bda")),
             "is_plush": any(term in normalized for term in ("gau_bong", "gaubong", "plush", "stuffed", "stuffed_animal", "teddy", "bear", "gau")),
+            "is_pillowcase": any(
+                term in normalized
+                for term in ("goi", "vo_goi", "vỏ_gối", "pillow", "pillowcase", "cushion", "baby_pillow")
+            ) or "vogoi" in compact,
             "is_child_shirt": is_child_shirt,
             "is_shirt": any(term in normalized for term in ("ao", "shirt", "tshirt", "tee")),
-            "is_embroidery": any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made")),
+            "is_embroidery": any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made", "stitched", "stitch")),
             "is_baking": any(term in normalized for term in ("baking", "bakery", "kitchen", "nau_an", "lam_banh")),
         }
 
@@ -8180,6 +8197,8 @@ exit 1
             product_bits.append("doll body shape, face, hair/clothing/accessories, fabric texture, proportions, and collectible toy identity")
         elif signals.get("is_plush"):
             product_bits.append("plush toy silhouette, soft fabric pile, stitched seams, facial features, stuffing volume, and cuddly product scale")
+        elif signals.get("is_pillowcase"):
+            product_bits.append("baby pillowcase or cushion shape, soft fabric texture, pillow volume, name placement, embroidered motifs, nursery-safe styling, and giftable handmade cues")
         elif signals.get("is_child_shirt"):
             product_bits.append("children shirt silhouette, collar/sleeves/hem, print placement, fabric texture, size scale, and kid-safe styling")
         elif signals.get("is_shirt"):
@@ -8285,6 +8304,43 @@ exit 1
                     "label": "Gift ready scene",
                     "brief": "Premium gift-ready scene with the doll/plush beside wrapping tissue, ribbon, small card, or keepsake box while preserving the source product identity.",
                     "must_include": "premium gift presentation, doll/plush details visible, clean commercial finish",
+                },
+            ]
+
+        if signals.get("is_pillowcase"):
+            return [
+                {
+                    "label": "Embroidery craft proof",
+                    "brief": (
+                        "Extreme close-up of the pillowcase embroidery or stitched motif, showing thread fibers, raised stitches, fabric weave, "
+                        "name lettering if present, and handmade irregularities; this shot must clearly prove the product is handmade or embroidered."
+                    ),
+                    "must_include": "visible thread texture, embroidered motif/name, pillow fabric weave, craft proof detail",
+                },
+                {
+                    "label": "Nursery hero arrangement",
+                    "brief": "Clean nursery product hero with the pillowcase/cushion placed on a crib, rocking chair, bed, or soft rug with gentle baby-safe decor and the design fully visible.",
+                    "must_include": "full pillowcase, exact embroidery design, soft nursery styling, bright natural light",
+                },
+                {
+                    "label": "Lifestyle baby room scene",
+                    "brief": "Warm lifestyle scene in a baby room or play corner, optionally with a parent or baby safely interacting near the pillow while the embroidered design remains visible and unchanged.",
+                    "must_include": "pillow in use context, gentle baby-safe props, embroidery still visible",
+                },
+                {
+                    "label": "Gift box presentation",
+                    "brief": "Premium gift-ready scene with the pillowcase or cushion neatly presented in a box, basket, or folded with tissue paper, ribbon, tag, and soft nursery props.",
+                    "must_include": "gift packaging, full product detail, handmade premium feel",
+                },
+                {
+                    "label": "Flat lay motif story",
+                    "brief": "Overhead flat lay showing the pillowcase arranged on light linen or wood with matching thread spools, small toys, dried flowers, or nursery props that echo the motif.",
+                    "must_include": "flat lay, embroidery motif, craft props, clean editorial styling",
+                },
+                {
+                    "label": "Collection variation scene",
+                    "brief": "Tasteful collection-style scene with one to three pillows/cushions in different nursery placements while keeping the source embroidery style, fabric quality, and handmade look consistent.",
+                    "must_include": "coherent pillow collection, varied placement, source style consistent",
                 },
             ]
 
@@ -8394,6 +8450,7 @@ exit 1
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
+            self._flow_agent_reference_prompt_style_guide(target_count),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
             "Do not change the source product into a different category; if the source is a doll or plush, it must remain a doll or plush, not an apron, shirt, mug, or unrelated object.",
