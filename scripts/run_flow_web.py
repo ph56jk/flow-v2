@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 VENV_DIR = ROOT / ".venv"
 INSTALL_STAMP = VENV_DIR / ".flow_install_stamp"
+PID_FILE = ROOT / ".flow-web.pid"
 
 
 def is_windows() -> bool:
@@ -133,6 +134,38 @@ def open_later(url: str) -> None:
     threading.Thread(target=_go, daemon=True).start()
 
 
+def write_server_pid(pid: int) -> None:
+    try:
+        PID_FILE.write_text(f"{pid}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def clear_server_pid(pid: int) -> None:
+    try:
+        if PID_FILE.read_text(encoding="utf-8").strip() == str(pid):
+            PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def run_server(command: list[str]) -> int:
+    process = subprocess.Popen(command, cwd=ROOT)
+    write_server_pid(process.pid)
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return 130
+    finally:
+        clear_server_pid(process.pid)
+
+
 def windows_session_warning(prepare_only: bool) -> None:
     if prepare_only or not is_windows():
         return
@@ -186,7 +219,7 @@ def main() -> int:
     ]
     if args.reload:
         command.append("--reload")
-    return subprocess.call(command, cwd=ROOT)
+    return run_server(command)
 
 
 if __name__ == "__main__":

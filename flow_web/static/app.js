@@ -1504,7 +1504,7 @@ function applyAutomationBranding() {
   if (elements.automationBrandTitle) {
     elements.automationBrandTitle.textContent = title;
   }
-  document.title = title ? `${title} | Flow v2` : "Flow v2";
+  document.title = title && title !== "Flow v2" ? `${title} | Flow v2` : "Flow v2";
 }
 
 function renderTopbar() {
