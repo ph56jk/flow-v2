@@ -13589,6 +13589,11 @@ exit 1
                 )
             target_count = max(1, min(4, int(request.count or 1)))
             flow_agent_enabled = self._flow_agent_enabled_for_request(request)
+            source_workflow_id = str(request.workflow_id or "").strip()
+            if flow_agent_enabled and not source_workflow_id:
+                source_workflow_id = await self._find_workflow_id_for_media(client, reference_media_names[0])
+            if flow_agent_enabled and not source_workflow_id:
+                raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
             generated: List[Any] = []
             max_attempts = target_count if flow_agent_enabled else 1
             for attempt in range(max_attempts):
@@ -13603,7 +13608,7 @@ exit 1
                             job_id,
                             f"Flow Agent tạo ảnh riêng {attempt + 1}/{target_count}; app không dùng x4/frame cho Tác nhân.",
                         )
-                shot_tries = 2 if flow_agent_enabled else 1
+                shot_tries = 3 if flow_agent_enabled else 1
                 last_exc: Exception | None = None
                 images: List[Any] = []
                 for shot_try in range(shot_tries):
@@ -13612,7 +13617,7 @@ exit 1
                             client,
                             prompt,
                             model=request.model,
-                            workflow_id=request.workflow_id or "",
+                            workflow_id=source_workflow_id,
                             reference_media_name=reference_media_names[0],
                             reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
                             count=max(1, min(remaining, attempt_count)),
@@ -13625,14 +13630,26 @@ exit 1
                     except Exception as exc:
                         last_exc = exc
                         detail = str(exc or "")
-                        if not flow_agent_enabled or "invalid argument" not in detail.lower() or shot_try >= shot_tries - 1:
+                        normalized_detail = detail.lower()
+                        retryable = any(
+                            marker in normalized_detail
+                            for marker in (
+                                "invalid argument",
+                                "recaptcha",
+                                "403",
+                                "timeout",
+                                "thoi gian cho",
+                                "chua tra ve anh",
+                            )
+                        )
+                        if not flow_agent_enabled or not retryable or shot_try >= shot_tries - 1:
                             raise
                         if job_id:
                             await self.store.append_log(
                                 job_id,
-                                f"Flow Agent báo busy/invalid argument ở ảnh {attempt + 1}/{target_count}; app chờ rồi thử lại cùng ảnh nguồn.",
+                                f"Flow Agent báo bận/reCAPTCHA ở ảnh {attempt + 1}/{target_count}; app nghỉ rồi thử lại cùng ảnh nguồn.",
                             )
-                        await asyncio.sleep(20.0)
+                        await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
                 if not images and last_exc is not None:
                     raise last_exc
                 generated.extend(images)
@@ -13641,7 +13658,8 @@ exit 1
                 if not flow_agent_enabled:
                     break
                 if job_id:
-                    await asyncio.sleep(8.0)
+                    await self.store.append_log(job_id, "Flow Agent nghỉ 25 giây trước ảnh tiếp theo để tránh reCAPTCHA/rate limit.")
+                    await asyncio.sleep(25.0)
             if flow_agent_enabled and len(generated) < target_count:
                 raise RuntimeError(
                     f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh sau {max_attempts} lượt. "
@@ -13902,7 +13920,8 @@ exit 1
                             )
                 raise RuntimeError(
                     "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
-                    "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong."
+                    "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong. "
+                    f"Chi tiet: {humanize_flow_error(str(exc))[:240]}"
                 ) from exc
             raise
 

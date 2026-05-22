@@ -4899,7 +4899,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         generate_via_ui.assert_awaited_once_with(fake_client, request, ["source-media"], job_id=job.id)
 
     async def test_generate_images_via_ui_uses_single_reference_fallback(self) -> None:
-        request = CreateJobRequest(type="image", prompt="them kinh", count=1, aspect="portrait")
+        request = CreateJobRequest(type="image", prompt="them kinh", count=1, aspect="portrait", flow_agent_enabled=False)
         fake_image = SimpleNamespace(media_name="img-1")
         fake_client = SimpleNamespace()
 
@@ -4951,14 +4951,20 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         with patch.object(
             self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="source-workflow"),
+        ) as find_workflow, patch.object(
+            self.service,
             "_generate_single_reference_image_via_ui",
             AsyncMock(side_effect=[[fake_images[0]], [fake_images[1]], [fake_images[2]], [fake_images[3]]]),
         ) as single_ref:
             result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"])
 
         self.assertEqual(fake_images, result)
+        find_workflow.assert_awaited_once_with(fake_client, "base-media")
         self.assertEqual(4, single_ref.await_count)
         self.assertEqual([1, 1, 1, 1], [call.kwargs["count"] for call in single_ref.await_args_list])
+        self.assertEqual(["source-workflow"] * 4, [call.kwargs["workflow_id"] for call in single_ref.await_args_list])
         self.assertIn("Create exactly ONE standalone image now", single_ref.await_args_list[0].args[1])
         self.assertIn("Do NOT create a 4-frame grid", single_ref.await_args_list[0].args[1])
 
