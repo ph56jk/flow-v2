@@ -1036,6 +1036,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual([], cards)
 
+    def test_auto_trello_ready_summary_explains_completed_ready_cards(self) -> None:
+        request = CreateJobRequest(type="image", trello_board_id="board123", trello_list_id="ready-list")
+        cards_payload = [
+            {"id": "done-card", "name": "Done", "idList": "ready-list"},
+            {"id": "new-card", "name": "New", "idList": "ready-list"},
+            {"id": "empty-card", "name": "Empty", "idList": "ready-list"},
+        ]
+        done_attachments = [
+            {"id": "source", "name": "source.png", "mimeType": "image/png"},
+            {"id": "flow-1", "name": "flow-done-1.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-2", "name": "flow-done-2.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-3", "name": "flow-done-3.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-4", "name": "flow-done-4.jpg", "mimeType": "image/jpeg"},
+        ]
+        new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
+        empty_attachments: list[dict] = []
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            side_effect=[cards_payload, done_attachments, new_attachments, empty_attachments],
+        ):
+            summary = self.service._auto_trello_ready_for_ai_summary(request)
+
+        self.assertIn("Ready for AI có 3 card", summary)
+        self.assertIn("1 card đã đủ 4 ảnh output", summary)
+        self.assertIn("1 card còn thiếu ảnh", summary)
+        self.assertIn("1 card chưa có ảnh nguồn", summary)
+
     def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
         previews = self.service._trello_candidate_image_previews(
             "card-1",

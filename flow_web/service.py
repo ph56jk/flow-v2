@@ -2472,6 +2472,90 @@ class FlowWebService:
         normalized = self._strip_accents(str(detail or "")).lower()
         return "chua tim thay card" in normalized or "khong tim thay card" in normalized
 
+    def _continuous_auto_trello_idle_message(self, request: CreateJobRequest, poll_interval_s: int) -> str:
+        summary = ""
+        try:
+            summary = self._auto_trello_ready_for_ai_summary(request)
+        except Exception as exc:
+            summary = f"Chưa đọc được chi tiết board: {humanize_flow_error(str(exc))[:120]}."
+        detail = f" {summary}" if summary else ""
+        return f"Chưa có card mới cần chạy trong Ready for AI.{detail} App sẽ quét lại sau {poll_interval_s}s."
+
+    def _auto_trello_ready_for_ai_summary(self, request: CreateJobRequest) -> str:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            return "Trello chưa có key/token để quét chi tiết."
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id
+            or trello_config.board_id
+            or os.getenv("TRELLO_BOARD_ID", "")
+        )
+        raw_list_id = self._normalize_trello_id(
+            request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
+        )
+        if not board_id:
+            return "Chưa có board Trello để kiểm tra."
+        list_id = self._trello_resolve_board_list_id(key, token, board_id, raw_list_id)
+        if not list_id:
+            return f"Chưa tìm thấy list {self._default_trello_source_list_name()} để kiểm tra."
+
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/cards",
+            key,
+            token,
+            fields={"fields": "id,name,idList,closed", "filter": "open"},
+        )
+        cards = [
+            card
+            for card in (payload if isinstance(payload, list) else [])
+            if isinstance(card, dict)
+            and not card.get("closed")
+            and self._normalize_trello_id(str(card.get("idList") or "")) == list_id
+        ]
+        if not cards:
+            return "List Ready for AI hiện chưa có card nào."
+
+        complete = 0
+        eligible = 0
+        no_source = 0
+        for card in cards:
+            card_id = str(card.get("id") or "").strip()
+            if not card_id:
+                continue
+            attachments_payload = self._trello_get_json(
+                f"cards/{quote(card_id, safe='')}/attachments",
+                key,
+                token,
+                fields={"fields": "id,name,mimeType,date"},
+            )
+            attachments = attachments_payload if isinstance(attachments_payload, list) else []
+            images = [
+                item
+                for item in attachments
+                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            ]
+            sources, outputs = self._trello_source_and_flow_output_attachments(images)
+            if sources and len(outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
+                complete += 1
+            elif sources:
+                eligible += 1
+            else:
+                no_source += 1
+
+        parts = [f"Ready for AI có {len(cards)} card"]
+        if complete:
+            parts.append(f"{complete} card đã đủ {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} ảnh output")
+        if eligible:
+            parts.append(f"{eligible} card còn thiếu ảnh và sẽ chạy ở lượt quét kế tiếp")
+        if no_source:
+            parts.append(f"{no_source} card chưa có ảnh nguồn hợp lệ")
+        if not eligible and complete:
+            parts.append("Auto đang chờ card mới hoặc card chưa đủ ảnh")
+        return "; ".join(parts) + "."
+
     async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
         remaining = max(1.0, float(poll_interval_s or 30))
         while remaining > 0:
@@ -2535,7 +2619,7 @@ class FlowWebService:
                         if idle_cycles == 1 or idle_cycles % 10 == 0:
                             await self.store.append_log(
                                 batch_id,
-                                f"Chưa có card mới trong Ready for AI. App sẽ quét lại sau {poll_interval_s}s.",
+                                self._continuous_auto_trello_idle_message(base_request, poll_interval_s),
                             )
                         await self._patch_prompt_batch_result(
                             batch_id,
@@ -2556,7 +2640,7 @@ class FlowWebService:
                     if idle_cycles == 1 or idle_cycles % 10 == 0:
                         await self.store.append_log(
                             batch_id,
-                            f"Chưa có card mới trong Ready for AI. App sẽ quét lại sau {poll_interval_s}s.",
+                            self._continuous_auto_trello_idle_message(base_request, poll_interval_s),
                         )
                     await self._patch_prompt_batch_result(
                         batch_id,
