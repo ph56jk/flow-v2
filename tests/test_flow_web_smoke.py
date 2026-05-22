@@ -4472,6 +4472,95 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(0, saved.result["completed"])
         self.assertEqual(0, saved.result["failed"])
 
+    async def test_continuous_auto_trello_does_not_retry_same_card_in_one_session(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    ]
+                },
+            ),
+            limit=0,
+            auto_trello=True,
+            run_until_empty=True,
+            continuous=True,
+            poll_interval_s=1,
+        )
+        cards = [
+            {
+                "id": "repeat-card",
+                "name": "Repeat product",
+                "shortLink": "repeat",
+                "url": "https://trello.com/c/repeat",
+                "idList": "ready-list",
+                "_image_attachments": [{"id": "repeat-att", "name": "image.jpg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["repeat-att"],
+            }
+        ]
+        seen_cards: list[str] = []
+        sleep_calls = 0
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_cards.append(child_request.trello_card_id)
+            await self.store.patch_job(job_id, status="completed", result={"count": child_request.count, "mode": "image"})
+
+        async def fake_sleep(batch_id, poll_interval_s):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 2:
+                await self.service.request_stop_prompt_batch(batch_id)
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=cards,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ), patch.object(
+            self.service,
+            "_sleep_continuous_auto_trello",
+            side_effect=fake_sleep,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(["repeat-card"], seen_cards)
+        self.assertEqual(["repeat-card"], saved.result["seen_card_ids"])
+        self.assertEqual(1, saved.result["completed"])
+
     async def test_continuous_auto_trello_forces_configured_ready_list_over_stale_graph(self) -> None:
         await self.store.replace_trello_config(
             TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")

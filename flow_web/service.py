@@ -2371,6 +2371,9 @@ class FlowWebService:
 
         try:
             for index, item in enumerate(items):
+                if self._prompt_batch_stop_requested(batch_id):
+                    await self.store.append_log(batch_id, "Đã nhận lệnh dừng, không gửi thêm card mới trong batch này.")
+                    break
                 child_request = self._prompt_batch_child_request(base_request, item, index, total)
                 self._validate_job_request(child_request)
                 child_job = JobRecord(
@@ -2834,6 +2837,7 @@ class FlowWebService:
         planned_total = 0
         cycles = 0
         idle_cycles = 0
+        seen_card_ids: set[str] = set()
         await self.store.patch_job(batch_id, status="running")
         await self.store.append_log(
             batch_id,
@@ -2850,6 +2854,12 @@ class FlowWebService:
                 )
                 existing = self.store.get_job(batch_id)
                 existing_result = dict(existing.result or {}) if existing is not None else {}
+                stored_seen_card_ids = [
+                    self._normalize_trello_card_id(str(item or ""))
+                    for item in existing_result.get("seen_card_ids", [])
+                    if self._normalize_trello_card_id(str(item or ""))
+                ]
+                seen_card_ids.update(stored_seen_card_ids)
                 existing_result.update(
                     {
                         "continuous": True,
@@ -2858,6 +2868,7 @@ class FlowWebService:
                         "cycles": cycles,
                         "idle_cycles": idle_cycles,
                         "last_scan_at": utc_now(),
+                        "seen_card_ids": sorted(seen_card_ids),
                     }
                 )
                 await self.store.patch_job(batch_id, result=existing_result)
@@ -2891,6 +2902,20 @@ class FlowWebService:
                         continue
                     raise
 
+                fresh_items: List[Dict[str, Any]] = []
+                skipped_seen = 0
+                for item in items:
+                    item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
+                    if item_card_id and item_card_id in seen_card_ids:
+                        skipped_seen += 1
+                        continue
+                    fresh_items.append(item)
+                if skipped_seen:
+                    await self.store.append_log(
+                        batch_id,
+                        f"Bỏ qua {skipped_seen} card đã thử trong phiên Auto này để tránh lặp lại.",
+                    )
+                items = fresh_items
                 if not items:
                     idle_cycles += 1
                     if idle_cycles == 1 or idle_cycles % 10 == 0:
@@ -2902,12 +2927,17 @@ class FlowWebService:
                         batch_id,
                         total=planned_total,
                         child_job_ids=child_job_ids,
-                        completed=completed,
-                        failed=failed,
-                        current_index=0,
-                        current_child_job_id="",
-                        extra={"cycles": cycles, "idle_cycles": idle_cycles, "last_scan_at": utc_now()},
-                    )
+                            completed=completed,
+                            failed=failed,
+                            current_index=0,
+                            current_child_job_id="",
+                            extra={
+                                "cycles": cycles,
+                                "idle_cycles": idle_cycles,
+                                "last_scan_at": utc_now(),
+                                "seen_card_ids": sorted(seen_card_ids),
+                            },
+                        )
                     await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
                     continue
 
@@ -2923,6 +2953,9 @@ class FlowWebService:
                         break
                     item_index = completed + failed + 1
                     child_request = self._prompt_batch_child_request(scan_request, item, item_index - 1, planned_total)
+                    item_card_id = self._normalize_trello_card_id(child_request.trello_card_id)
+                    if item_card_id:
+                        seen_card_ids.add(item_card_id)
                     self._validate_job_request(child_request)
                     child_job = JobRecord(
                         type="image",
@@ -2940,6 +2973,7 @@ class FlowWebService:
                         failed=failed,
                         current_index=item_index,
                         current_child_job_id=child_job.id,
+                        extra={"seen_card_ids": sorted(seen_card_ids)},
                     )
                     await self.store.set_progress_hint(
                         batch_id,
@@ -2966,6 +3000,7 @@ class FlowWebService:
                         failed=failed,
                         current_index=item_index,
                         current_child_job_id="",
+                        extra={"seen_card_ids": sorted(seen_card_ids)},
                     )
 
                 if not self._prompt_batch_stop_requested(batch_id):
@@ -2980,6 +3015,7 @@ class FlowWebService:
                 failed=failed,
                 current_index=0,
                 current_child_job_id="",
+                extra={"seen_card_ids": sorted(seen_card_ids)},
             )
             await self.store.patch_job(batch_id, status="completed", error="")
             await self.store.append_log(batch_id, f"Đã dừng Auto AI Trello liên tục: {completed} card xong, {failed} card lỗi.")
