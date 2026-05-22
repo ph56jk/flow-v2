@@ -7349,8 +7349,21 @@ exit 1
             return {"configured": False}
 
         trello_config = self.store.snapshot().trello_config
+        request_card_id = self._normalize_trello_card_id(request.trello_card_id)
+        selected_source_attachment_ids = self._normalize_trello_attachment_ids(request.trello_attachment_ids)
+        if selected_source_attachment_ids and not request_card_id:
+            await self.store.append_log(
+                job_id,
+                "Trello Archive đã dừng: job có attachment nguồn nhưng thiếu card nguồn, tránh upload nhầm sang card/list khác.",
+            )
+            return {
+                "configured": True,
+                "sent": 0,
+                "failed": len(artifacts),
+                "error": "source_card_missing",
+            }
         card_id = self._normalize_trello_card_id(
-            request.trello_card_id or trello_config.card_id or os.getenv("TRELLO_CARD_ID", "")
+            request_card_id or trello_config.card_id or os.getenv("TRELLO_CARD_ID", "")
         )
         list_id = self._normalize_trello_id(request.trello_list_id or trello_config.list_id or os.getenv("TRELLO_LIST_ID", ""))
         board_id = self._normalize_trello_board_id(
@@ -7778,17 +7791,24 @@ exit 1
             for item in attachments
             if self._trello_attachment_is_image(item)
         ]
+        source_attachments, generated_attachments = self._trello_source_and_flow_output_attachments(image_attachments)
         selected_ids = self._normalize_trello_attachment_ids(attachment_ids)
         if selected_ids:
-            by_id = {self._normalize_trello_id(str(item.get("id") or "")): item for item in image_attachments}
+            by_id = {self._normalize_trello_id(str(item.get("id") or "")): item for item in source_attachments}
             selected_attachments = [by_id[item_id] for item_id in selected_ids if item_id in by_id]
             if not selected_attachments:
-                raise RuntimeError("Ảnh Trello đã chọn không nằm trên card này hoặc không phải attachment ảnh.")
+                raise RuntimeError(
+                    "Ảnh Trello đã chọn không phải ảnh nguồn hợp lệ trên card này, hoặc đó là ảnh output cũ của Flow. "
+                    "App đã dừng để tránh lấy ảnh cũ làm ảnh nguồn."
+                )
             image_attachments = selected_attachments
         else:
-            source_attachments, _generated_attachments = self._trello_source_and_flow_output_attachments(image_attachments)
             if source_attachments:
                 image_attachments = source_attachments
+            elif generated_attachments:
+                raise RuntimeError(
+                    "Card Trello này chỉ còn ảnh output cũ của Flow, không có ảnh nguồn mới để làm reference."
+                )
         image_attachments = image_attachments[: max(1, min(4, int(limit or 4)))]
         paths: List[str] = []
         for index, attachment in enumerate(image_attachments):
@@ -9017,6 +9037,20 @@ exit 1
             return (1, 0.0, index)
         return (0, parsed.timestamp(), index)
 
+    def _sort_trello_attachments_by_date(
+        self,
+        attachments: List[Dict[str, Any]],
+        *,
+        newest_first: bool = False,
+    ) -> List[Dict[str, Any]]:
+        indexed = list(enumerate(attachments))
+        sorted_items = sorted(indexed, key=lambda pair: self._trello_attachment_order_key(pair[1], pair[0]))
+        if newest_first:
+            dated = [pair for pair in sorted_items if self._trello_attachment_order_key(pair[1], pair[0])[0] == 0]
+            undated = [pair for pair in sorted_items if self._trello_attachment_order_key(pair[1], pair[0])[0] != 0]
+            sorted_items = list(reversed(dated)) + undated
+        return [item for _index, item in sorted_items]
+
     def _trello_attachment_is_flow_output(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").strip().lower()
         stem = Path(name).stem.lower()
@@ -9081,31 +9115,30 @@ exit 1
             prefix = self._trello_generated_series_prefix(item)
             if prefix:
                 series_counts[prefix] = series_counts.get(prefix, 0) + 1
+        has_plain_source_candidate = any(
+            not self._trello_attachment_is_flow_output(item)
+            and not self._trello_generated_series_prefix(item)
+            for item in images
+        )
 
         source_attachments: List[Dict[str, Any]] = []
         flow_outputs: List[Dict[str, Any]] = []
         for item in images:
             series_prefix = self._trello_generated_series_prefix(item)
-            is_generated_series = bool(series_prefix and series_counts.get(series_prefix, 0) >= 2)
+            is_generated_series = bool(
+                series_prefix
+                and (
+                    series_counts.get(series_prefix, 0) >= 2
+                    or has_plain_source_candidate
+                )
+            )
             if self._trello_attachment_is_flow_output(item) or is_generated_series:
                 flow_outputs.append(item)
             else:
                 source_attachments.append(item)
 
-        source_attachments = [
-            item
-            for index, item in sorted(
-                enumerate(source_attachments),
-                key=lambda pair: self._trello_attachment_order_key(pair[1], pair[0]),
-            )
-        ]
-        flow_outputs = [
-            item
-            for index, item in sorted(
-                enumerate(flow_outputs),
-                key=lambda pair: self._trello_attachment_order_key(pair[1], pair[0]),
-            )
-        ]
+        source_attachments = self._sort_trello_attachments_by_date(source_attachments, newest_first=True)
+        flow_outputs = self._sort_trello_attachments_by_date(flow_outputs)
         return source_attachments, flow_outputs
 
     def _trello_download_attachment_bytes(
