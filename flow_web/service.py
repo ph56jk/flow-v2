@@ -7350,6 +7350,14 @@ exit 1
             if not selected_attachments:
                 raise RuntimeError("Ảnh Trello đã chọn không nằm trên card này hoặc không phải attachment ảnh.")
             image_attachments = selected_attachments
+        else:
+            source_attachments = [
+                item
+                for item in image_attachments
+                if not self._trello_attachment_is_flow_output(item)
+            ]
+            if source_attachments:
+                image_attachments = source_attachments
         image_attachments = image_attachments[: max(1, min(4, int(limit or 4)))]
         paths: List[str] = []
         for index, attachment in enumerate(image_attachments):
@@ -8382,10 +8390,22 @@ exit 1
             image_attachments = [
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
-            if any(self._trello_attachment_is_flow_output(item) for item in image_attachments):
+            flow_outputs = [
+                item for item in image_attachments if self._trello_attachment_is_flow_output(item)
+            ]
+            source_attachments = [
+                item for item in image_attachments if not self._trello_attachment_is_flow_output(item)
+            ]
+            if len(flow_outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
                 continue
-            if image_attachments:
-                card["_image_attachments"] = image_attachments
+            if source_attachments:
+                card["_image_attachments"] = source_attachments
+                card["_selected_attachment_ids"] = [
+                    self._normalize_trello_id(str(item.get("id") or ""))
+                    for item in source_attachments[:1]
+                    if str(item.get("id") or "").strip()
+                ]
+                card["_flow_output_count"] = len(flow_outputs)
                 image_cards.append(card)
         return image_cards
 

@@ -904,26 +904,37 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual([], cards)
         get_json.assert_not_called()
 
-    def test_trello_image_card_scan_skips_cards_already_generated_by_flow(self) -> None:
+    def test_trello_image_card_scan_skips_cards_with_complete_flow_outputs(self) -> None:
         cards_payload = [
             {"id": "done-card", "name": "Done", "idList": "ready-list"},
+            {"id": "partial-card", "name": "Partial", "idList": "ready-list"},
             {"id": "fresh-card", "name": "Fresh", "idList": "ready-list"},
         ]
         done_attachments = [
             {"id": "source", "name": "source.png", "mimeType": "image/png"},
             {"id": "flow-output", "name": "flow-abc12345-1.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-2", "name": "flow-abc12345-2.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-3", "name": "flow-abc12345-3.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-4", "name": "flow-abc12345-4.jpg", "mimeType": "image/jpeg"},
+        ]
+        partial_attachments = [
+            {"id": "partial-source", "name": "partial.png", "mimeType": "image/png"},
+            {"id": "flow-partial", "name": "flow-def67890-1.jpg", "mimeType": "image/jpeg"},
         ]
         fresh_attachments = [{"id": "fresh-source", "name": "fresh.png", "mimeType": "image/png"}]
 
         with patch.object(
             self.service,
             "_trello_get_json",
-            side_effect=[cards_payload, done_attachments, fresh_attachments],
+            side_effect=[cards_payload, done_attachments, partial_attachments, fresh_attachments],
         ):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual(["fresh-card"], [card["id"] for card in cards])
-        self.assertEqual("fresh-source", cards[0]["_image_attachments"][0]["id"])
+        self.assertEqual(["partial-card", "fresh-card"], [card["id"] for card in cards])
+        self.assertEqual("partial-source", cards[0]["_image_attachments"][0]["id"])
+        self.assertEqual(["partial-source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual(1, cards[0]["_flow_output_count"])
+        self.assertEqual("fresh-source", cards[1]["_image_attachments"][0]["id"])
 
     def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
         previews = self.service._trello_candidate_image_previews(
