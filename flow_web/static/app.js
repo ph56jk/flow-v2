@@ -2527,7 +2527,8 @@ function renderEasyPanel(stats) {
     elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello"));
   }
   if (elements.automationResetReadyButton) {
-    elements.automationResetReadyButton.disabled = stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
+    const blockingActiveJobs = stats.active.filter((job) => job.id !== continuousAutoJob?.id);
+    elements.automationResetReadyButton.disabled = blockingActiveJobs.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
   }
   if (elements.automationRunButton) {
     elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
@@ -3982,18 +3983,20 @@ function resetAutomationConfig() {
   showMessage("Đã reset phần custom về mặc định.", "success");
 }
 
-async function resetReadyForAiOutputs() {
+async function resetReadyForAiOutputs({ skipConfirm = false, quiet = false } = {}) {
   if (automationSubmitInFlight) {
-    return;
+    return null;
   }
   syncAutomationFromForm();
   const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
   const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
-  const confirmed = window.confirm(
-    "Reset Ready for AI sẽ xóa ảnh output do Flow tạo trên các card trong Ready for AI, giữ nguyên ảnh nguồn. Sau đó Auto sẽ chạy lại các card đó. Tiếp tục?"
-  );
-  if (!confirmed) {
-    return;
+  if (!skipConfirm) {
+    const confirmed = window.confirm(
+      "Reset Ready for AI sẽ xóa ảnh output do Flow tạo trên các card trong Ready for AI, giữ nguyên ảnh nguồn. Sau đó Auto sẽ chạy lại các card đó. Tiếp tục?"
+    );
+    if (!confirmed) {
+      return null;
+    }
   }
   automationSubmitInFlight = true;
   if (elements.automationResetReadyButton) {
@@ -4013,15 +4016,19 @@ async function resetReadyForAiOutputs() {
     const deleted = Number(result.attachments_deleted || 0);
     const cardsReset = Number(result.cards_reset || 0);
     const cardsSeen = Number(result.cards_seen || 0);
-    showMessage(
-      deleted
-        ? `Đã reset ${cardsReset} card trong Ready for AI, xóa ${deleted} ảnh output. Bấm Auto AI Trello để chạy lại.`
-        : `Ready for AI có ${cardsSeen} card nhưng chưa có ảnh output nào cần xóa.`,
-      "success",
-    );
+    if (!quiet) {
+      showMessage(
+        deleted
+          ? `Đã reset ${cardsReset} card trong Ready for AI, xóa ${deleted} ảnh output. Bấm Auto AI Trello để chạy lại.`
+          : `Ready for AI có ${cardsSeen} card nhưng chưa có ảnh output nào cần xóa.`,
+        "success",
+      );
+    }
     await loadState({ silent: true });
+    return result;
   } catch (error) {
     showMessage(error.message, "error");
+    return null;
   } finally {
     automationSubmitInFlight = false;
     if (elements.automationResetReadyButton) {
@@ -4032,6 +4039,52 @@ async function resetReadyForAiOutputs() {
     }
     renderAutomationDashboard();
   }
+}
+
+async function prepareReadyForAutoTrello() {
+  syncAutomationFromForm();
+  const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
+  const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
+  try {
+    const status = await api("/api/trello/ready/status", {
+      method: "POST",
+      body: JSON.stringify({
+        trello_board_id: boardId,
+        trello_list_id: listId,
+      }),
+    });
+    const eligible = Number(status.eligible || 0);
+    const complete = Number(status.complete || 0);
+    const cardsSeen = Number(status.cards_seen || 0);
+    if (eligible > 0 || !cardsSeen) {
+      return true;
+    }
+    if (complete > 0) {
+      const confirmed = window.confirm(
+        `Ready for AI hiện có ${complete} card đã đủ 4 ảnh nên Auto đang chờ. Reset ảnh output để chạy lại các card này ngay bây giờ?`
+      );
+      if (!confirmed) {
+        showMessage("Auto chưa chạy vì các card Ready for AI đã đủ ảnh. Bấm Reset Ready nếu muốn làm lại.", "error");
+        return false;
+      }
+      const resetResult = await resetReadyForAiOutputs({ skipConfirm: true, quiet: true });
+      if (!resetResult) {
+        return false;
+      }
+      showMessage(
+        `Đã reset ${resetResult.cards_reset || 0} card, xóa ${resetResult.attachments_deleted || 0} ảnh output. Auto sẽ lấy sản phẩm và chạy lại.`,
+        "success",
+      );
+      return true;
+    }
+    if (Number(status.without_source || 0) > 0) {
+      showMessage("Ready for AI có card nhưng chưa có attachment ảnh nguồn hợp lệ.", "error");
+      return false;
+    }
+  } catch (error) {
+    showMessage(`Chưa kiểm tra được Ready for AI trước khi chạy: ${error.message}. App vẫn sẽ thử Auto.`, "error");
+  }
+  return true;
 }
 
 async function saveTrelloConfig({ clearCredentials = false } = {}) {
@@ -5663,9 +5716,13 @@ elements.automationIncompleteRefreshButton.addEventListener("click", () => loadS
 elements.automationResetReadyButton?.addEventListener("click", resetReadyForAiOutputs);
 elements.automationRunButton.addEventListener("click", submitAutomationImage);
 elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
-elements.automationAutoRunButton?.addEventListener("click", () => {
+elements.automationAutoRunButton?.addEventListener("click", async () => {
   if (activeContinuousAutoTrelloJob()) {
     void stopContinuousAutoTrello();
+    return;
+  }
+  const ready = await prepareReadyForAutoTrello();
+  if (!ready) {
     return;
   }
   void submitAutomationImage({ autoTrello: true, continuousAutoTrello: true });

@@ -124,6 +124,11 @@ async def reset_ready_trello_outputs(request: Request, payload: ResetReadyTrello
     return await service(request).reset_ready_trello_outputs(payload)
 
 
+@app.post("/api/trello/ready/status")
+async def ready_trello_status(request: Request, payload: ResetReadyTrelloRequest) -> Dict[str, Any]:
+    return await service(request).ready_trello_status(payload)
+
+
 @app.get("/api/trello/cards/{card_id}/attachments/{attachment_id}/preview")
 async def trello_attachment_preview(request: Request, card_id: str, attachment_id: str) -> Response:
     payload = await service(request).trello_attachment_preview(card_id, attachment_id)

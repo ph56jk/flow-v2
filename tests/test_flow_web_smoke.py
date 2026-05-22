@@ -1104,6 +1104,43 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["flow-1", "flow-2", "flow-3", "flow-4"], deleted_ids)
         self.assertNotIn("source", deleted_ids)
 
+    def test_ready_trello_status_reports_completed_and_runnable_cards(self) -> None:
+        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+        cards_payload = [
+            {"id": "done-card", "name": "Done", "idList": "ready-list", "url": "https://trello.test/done"},
+            {"id": "new-card", "name": "New", "idList": "ready-list", "url": "https://trello.test/new"},
+            {"id": "empty-card", "name": "Empty", "idList": "ready-list", "url": "https://trello.test/empty"},
+        ]
+        done_attachments = [
+            {"id": "source", "name": "source.png", "mimeType": "image/png"},
+            {"id": "flow-1", "name": "flow-done-1.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-2", "name": "flow-done-2.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-3", "name": "flow-done-3.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-4", "name": "flow-done-4.jpg", "mimeType": "image/jpeg"},
+        ]
+        new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
+        empty_attachments: list[dict] = []
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            side_effect=[cards_payload, done_attachments, new_attachments, empty_attachments],
+        ):
+            result = asyncio.run(self.service.ready_trello_status(request))
+
+        self.assertEqual(3, result["cards_seen"])
+        self.assertEqual(1, result["complete"])
+        self.assertEqual(1, result["eligible"])
+        self.assertEqual(1, result["without_source"])
+        card_statuses = {card["id"]: card["status"] for card in result["cards"]}
+        self.assertEqual("complete", card_statuses["done-card"])
+        self.assertEqual("eligible", card_statuses["new-card"])
+        self.assertEqual("no_source", card_statuses["empty-card"])
+
     def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
         previews = self.service._trello_candidate_image_previews(
             "card-1",

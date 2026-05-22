@@ -2479,6 +2479,33 @@ class FlowWebService:
         key, token = self._trello_credentials()
         if not key or not token:
             raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
+        board_id, list_id = await self._ready_trello_board_and_list(request, key, token)
+        try:
+            result = await asyncio.to_thread(self._reset_ready_trello_outputs_sync, key, token, board_id, list_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
+        return result
+
+    async def ready_trello_status(self, request: ResetReadyTrelloRequest) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
+        board_id, list_id = await self._ready_trello_board_and_list(request, key, token)
+        try:
+            return await asyncio.to_thread(self._ready_trello_status_sync, key, token, board_id, list_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
+
+    async def _ready_trello_board_and_list(
+        self,
+        request: ResetReadyTrelloRequest,
+        key: str,
+        token: str,
+    ) -> tuple[str, str]:
         trello_config = self.store.snapshot().trello_config
         board_id = self._normalize_trello_board_id(
             request.trello_board_id
@@ -2493,17 +2520,87 @@ class FlowWebService:
             or self.DEFAULT_TRELLO_SOURCE_LIST_ID
         )
         if not board_id:
-            raise HTTPException(status_code=400, detail="Chưa có board Trello để reset.")
+            raise HTTPException(status_code=400, detail="Chưa có board Trello để kiểm tra.")
         try:
             list_id = await asyncio.to_thread(self._trello_resolve_board_list_id, key, token, board_id, raw_list_id)
             if not list_id:
                 raise RuntimeError(f"Không tìm thấy list {self._default_trello_source_list_name()} trên board Trello.")
-            result = await asyncio.to_thread(self._reset_ready_trello_outputs_sync, key, token, board_id, list_id)
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
-        return result
+        return board_id, list_id
+
+    def _ready_trello_status_sync(self, key: str, token: str, board_id: str, list_id: str) -> Dict[str, Any]:
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/cards",
+            key,
+            token,
+            fields={"fields": "id,name,idList,closed,url", "filter": "open"},
+        )
+        cards = [
+            card
+            for card in (payload if isinstance(payload, list) else [])
+            if isinstance(card, dict)
+            and not card.get("closed")
+            and self._normalize_trello_id(str(card.get("idList") or "")) == list_id
+        ]
+        complete = 0
+        eligible = 0
+        no_source = 0
+        card_summaries: List[Dict[str, Any]] = []
+        for card in cards:
+            card_id = self._normalize_trello_card_id(str(card.get("id") or ""))
+            if not card_id:
+                continue
+            attachments_payload = self._trello_get_json(
+                f"cards/{quote(card_id, safe='')}/attachments",
+                key,
+                token,
+                fields={"fields": "id,name,mimeType,date"},
+            )
+            attachments = attachments_payload if isinstance(attachments_payload, list) else []
+            image_attachments = [
+                item
+                for item in attachments
+                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            ]
+            sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            status = "no_source"
+            if sources and len(outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
+                complete += 1
+                status = "complete"
+            elif sources:
+                eligible += 1
+                status = "eligible"
+            else:
+                no_source += 1
+            card_summaries.append(
+                {
+                    "id": card_id,
+                    "name": str(card.get("name") or "").strip(),
+                    "url": str(card.get("url") or "").strip(),
+                    "status": status,
+                    "source_count": len(sources),
+                    "output_count": len(outputs),
+                    "missing_count": max(0, self.FLOW_AGENT_DEFAULT_IMAGE_COUNT - len(outputs)) if sources else 0,
+                }
+            )
+        return {
+            "ok": True,
+            "board_id": board_id,
+            "list_id": list_id,
+            "cards_seen": len(cards),
+            "complete": complete,
+            "eligible": eligible,
+            "without_source": no_source,
+            "target_output_count": self.FLOW_AGENT_DEFAULT_IMAGE_COUNT,
+            "cards": card_summaries[:50],
+            "message": (
+                f"Ready for AI có {len(cards)} card; {eligible} card có thể chạy; "
+                f"{complete} card đã đủ {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} ảnh output; {no_source} card chưa có ảnh nguồn."
+            ),
+        }
 
     def _reset_ready_trello_outputs_sync(self, key: str, token: str, board_id: str, list_id: str) -> Dict[str, Any]:
         payload = self._trello_get_json(
