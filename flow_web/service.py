@@ -3619,7 +3619,7 @@ class FlowWebService:
         lines = [
             f"Quy trình chuẩn: Trello {self._trello_source_scope_label()} card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 4 ảnh -> upload lại đúng card Trello để duyệt trực tiếp.",
             f"Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list {self._trello_source_scope_label()}; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
-            f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, workflow {'đã chọn' if flow.get('workflow_set') else 'chưa chọn'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}.",
+            f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}; Auto AI Trello dùng Tác nhân Flow nên không bắt buộc workflow mặc định ({'workflow chỉnh sửa đã chọn' if flow.get('workflow_set') else 'workflow chỉnh sửa đang để trống'}).",
             f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
             f"Telegram: {'đã cấu hình tùy chọn' if telegram.get('configured') else 'không bắt buộc cho Auto Trello'}.",
             f"AI: {'Gemini ' + str(gemini.get('model') or '') if gemini.get('configured') else 'trợ lý nội bộ'}.",
@@ -4195,12 +4195,12 @@ class FlowWebService:
             first = candidates[0]
             notice = (
                 f"Trello scan: app tìm thấy card khớp '{query}' là {first.get('name') or first.get('short_link')} "
-                f"đang ở list {first.get('list_name') or 'khác'}. "
+                f"đang ở list {first.get('list_name') or 'khác'}, chưa ở {source_scope}. "
                 "Chủ nhân có thể bấm đúng thumbnail ảnh ngay trong app; sau khi chọn, Auto Trello sẽ dùng chính attachment đó mà không cần kéo list."
             )
         if notice in answer:
             return answer
-        return f"{answer}\n\n{notice}".strip()
+        return f"{notice}\n\n{answer}".strip()
 
     def _refine_user_assistant_actions_for_trello_candidates(
         self,
@@ -4332,6 +4332,7 @@ class FlowWebService:
                 "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 4 ảnh, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
                 "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, chọn đúng card/ảnh và đưa các nút thao tác thật; prompt ảnh cuối do Tác nhân trong Google Flow viết.",
                 f"Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list {self._trello_source_scope_label()}. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
+                "Không được yêu cầu người dùng chọn workflow mặc định để chạy Auto AI Trello; workflow mặc định chỉ hữu ích cho luồng chỉnh/sửa ảnh cũ, còn Auto AI Trello chạy bằng project Flow + Tác nhân Flow + ảnh Trello.",
                 "Nếu người dùng yêu cầu app làm việc gì, hãy nói app sẽ dùng các nút hành động kèm theo câu trả lời; không bịa hành động ngoài khả năng hiện có.",
                 "Không yêu cầu người dùng dán secret vào chat. Không in API key, token, cookie hay biến môi trường.",
                 "Trả lời ngắn, thực dụng, ưu tiên các bước người dùng bấm được trong giao diện.",
@@ -4397,6 +4398,8 @@ class FlowWebService:
         text = re.sub(r"\n{3,}", "\n\n", str(answer or "").strip())
         text = re.sub(r"(?i)^\s*draft\s*:\s*\*?\s*", "", text)
         text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+        if text.count("**") % 2:
+            text = text.replace("**", "")
         text = re.sub(r"(?m)^\s*[*-]\s+", "", text)
         if len(text) <= self.USER_ASSISTANT_ANSWER_LIMIT:
             return text
@@ -4405,6 +4408,20 @@ class FlowWebService:
         if boundary > 500:
             return clipped[:boundary].rstrip(" .;") + "."
         return clipped.rstrip(" .;") + "."
+
+    def _user_assistant_generated_answer_is_usable(self, answer: str) -> bool:
+        text = re.sub(r"\s+", " ", str(answer or "").strip())
+        if not text:
+            return False
+        if text.count("**") % 2:
+            return False
+        if re.search(r"(?i)\b(State|Action)\s*:", text):
+            return False
+        if re.search(r"(?i)\b(attempt\s*\d+|mental outline|draft)\b", text):
+            return False
+        if not re.search(r"[.!?…)]$", text):
+            return False
+        return True
 
     async def answer_user_assistant(self, request: UserAssistantRequest) -> Dict[str, Any]:
         question = re.sub(r"\s+", " ", str(request.question or "").strip())
@@ -4467,14 +4484,18 @@ class FlowWebService:
         if self._gemini_api_key():
             model = self._gemini_model()
             try:
-                answer = await asyncio.to_thread(
+                generated_answer = await asyncio.to_thread(
                     self._generate_user_assistant_with_gemini,
                     question,
                     context_summary,
                     local_answer,
                 )
-                engine = "gemini"
-                engine_label = "Gemini"
+                if self._user_assistant_generated_answer_is_usable(generated_answer):
+                    answer = generated_answer
+                    engine = "gemini"
+                    engine_label = "Gemini"
+                else:
+                    fallback_reason = "Gemini trả lời quá ngắn hoặc lỗi định dạng; đã dùng trợ lý nội bộ."
             except Exception as exc:
                 fallback_reason = str(exc)[:180]
                 model = ""

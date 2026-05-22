@@ -1838,10 +1838,17 @@ function latestAutomationExecutionNode(module) {
     .slice()
     .sort((left, right) => new Date(right.updated_at || right.created_at || 0).getTime() - new Date(left.updated_at || left.created_at || 0).getTime());
   for (const job of jobs) {
+    if (!ACTIVE_STATUSES.has(job.status) && job.status !== "completed") {
+      continue;
+    }
     const execution = job.result?.automation_execution;
     const nodes = Array.isArray(execution?.nodes) ? execution.nodes : [];
     const matched = nodes.find((node) => node.id === module.id) || nodes.find((node) => node.type === module.type);
     if (matched) {
+      const nodeStatus = String(matched.status || "").toLowerCase();
+      if (nodeStatus === "running" && !ACTIVE_STATUSES.has(job.status)) {
+        continue;
+      }
       return matched;
     }
   }
