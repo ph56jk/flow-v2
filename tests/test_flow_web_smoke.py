@@ -5356,6 +5356,123 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertNotIn("fill_prompt", events)
         select_image.assert_not_awaited()
 
+    async def test_single_reference_ui_drags_source_into_agent_panel_before_send(self) -> None:
+        events: list[str] = []
+        fake_image = SimpleNamespace(media_name="generated-1")
+
+        class FakePage:
+            url = "https://labs.google/fx/tools/flow/project/pid"
+
+            async def goto(self, *_args: object, **_kwargs: object) -> None:
+                events.append("goto")
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return FakePage()
+
+        class FakeFlowUI:
+            async def open_settings_panel(self, _page: FakePage) -> None:
+                events.append("settings")
+
+            async def select_image_model(self, _page: FakePage, _model: str) -> None:
+                events.append("model")
+
+            async def set_count(self, _page: FakePage, _count: int) -> None:
+                events.append("count")
+
+        class FakeFlowAPI:
+            async def get_project_data(self) -> dict:
+                events.append("project_data")
+                return {"projectContents": {"media": []}}
+
+        class FakeInterceptor:
+            def attach(self, _page: FakePage) -> None:
+                events.append("interceptor")
+
+            def clear(self) -> None:
+                events.append("clear")
+
+            async def wait_for(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+                events.append("wait")
+                return SimpleNamespace(req={"requests": []}, resp={"media": []})
+
+        fake_client = SimpleNamespace(
+            project_id="pid",
+            _bm=FakeBrowserManager(),
+            _ui=FakeFlowUI(),
+            _api=FakeFlowAPI(),
+        )
+
+        async def select_source(*_args: object, **kwargs: object) -> tuple[bool, str]:
+            events.append("drag")
+            self.assertTrue(kwargs.get("require_agent_panel"))
+            return True, "drag source into agent panel"
+
+        with patch("flow._ui_interceptor.UIInterceptor", return_value=FakeInterceptor()), patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="wf-source"),
+        ), patch.object(
+            self.service,
+            "_enable_flow_agent_mode",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("agent") or (True, "Tác nhân")),
+        ), patch.object(
+            self.service,
+            "_open_flow_agent_panel",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("panel") or (True, "agent panel visible")),
+        ), patch.object(
+            self.service,
+            "_fill_flow_agent_panel_instruction",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("fill_panel") or (True, "panel textbox")),
+        ), patch.object(
+            self.service,
+            "_select_flow_edit_target_image",
+            AsyncMock(side_effect=select_source),
+        ) as select_image, patch.object(
+            self.service,
+            "_attach_flow_agent_source_file",
+            AsyncMock(return_value=(True, "upload fallback")),
+        ) as attach_file, patch.object(
+            self.service,
+            "_click_flow_agent_panel_send",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("send") or (True, "send arrow")),
+        ), patch.object(
+            self.service,
+            "_ensure_flow_agent_panel_submitted",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("ensure") or (True, "prompt already submitted", False)),
+        ) as ensure_panel, patch.object(
+            self.service,
+            "_approve_flow_agent_generation",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("approve") or (True, "approved")),
+        ), patch.object(
+            self.service,
+            "_flow_image_call_uses_selected_image",
+            return_value=True,
+        ), patch.object(
+            self.service,
+            "_parse_images_from_flow_payload",
+            return_value=[fake_image],
+        ):
+            result = await self.service._generate_single_reference_image_via_ui(
+                fake_client,
+                "tao 4 anh san pham tu anh goc",
+                model="NARWHAL",
+                reference_media_name="source-media",
+                reference_image_path="/tmp/source.jpg",
+                count=1,
+                flow_agent_enabled=True,
+                flow_agent_auto_approve=True,
+            )
+
+        self.assertEqual([fake_image], result)
+        select_image.assert_awaited_once()
+        attach_file.assert_not_awaited()
+        self.assertFalse(ensure_panel.await_args.kwargs["submit_if_needed"])
+        self.assertLess(events.index("panel"), events.index("fill_panel"))
+        self.assertLess(events.index("fill_panel"), events.index("drag"))
+        self.assertLess(events.index("drag"), events.index("send"))
+        self.assertLess(events.index("send"), events.index("approve"))
+
     async def test_enable_flow_agent_mode_clicks_visible_tac_nhan_button(self) -> None:
         events: list[tuple[str, float, float]] = []
 
