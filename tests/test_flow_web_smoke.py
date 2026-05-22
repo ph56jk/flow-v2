@@ -241,6 +241,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("", self.service._trello_auto_search_query(request))
         self.assertEqual({"card-1", "card-2"}, {item["trello_card_id"] for item in items})
 
+    def test_auto_trello_ready_for_ai_label_does_not_filter_ready_cards(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            title="Auto AI Trello: chờ sản phẩm mới liên tục",
+            prompt_product="phần ready for AI",
+            prompt_product_key="phần ready for AI",
+            prompt_notes="Trello search: phần ready for AI",
+            count=4,
+        )
+        cards = [
+            {
+                "id": "card-apron",
+                "shortLink": "apron",
+                "idList": "ready",
+                "name": "embroidered apron",
+                "url": "https://trello.example/c/apron",
+                "_image_attachments": [{"id": "att-apron", "name": "source.jpg", "mimeType": "image/jpeg"}],
+            },
+            {
+                "id": "card-pillow",
+                "shortLink": "pillow",
+                "idList": "ready",
+                "name": "baby pillowcase",
+                "url": "https://trello.example/c/pillow",
+                "_image_attachments": [{"id": "att-pillow", "name": "source.png", "mimeType": "image/png"}],
+            },
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual("", self.service._trello_auto_search_query(request))
+        self.assertEqual({"card-apron", "card-pillow"}, {item["trello_card_id"] for item in items})
+
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
         project_data = {
             "projectContents": {
@@ -4861,6 +4894,73 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual([fake_image], result)
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_enabled"])
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_auto_approve"])
+
+    async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
+        events: list[str] = []
+
+        class FakePage:
+            url = "https://labs.google/fx/tools/flow/project/pid/edit/wf-source"
+
+            async def goto(self, *_args: object, **_kwargs: object) -> None:
+                events.append("goto")
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return FakePage()
+
+        class FakeFlowUI:
+            async def open_settings_panel(self, _page: FakePage) -> None:
+                events.append("settings")
+
+            async def select_image_model(self, _page: FakePage, _model: str) -> None:
+                events.append("model")
+
+            async def set_count(self, _page: FakePage, _count: int) -> None:
+                events.append("count")
+
+            async def fill_prompt(self, _page: FakePage, _prompt: str) -> bool:
+                events.append("fill_prompt")
+                return True
+
+        class FakeInterceptor:
+            def attach(self, _page: FakePage) -> None:
+                events.append("interceptor")
+
+            def clear(self) -> None:
+                events.append("clear")
+
+        fake_client = SimpleNamespace(
+            project_id="pid",
+            _bm=FakeBrowserManager(),
+            _ui=FakeFlowUI(),
+        )
+
+        with patch("flow._ui_interceptor.UIInterceptor", return_value=FakeInterceptor()), patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="wf-source"),
+        ), patch.object(
+            self.service,
+            "_select_flow_edit_target_image",
+            AsyncMock(return_value=(True, "selected source")),
+        ), patch.object(
+            self.service,
+            "_enable_flow_agent_mode",
+            AsyncMock(return_value=(False, "no visible Tac nhan/Agent button")),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                await self.service._generate_single_reference_image_via_ui(
+                    fake_client,
+                    "tao 4 anh san pham tu anh goc",
+                    model="NARWHAL",
+                    reference_media_name="source-media",
+                    count=4,
+                    flow_agent_enabled=True,
+                    flow_agent_auto_approve=True,
+                )
+
+        self.assertIn("bắt buộc dùng Tác nhân Flow", str(ctx.exception))
+        self.assertNotIn("fill_prompt", events)
 
     async def test_enable_flow_agent_mode_clicks_visible_tac_nhan_button(self) -> None:
         events: list[tuple[str, float, float]] = []

@@ -8262,6 +8262,10 @@ exit 1
             "auto_trello_ai_chay_den_het_ready_for_ai",
             "auto_trello_flow_agent_chay_den_het_ready_for_ai",
             "auto_ai_trello_cho_san_pham_moi_lien_tuc",
+            "ready_for_ai",
+            "phan_ready_for_ai",
+            "trello_search_ready_for_ai",
+            "trello_search_phan_ready_for_ai",
         }
         for value in (
             request.prompt_product_key,
@@ -13663,24 +13667,33 @@ exit 1
                 else:
                     await self.store.append_log(
                         job_id,
-                        f"Fallback UI Flow: chưa thấy nút Tác nhân, chạy bằng prompt thường ({agent_detail[:120]}).",
+                        f"Fallback UI Flow: chưa thấy nút Tác nhân, dừng để tránh tạo ảnh prompt-only ({agent_detail[:120]}).",
                     )
+            if not agent_opened:
+                raise RuntimeError(
+                    "Auto AI Trello bắt buộc dùng Tác nhân Flow. App chưa thấy nút Tác nhân trên màn hình Flow, "
+                    "nên đã dừng trước khi nhập prompt thường để tránh tạo ảnh không dùng ảnh nguồn."
+                )
 
         filled = False
-        if agent_opened:
+        if flow_agent_enabled:
             filled, fill_detail = await self._fill_flow_agent_instruction(page, prompt)
             if job_id and fill_detail:
                 await self.store.append_log(job_id, f"Fallback UI Flow: nhập prompt bằng ô Tác nhân ({fill_detail[:120]}).")
-        if not filled:
+            if not filled:
+                raise RuntimeError(
+                    "Auto AI Trello đã bật Tác nhân Flow nhưng chưa nhập được lệnh vào ô Tác nhân. "
+                    "App đã dừng trước khi dùng ô prompt thường."
+                )
+        else:
             filled = await client._ui.fill_prompt(page, prompt)
-        if not filled and flow_agent_enabled:
-            filled, fill_detail = await self._fill_flow_agent_instruction(page, prompt)
-            if job_id and fill_detail:
-                await self.store.append_log(job_id, f"Fallback UI Flow: nhập prompt bằng ô Tác nhân ({fill_detail[:120]}).")
         if not filled:
             raise RuntimeError("Google Flow chua dien duoc prompt vao man hinh chinh anh.")
         if job_id:
-            await self.store.append_log(job_id, "Fallback UI Flow: đã điền prompt vào ô tạo ảnh.")
+            await self.store.append_log(
+                job_id,
+                "Fallback UI Flow: đã điền prompt vào ô Tác nhân Flow." if flow_agent_enabled else "Fallback UI Flow: đã điền prompt vào ô tạo ảnh.",
+            )
 
         try:
             known_media_before_submit = self._project_media_names(await client._api.get_project_data())
