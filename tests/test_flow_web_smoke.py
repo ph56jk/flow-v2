@@ -5287,6 +5287,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(["source-workflow"] * 4, [call.kwargs["workflow_id"] for call in single_ref.await_args_list])
         self.assertIn("Create exactly ONE standalone image now", single_ref.await_args_list[0].args[1])
         self.assertIn("Do NOT create a 4-frame grid", single_ref.await_args_list[0].args[1])
+        prompts = [call.args[1] for call in single_ref.await_args_list]
+        self.assertTrue(all("CURRENT SHOT ONLY" in item for item in prompts))
+        self.assertIn("detail/craft proof macro image", prompts[0])
+        self.assertIn("full front hero ecommerce image", prompts[1])
+        self.assertIn("lifestyle use-context image", prompts[2])
+        self.assertIn("flat lay, or gift-ready merchandising image", prompts[3])
+        self.assertIn("visibly different from the other images", prompts[0])
 
     async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
         events: list[str] = []

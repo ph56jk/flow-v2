@@ -14269,17 +14269,59 @@ exit 1
     def _flow_agent_single_image_prompt(self, prompt: str, index: int, total: int) -> str:
         total = max(1, min(4, int(total or 1)))
         index = max(1, min(total, int(index or 1)))
-        shot_names = [
-            "detail/craft proof image",
-            "full product hero image",
-            "lifestyle/use-context image",
-            "alternate angle, flat lay, or gift-ready image",
+        shot_specs = [
+            {
+                "label": "detail/craft proof macro image",
+                "brief": (
+                    "Make a tight macro/close-up detail image. Crop into the most important craft/material area: "
+                    "thread fibers, raised stitches, print texture, seams, fabric weave, edge finish, or tactile surface. "
+                    "Use shallow depth of field and optional craft props such as needle, thread, hoop, scissors, or folded fabric. "
+                    "The viewer should immediately understand the handmade/material quality."
+                ),
+                "must_not": "Do not show the same full-product hero composition; do not use a plain centered catalog view.",
+            },
+            {
+                "label": "full front hero ecommerce image",
+                "brief": (
+                    "Make a clean full-product hero image. Show the entire product shape clearly from the front, centered and sellable, "
+                    "with the design placement, color, proportions, silhouette, and main feature fully visible. "
+                    "Use a simple premium background, tidy styling, and enough negative space for an ecommerce listing."
+                ),
+                "must_not": "Do not crop into a macro detail; do not add busy lifestyle action; do not make a flat lay collage.",
+            },
+            {
+                "label": "lifestyle use-context image",
+                "brief": (
+                    "Make a lifestyle scene where the product is naturally used or displayed in a believable environment that fits its category. "
+                    "Use different background, props, and camera distance from the hero shot: home/nursery/kitchen/gift/playroom/apparel context as appropriate. "
+                    "Include realistic natural light and human/use context when suitable while keeping the source product design visible."
+                ),
+                "must_not": "Do not repeat the plain centered hero view; do not use the same tabletop/background as the hero shot.",
+            },
+            {
+                "label": "alternate angle, flat lay, or gift-ready merchandising image",
+                "brief": (
+                    "Make a clearly different merchandising image: overhead flat lay, three-quarter/side/back angle, folded/packaged view, or gift-ready presentation. "
+                    "Use a new layout with tasteful props such as ribbon, box, tissue paper, craft tools, tag, books, toys, or theme-matching decor. "
+                    "Reveal construction, scale, packaging, or alternate detail that the previous shots do not show."
+                ),
+                "must_not": "Do not repeat the macro, front hero, or lifestyle composition; do not place the product in the same pose/background again.",
+            },
         ]
-        shot_name = shot_names[index - 1] if index - 1 < len(shot_names) else f"image {index}"
+        shot = shot_specs[index - 1] if index - 1 < len(shot_specs) else {
+            "label": f"image {index}",
+            "brief": "Make one visually distinct standalone product image with a different camera angle, background, and prop set.",
+            "must_not": "Do not repeat the same composition as another image in the set.",
+        }
         base = str(prompt or "").strip()
         correction = (
-            f"IMPORTANT APP PASS: Create exactly ONE standalone image now: image {index} of {total}, the {shot_name}. "
+            f"IMPORTANT APP PASS: Create exactly ONE standalone image now: image {index} of {total}. "
             "The local app will call Flow Agent separately for each image in the set. "
+            f"CURRENT SHOT ONLY: {shot['label']}. "
+            f"SHOT BRIEF: {shot['brief']} "
+            f"NEGATIVE DIRECTION: {shot['must_not']} "
+            "This image must be visibly different from the other images in camera angle, crop distance, background, props, and product presentation. "
+            "If the first idea looks like a repeated product-on-table view, change the scene before generating. "
             "Do NOT create a 4-frame grid, contact sheet, collage, storyboard, multi-panel layout, or four images inside one canvas. "
             "Use the attached Trello source product image as the reference for this single output. "
             "Keep this output 1:1 square, commercial product photography, and consistent with the same product identity."
