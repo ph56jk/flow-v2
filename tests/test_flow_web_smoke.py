@@ -5257,7 +5257,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_auto_approve"])
         self.assertEqual("/tmp/source.jpg", single_ref.await_args.kwargs["reference_image_path"])
 
-    async def test_generate_images_via_ui_retries_flow_agent_until_target_count(self) -> None:
+    async def test_generate_images_via_ui_uses_flow_agent_x4_single_pass(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="tao bo anh san pham",
@@ -5276,24 +5276,24 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ) as find_workflow, patch.object(
             self.service,
             "_generate_single_reference_image_via_ui",
-            AsyncMock(side_effect=[[fake_images[0]], [fake_images[1]], [fake_images[2]], [fake_images[3]]]),
+            AsyncMock(return_value=fake_images),
         ) as single_ref:
             result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"])
 
         self.assertEqual(fake_images, result)
         find_workflow.assert_awaited_once_with(fake_client, "base-media")
-        self.assertEqual(4, single_ref.await_count)
-        self.assertEqual([1, 1, 1, 1], [call.kwargs["count"] for call in single_ref.await_args_list])
-        self.assertEqual(["source-workflow"] * 4, [call.kwargs["workflow_id"] for call in single_ref.await_args_list])
-        self.assertIn("Create exactly ONE standalone image now", single_ref.await_args_list[0].args[1])
-        self.assertIn("Do NOT create a 4-frame grid", single_ref.await_args_list[0].args[1])
-        prompts = [call.args[1] for call in single_ref.await_args_list]
-        self.assertTrue(all("CURRENT SHOT ONLY" in item for item in prompts))
-        self.assertIn("detail/craft proof macro image", prompts[0])
-        self.assertIn("full front hero ecommerce image", prompts[1])
-        self.assertIn("lifestyle use-context image", prompts[2])
-        self.assertIn("flat lay, or gift-ready merchandising image", prompts[3])
-        self.assertIn("visibly different from the other images", prompts[0])
+        single_ref.assert_awaited_once()
+        self.assertEqual(4, single_ref.await_args.kwargs["count"])
+        self.assertEqual("source-workflow", single_ref.await_args.kwargs["workflow_id"])
+        prompt = single_ref.await_args.args[1]
+        self.assertIn("Create exactly 4 separate standalone images now in ONE Flow Agent run", prompt)
+        self.assertIn("using the x4 image setting", prompt)
+        self.assertIn("Do NOT create a 4-frame grid", prompt)
+        self.assertIn("detail/craft proof macro image", prompt)
+        self.assertIn("full front hero ecommerce image", prompt)
+        self.assertIn("lifestyle use-context image", prompt)
+        self.assertIn("flat lay, or gift-ready merchandising image", prompt)
+        self.assertIn("visibly different from each other", prompt)
 
     async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
         events: list[str] = []

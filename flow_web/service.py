@@ -14186,75 +14186,64 @@ exit 1
                 source_workflow_id = await self._find_workflow_id_for_media(client, reference_media_names[0])
             if flow_agent_enabled and not source_workflow_id:
                 raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
+
+            prompt = request.prompt
+            if flow_agent_enabled:
+                prompt = self._flow_agent_multi_image_prompt(request.prompt, target_count)
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        f"Flow Agent tạo {target_count} ảnh trong 1 lần bằng setting x{target_count}; app không tách 4 lượt.",
+                    )
+
+            tries = 3 if flow_agent_enabled else 1
+            last_exc: Exception | None = None
             generated: List[Any] = []
-            max_attempts = target_count if flow_agent_enabled else 1
-            for attempt in range(max_attempts):
-                remaining = max(1, target_count - len(generated))
-                prompt = request.prompt
-                attempt_count = target_count
-                if flow_agent_enabled:
-                    attempt_count = 1
-                    prompt = self._flow_agent_single_image_prompt(request.prompt, attempt + 1, target_count)
+            for attempt in range(tries):
+                try:
+                    generated = await self._generate_single_reference_image_via_ui(
+                        client,
+                        prompt,
+                        model=request.model,
+                        workflow_id=source_workflow_id,
+                        reference_media_name=reference_media_names[0],
+                        reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                        count=target_count,
+                        timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+                        flow_agent_enabled=flow_agent_enabled,
+                        flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
+                        job_id=job_id,
+                    )
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    detail = str(exc or "")
+                    normalized_detail = detail.lower()
+                    retryable = any(
+                        marker in normalized_detail
+                        for marker in (
+                            "invalid argument",
+                            "recaptcha",
+                            "403",
+                            "timeout",
+                            "thoi gian cho",
+                            "chua tra ve anh",
+                        )
+                    )
+                    if not flow_agent_enabled or not retryable or attempt >= tries - 1:
+                        raise
                     if job_id:
                         await self.store.append_log(
                             job_id,
-                            f"Flow Agent tạo ảnh riêng {attempt + 1}/{target_count}; app không dùng x4/frame cho Tác nhân.",
+                            f"Flow Agent báo bận/reCAPTCHA khi tạo x{target_count}; app nghỉ rồi thử lại 1 lần đủ bộ.",
                         )
-                shot_tries = 3 if flow_agent_enabled else 1
-                last_exc: Exception | None = None
-                images: List[Any] = []
-                for shot_try in range(shot_tries):
-                    try:
-                        images = await self._generate_single_reference_image_via_ui(
-                            client,
-                            prompt,
-                            model=request.model,
-                            workflow_id=source_workflow_id,
-                            reference_media_name=reference_media_names[0],
-                            reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
-                            count=max(1, min(remaining, attempt_count)),
-                            timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
-                            flow_agent_enabled=flow_agent_enabled,
-                            flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
-                            job_id=job_id,
-                        )
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        detail = str(exc or "")
-                        normalized_detail = detail.lower()
-                        retryable = any(
-                            marker in normalized_detail
-                            for marker in (
-                                "invalid argument",
-                                "recaptcha",
-                                "403",
-                                "timeout",
-                                "thoi gian cho",
-                                "chua tra ve anh",
-                            )
-                        )
-                        if not flow_agent_enabled or not retryable or shot_try >= shot_tries - 1:
-                            raise
-                        if job_id:
-                            await self.store.append_log(
-                                job_id,
-                                f"Flow Agent báo bận/reCAPTCHA ở ảnh {attempt + 1}/{target_count}; app nghỉ rồi thử lại cùng ảnh nguồn.",
-                            )
-                        await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
-                if not images and last_exc is not None:
-                    raise last_exc
-                generated.extend(images)
-                if len(generated) >= target_count:
-                    break
-                if not flow_agent_enabled:
-                    break
-                if job_id:
-                    await self.store.append_log(job_id, "Flow Agent nghỉ 25 giây trước ảnh tiếp theo để tránh reCAPTCHA/rate limit.")
-                    await asyncio.sleep(25.0)
+                    await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
+
+            if not generated and last_exc is not None:
+                raise last_exc
             if flow_agent_enabled and len(generated) < target_count:
                 raise RuntimeError(
-                    f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh sau {max_attempts} lượt. "
+                    f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh trong lượt x{target_count}. "
                     "App đã dừng trước khi upload lên Trello để tránh bộ ảnh thiếu."
                 )
             return generated[:target_count]
@@ -14266,10 +14255,8 @@ exit 1
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
         )
 
-    def _flow_agent_single_image_prompt(self, prompt: str, index: int, total: int) -> str:
-        total = max(1, min(4, int(total or 1)))
-        index = max(1, min(total, int(index or 1)))
-        shot_specs = [
+    def _flow_agent_shot_specs(self) -> List[Dict[str, str]]:
+        return [
             {
                 "label": "detail/craft proof macro image",
                 "brief": (
@@ -14308,23 +14295,25 @@ exit 1
                 "must_not": "Do not repeat the macro, front hero, or lifestyle composition; do not place the product in the same pose/background again.",
             },
         ]
-        shot = shot_specs[index - 1] if index - 1 < len(shot_specs) else {
-            "label": f"image {index}",
-            "brief": "Make one visually distinct standalone product image with a different camera angle, background, and prop set.",
-            "must_not": "Do not repeat the same composition as another image in the set.",
-        }
+
+    def _flow_agent_multi_image_prompt(self, prompt: str, total: int) -> str:
+        total = max(1, min(4, int(total or 1)))
+        shot_specs = self._flow_agent_shot_specs()[:total]
+        shot_lines = " ".join(
+            f"{index}. {shot['label']}: {shot['brief']} Negative direction: {shot['must_not']}"
+            for index, shot in enumerate(shot_specs, start=1)
+        )
         base = str(prompt or "").strip()
         correction = (
-            f"IMPORTANT APP PASS: Create exactly ONE standalone image now: image {index} of {total}. "
-            "The local app will call Flow Agent separately for each image in the set. "
-            f"CURRENT SHOT ONLY: {shot['label']}. "
-            f"SHOT BRIEF: {shot['brief']} "
-            f"NEGATIVE DIRECTION: {shot['must_not']} "
-            "This image must be visibly different from the other images in camera angle, crop distance, background, props, and product presentation. "
-            "If the first idea looks like a repeated product-on-table view, change the scene before generating. "
+            f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
+            "Each output must be its own separate 1:1 image file, not panels inside one canvas. "
+            "The local app will not call Flow Agent four separate times, so this one run must produce the full set. "
+            f"CURRENT SHOT PLAN: {shot_lines} "
+            "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
+            "If two ideas look like the same product-on-table view, change one before generating. "
             "Do NOT create a 4-frame grid, contact sheet, collage, storyboard, multi-panel layout, or four images inside one canvas. "
-            "Use the attached Trello source product image as the reference for this single output. "
-            "Keep this output 1:1 square, commercial product photography, and consistent with the same product identity."
+            "Use the attached Trello source product image as the reference for every output. "
+            "Keep every output 1:1 square, commercial product photography, and consistent with the same product identity."
         )
         return f"{base}\n\n{correction}" if base else correction
 
