@@ -210,9 +210,19 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             }
         )
         prompt_only_call = SimpleNamespace(req={"requests": [{"clientContext": {"workflowId": "fresh-workflow"}}]})
+        attached_file_call = SimpleNamespace(req={"requests": [{"imageInputs": [{"name": "agent-uploaded-media"}]}]})
 
         self.assertTrue(self.service._flow_image_call_uses_selected_image(good_call, "media-source", "workflow-source"))
         self.assertFalse(self.service._flow_image_call_uses_selected_image(prompt_only_call, "media-source", "workflow-source"))
+        self.assertTrue(
+            self.service._flow_image_call_uses_selected_image(
+                attached_file_call,
+                "media-source",
+                "workflow-source",
+                allow_any_image_input=True,
+            )
+        )
+        self.assertFalse(self.service._flow_image_call_uses_selected_image(attached_file_call, "media-source", "workflow-source"))
 
     def test_auto_trello_generic_title_does_not_filter_ready_cards(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -4910,6 +4920,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             count=1,
             flow_agent_enabled=False,
             flow_agent_auto_approve=False,
+            reference_image_paths=["/tmp/source.jpg"],
         )
         fake_image = SimpleNamespace(media_name="img-1")
         fake_client = SimpleNamespace()
@@ -4924,6 +4935,32 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual([fake_image], result)
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_enabled"])
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_auto_approve"])
+        self.assertEqual("/tmp/source.jpg", single_ref.await_args.kwargs["reference_image_path"])
+
+    async def test_generate_images_via_ui_retries_flow_agent_until_target_count(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="tao bo anh san pham",
+            count=4,
+            flow_agent_enabled=True,
+            flow_agent_auto_approve=True,
+            reference_image_paths=["/tmp/source.jpg"],
+        )
+        fake_images = [SimpleNamespace(media_name=f"img-{index}") for index in range(4)]
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(side_effect=[[fake_images[0]], [fake_images[1]], [fake_images[2]], [fake_images[3]]]),
+        ) as single_ref:
+            result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"])
+
+        self.assertEqual(fake_images, result)
+        self.assertEqual(4, single_ref.await_count)
+        self.assertEqual([1, 1, 1, 1], [call.kwargs["count"] for call in single_ref.await_args_list])
+        self.assertIn("Create exactly ONE standalone image now", single_ref.await_args_list[0].args[1])
+        self.assertIn("Do NOT create a 4-frame grid", single_ref.await_args_list[0].args[1])
 
     async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
         events: list[str] = []

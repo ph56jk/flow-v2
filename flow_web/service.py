@@ -13404,9 +13404,11 @@ exit 1
         target_count: int,
         timeout_s: float,
         fallback_workflow_id: str = "",
+        settle_s: float = 4.0,
     ) -> List[Any]:
         target = max(1, min(4, int(target_count or 1)))
         deadline = time.monotonic() + max(5.0, float(timeout_s or 30))
+        settle_window = max(1.0, float(settle_s or 4.0))
         best: List[Any] = []
         first_seen_at = 0.0
 
@@ -13437,7 +13439,7 @@ exit 1
                 first_seen_at = first_seen_at or time.monotonic()
             if len(best) >= target:
                 return best[:target]
-            if best and first_seen_at and time.monotonic() - first_seen_at >= 4.0:
+            if best and first_seen_at and time.monotonic() - first_seen_at >= settle_window:
                 return best[:target]
             await asyncio.sleep(1.0)
 
@@ -13585,18 +13587,67 @@ exit 1
                 raise RuntimeError(
                     "Flow API dang chan nhanh ghep nhieu anh, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
                 )
-            return await self._generate_single_reference_image_via_ui(
-                client,
-                request.prompt,
-                model=request.model,
-                workflow_id=request.workflow_id or "",
-                reference_media_name=reference_media_names[0],
-                count=max(1, min(4, int(request.count or 1))),
-                timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
-                flow_agent_enabled=self._flow_agent_enabled_for_request(request),
-                flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
-                job_id=job_id,
-            )
+            target_count = max(1, min(4, int(request.count or 1)))
+            flow_agent_enabled = self._flow_agent_enabled_for_request(request)
+            generated: List[Any] = []
+            max_attempts = target_count if flow_agent_enabled else 1
+            for attempt in range(max_attempts):
+                remaining = max(1, target_count - len(generated))
+                prompt = request.prompt
+                attempt_count = target_count
+                if flow_agent_enabled:
+                    attempt_count = 1
+                    prompt = self._flow_agent_single_image_prompt(request.prompt, attempt + 1, target_count)
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            f"Flow Agent tạo ảnh riêng {attempt + 1}/{target_count}; app không dùng x4/frame cho Tác nhân.",
+                        )
+                shot_tries = 2 if flow_agent_enabled else 1
+                last_exc: Exception | None = None
+                images: List[Any] = []
+                for shot_try in range(shot_tries):
+                    try:
+                        images = await self._generate_single_reference_image_via_ui(
+                            client,
+                            prompt,
+                            model=request.model,
+                            workflow_id=request.workflow_id or "",
+                            reference_media_name=reference_media_names[0],
+                            reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                            count=max(1, min(remaining, attempt_count)),
+                            timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+                            flow_agent_enabled=flow_agent_enabled,
+                            flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
+                            job_id=job_id,
+                        )
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        detail = str(exc or "")
+                        if not flow_agent_enabled or "invalid argument" not in detail.lower() or shot_try >= shot_tries - 1:
+                            raise
+                        if job_id:
+                            await self.store.append_log(
+                                job_id,
+                                f"Flow Agent báo busy/invalid argument ở ảnh {attempt + 1}/{target_count}; app chờ rồi thử lại cùng ảnh nguồn.",
+                            )
+                        await asyncio.sleep(20.0)
+                if not images and last_exc is not None:
+                    raise last_exc
+                generated.extend(images)
+                if len(generated) >= target_count:
+                    break
+                if not flow_agent_enabled:
+                    break
+                if job_id:
+                    await asyncio.sleep(8.0)
+            if flow_agent_enabled and len(generated) < target_count:
+                raise RuntimeError(
+                    f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh sau {max_attempts} lượt. "
+                    "App đã dừng trước khi upload lên Trello để tránh bộ ảnh thiếu."
+                )
+            return generated[:target_count]
         return await client.generate_image(
             request.prompt,
             model=self._image_ui_model_label(request.model),
@@ -13605,6 +13656,26 @@ exit 1
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
         )
 
+    def _flow_agent_single_image_prompt(self, prompt: str, index: int, total: int) -> str:
+        total = max(1, min(4, int(total or 1)))
+        index = max(1, min(total, int(index or 1)))
+        shot_names = [
+            "detail/craft proof image",
+            "full product hero image",
+            "lifestyle/use-context image",
+            "alternate angle, flat lay, or gift-ready image",
+        ]
+        shot_name = shot_names[index - 1] if index - 1 < len(shot_names) else f"image {index}"
+        base = str(prompt or "").strip()
+        correction = (
+            f"IMPORTANT APP PASS: Create exactly ONE standalone image now: image {index} of {total}, the {shot_name}. "
+            "The local app will call Flow Agent separately for each image in the set. "
+            "Do NOT create a 4-frame grid, contact sheet, collage, storyboard, multi-panel layout, or four images inside one canvas. "
+            "Use the attached Trello source product image as the reference for this single output. "
+            "Keep this output 1:1 square, commercial product photography, and consistent with the same product identity."
+        )
+        return f"{base}\n\n{correction}" if base else correction
+
     async def _generate_single_reference_image_via_ui(
         self,
         client: Any,
@@ -13612,6 +13683,7 @@ exit 1
         *,
         model: str,
         reference_media_name: str,
+        reference_image_path: str = "",
         workflow_id: str = "",
         count: int = 1,
         timeout_s: int = 120,
@@ -13654,13 +13726,18 @@ exit 1
         interceptor.attach(page)
         interceptor.clear()
 
-        if not flow_agent_enabled:
-            try:
-                await client._ui.open_settings_panel(page)
-                await client._ui.select_image_model(page, self._image_ui_model_label(model))
-                await client._ui.set_count(page, max(1, min(4, int(count or 1))))
-            except Exception:
-                pass
+        try:
+            await client._ui.open_settings_panel(page)
+            await client._ui.select_image_model(page, self._image_ui_model_label(model))
+            await client._ui.set_count(page, max(1, min(4, int(count or 1))))
+            if job_id:
+                await self.store.append_log(job_id, f"Fallback UI Flow: đã đặt số lượng ảnh x{max(1, min(4, int(count or 1)))}.")
+        except Exception as settings_exc:
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    f"Fallback UI Flow: chưa chỉnh được model/số lượng trên UI ({humanize_flow_error(str(settings_exc))[:120]}).",
+                )
 
         agent_opened = False
         if flow_agent_enabled:
@@ -13699,19 +13776,38 @@ exit 1
                 "Fallback UI Flow: đã điền prompt vào ô Tác nhân Flow." if flow_agent_enabled else "Fallback UI Flow: đã điền prompt vào ô tạo ảnh.",
             )
 
-        selected, selected_detail = await self._select_flow_edit_target_image(
-            page,
-            reference_media_name,
-            workflow_id=resolved_workflow_id,
-            allow_visible_fallback=not flow_agent_enabled,
-        )
-        if not selected:
-            raise RuntimeError(
-                "Google Flow chua gan duoc anh goc vao lenh tao anh, nen em dung lai de tranh tao anh moi tu prompt. "
-                f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
+        attached_local_source = False
+        if flow_agent_enabled and str(reference_image_path or "").strip():
+            attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, reference_image_path)
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Fallback UI Flow: đã upload ảnh Trello vào ô Tác nhân ({attach_detail[:120]})."
+                        if attached_local_source
+                        else f"Fallback UI Flow: chưa upload được ảnh Trello vào ô Tác nhân ({attach_detail[:120]})."
+                    ),
+                )
+            if not attached_local_source:
+                raise RuntimeError(
+                    "Auto AI Trello chưa upload được file ảnh Trello vào Tác nhân Flow. "
+                    f"App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: {attach_detail}"
+                )
+
+        if not attached_local_source:
+            selected, selected_detail = await self._select_flow_edit_target_image(
+                page,
+                reference_media_name,
+                workflow_id=resolved_workflow_id,
+                allow_visible_fallback=not flow_agent_enabled,
             )
-        if job_id:
-            await self.store.append_log(job_id, f"Fallback UI Flow: đã gắn ảnh gốc vào lệnh ({selected_detail[:120]}).")
+            if not selected:
+                raise RuntimeError(
+                    "Google Flow chua gan duoc anh goc vao lenh tao anh, nen em dung lai de tranh tao anh moi tu prompt. "
+                    f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
+                )
+            if job_id:
+                await self.store.append_log(job_id, f"Fallback UI Flow: đã gắn ảnh gốc vào lệnh ({selected_detail[:120]}).")
 
         try:
             known_media_before_submit = self._project_media_names(await client._api.get_project_data())
@@ -13729,6 +13825,23 @@ exit 1
             )
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: đã bấm nút tạo ảnh ({click_detail[:120]}), chờ Flow trả ảnh tối đa {int(ui_timeout_s)} giây.")
+
+        if flow_agent_enabled:
+            panel_ok, panel_detail, needs_prompt = await self._ensure_flow_agent_panel_submitted(page, prompt)
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Fallback UI Flow: đã mở/dùng panel Tác nhân ({panel_detail[:160]})."
+                        if panel_ok
+                        else f"Fallback UI Flow: chưa xác nhận được panel Tác nhân ({panel_detail[:160]})."
+                    ),
+                )
+            if needs_prompt:
+                raise RuntimeError(
+                    "Tác nhân Flow đã mở panel nhưng app chưa gửi được lệnh trong panel Agent. "
+                    "App đã dừng trước khi chờ ảnh để tránh chạy sai."
+                )
 
         if flow_agent_enabled and flow_agent_auto_approve:
             approved, approve_detail = await self._approve_flow_agent_generation(
@@ -13793,7 +13906,12 @@ exit 1
                 ) from exc
             raise
 
-        if not self._flow_image_call_uses_selected_image(result, reference_media_name, resolved_workflow_id):
+        if not self._flow_image_call_uses_selected_image(
+            result,
+            reference_media_name,
+            resolved_workflow_id,
+            allow_any_image_input=attached_local_source,
+        ):
             raise RuntimeError(
                 "Flow vua gui request tao anh nhung request khong co anh goc dang chon. "
                 "Em da dung lai de tranh luu anh moi khong dung card Trello."
@@ -13813,6 +13931,48 @@ exit 1
                 timeout_s=ui_timeout_s,
                 fallback_workflow_id=resolved_workflow_id,
             )
+        elif flow_agent_enabled and len(images) < max(1, min(4, int(count or 1))):
+            target_count = max(1, min(4, int(count or 1)))
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    f"Fallback UI Flow: response đầu có {len(images)}/{target_count} ảnh; app chờ project render thêm trước khi chạy lượt mới.",
+                )
+            try:
+                project_images = await self._wait_for_new_project_images(
+                    client,
+                    known_media_before_submit,
+                    prompt=prompt,
+                    target_count=target_count,
+                    timeout_s=min(ui_timeout_s, 150.0),
+                    fallback_workflow_id=resolved_workflow_id,
+                    settle_s=min(90.0, max(25.0, ui_timeout_s / 5)),
+                )
+                merged: List[Any] = []
+                seen_keys: set[str] = set()
+                for image in [*images, *project_images]:
+                    key = (
+                        str(getattr(image, "media_name", "") or "").strip()
+                        or str(getattr(image, "fife_url", "") or "").strip()
+                        or str(getattr(image, "workflow_id", "") or "").strip()
+                    )
+                    if key and key in seen_keys:
+                        continue
+                    if key:
+                        seen_keys.add(key)
+                    merged.append(image)
+                images = merged
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        f"Fallback UI Flow: sau khi chờ project có {len(images)}/{target_count} ảnh.",
+                    )
+            except Exception as project_exc:
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        f"Fallback UI Flow: chưa thấy thêm ảnh sau khi chờ project ({str(project_exc)[:220]}).",
+                    )
 
         if not images:
             raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
@@ -13949,6 +14109,215 @@ exit 1
             await page.mouse.click(float((result or {}).get("x")), float((result or {}).get("y")))
             await asyncio.sleep(0.8)
             return True, detail
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+    async def _ensure_flow_agent_panel_submitted(self, page: Any, prompt: str, timeout_s: float = 8.0) -> tuple[bool, str, bool]:
+        prompt = str(prompt or "").strip()
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(timeout_s or 8.0))
+        last_detail = "agent panel not visible"
+        while asyncio.get_running_loop().time() < deadline:
+            state = await self._flow_agent_panel_state(page, prompt)
+            if state.get("visible"):
+                detail = str(state.get("detail") or "agent panel visible")
+                if state.get("has_prompt"):
+                    return True, f"{detail}; prompt already submitted", False
+                if not state.get("has_textbox"):
+                    return True, f"{detail}; no editable textbox", False
+                filled, fill_detail = await self._fill_flow_agent_panel_instruction(page, prompt)
+                if not filled:
+                    return False, f"{detail}; {fill_detail}", True
+                sent, send_detail = await self._click_flow_agent_panel_send(page)
+                if not sent:
+                    return False, f"{detail}; prompt filled but send failed: {send_detail}", True
+                await asyncio.sleep(1.5)
+                return True, f"{detail}; sent prompt in panel via {send_detail}", False
+            last_detail = str(state.get("detail") or last_detail)
+            await asyncio.sleep(0.5)
+        return False, last_detail, False
+
+    async def _flow_agent_panel_state(self, page: Any, prompt: str) -> Dict[str, Any]:
+        prompt = str(prompt or "").strip()
+        prompt_probe = prompt[:80]
+        try:
+            result = await page.evaluate(
+                """
+                ({ promptProbe }) => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 80 || rect.height < 40) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('placeholder') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const text = labelFor(el);
+                      const looksAgent = /Phiên\\s+không\\s+có\\s+tiêu\\s+đề|Phien\\s+khong\\s+co\\s+tieu\\s+de|Chào|Chao|Bạn\\s+muốn\\s+làm\\s+gì|Ban\\s+muon\\s+lam\\s+gi|Cùng\\s+tôi\\s+lên\\s+ý\\s+tưởng|Cung\\s+toi\\s+len\\s+y\\s+tuong/i.test(text);
+                      const sidePanel = rect.width >= 280 && rect.height >= window.innerHeight * 0.45 && rect.left >= window.innerWidth * 0.35;
+                      const score = (looksAgent ? 1000 : 0) + (sidePanel ? 300 : 0) + rect.height / 10;
+                      return { el, rect, text, score, looksAgent, sidePanel };
+                    })
+                    .filter((item) => item.looksAgent || item.sidePanel)
+                    .sort((a, b) => b.score - a.score);
+                  const panel = panels[0];
+                  if (!panel) return { visible: false, detail: 'agent panel not visible' };
+                  const textboxes = [...panel.el.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                    .filter((el) => {
+                      if (!visible(el)) return false;
+                      const label = labelFor(el);
+                      const rect = el.getBoundingClientRect();
+                      return rect.width >= 160 && rect.height >= 18 && /Bạn\\s*muốn\\s*tạo\\s*gì|Ban\\s*muon\\s*tao\\s*gi|What\\s+do\\s+you|prompt|create/i.test(label + ' ' + (el.textContent || ''));
+                    });
+                  const text = panel.text || '';
+                  const probe = String(promptProbe || '').trim();
+                  const hasPrompt = probe.length >= 16 && text.includes(probe);
+                  return {
+                    visible: true,
+                    has_textbox: textboxes.length > 0,
+                    has_prompt: hasPrompt,
+                    detail: (text.match(/Phiên\\s+không\\s+có\\s+tiêu\\s+đề|Phien\\s+khong\\s+co\\s+tieu\\s+de|Chào[^\\n]{0,40}|Chao[^\\n]{0,40}/i) || ['agent panel visible'])[0],
+                  };
+                }
+                """,
+                {"promptProbe": prompt_probe},
+            )
+        except Exception as exc:
+            return {"visible": False, "detail": humanize_flow_error(str(exc))}
+        return result if isinstance(result, dict) else {"visible": False, "detail": "agent panel state unavailable"}
+
+    async def _fill_flow_agent_panel_instruction(self, page: Any, prompt: str) -> tuple[bool, str]:
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            return False, "empty prompt"
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 160 || rect.height < 18) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('placeholder') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const candidates = [...document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const label = labelFor(el);
+                      const inRightPanel = rect.left >= window.innerWidth * 0.35;
+                      const agentish = /Bạn\\s*muốn\\s*tạo\\s*gì|Ban\\s*muon\\s*tao\\s*gi|What\\s+do\\s+you|prompt|create/i.test(label);
+                      const score = (inRightPanel ? 1000 : 0) + (agentish ? 600 : 0) + rect.bottom / 10;
+                      return { el, rect, label, score };
+                    })
+                    .sort((a, b) => b.score - a.score);
+                  const target = candidates[0];
+                  if (!target) return { ok: false, detail: 'no agent panel textbox' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  const rect = target.el.getBoundingClientRect();
+                  return {
+                    ok: true,
+                    x: rect.left + Math.min(rect.width - 16, Math.max(16, rect.width * 0.18)),
+                    y: rect.top + rect.height / 2,
+                    detail: target.label || target.el.tagName,
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+        if not isinstance(result, dict) or not result.get("ok"):
+            return False, str((result or {}).get("detail") or "no agent panel textbox") if isinstance(result, dict) else "no agent panel textbox"
+        try:
+            await page.mouse.click(float(result.get("x")), float(result.get("y")))
+            await asyncio.sleep(0.1)
+            await page.keyboard.press("Meta+a")
+            await page.keyboard.press("Control+a")
+            await page.keyboard.press("Backspace")
+            try:
+                await page.keyboard.insert_text(prompt)
+            except Exception:
+                await page.keyboard.type(prompt, delay=10)
+            await asyncio.sleep(0.2)
+            return True, str(result.get("detail") or "agent panel textbox")
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+    async def _click_flow_agent_panel_send(self, page: Any) -> tuple[bool, str]:
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 24 || rect.height < 24) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0' && !el.disabled;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const buttons = [...document.querySelectorAll('button, [role="button"]')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const label = labelFor(el);
+                      const inRightPanel = rect.left >= window.innerWidth * 0.35;
+                      const nearBottom = rect.top >= window.innerHeight * 0.65;
+                      const sendish = /arrow_forward|arrow_upward|send|gửi|gui|tạo|tao|create/i.test(label);
+                      const score = (inRightPanel ? 1000 : 0) + (nearBottom ? 300 : 0) + (sendish ? 800 : 0) + rect.right / 100;
+                      return { el, rect, label, score };
+                    })
+                    .filter((item) => item.score >= 900)
+                    .sort((a, b) => b.score - a.score);
+                  const target = buttons[0];
+                  if (!target) return { ok: false, detail: 'no agent panel send button' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  return {
+                    ok: true,
+                    x: target.rect.left + target.rect.width / 2,
+                    y: target.rect.top + target.rect.height / 2,
+                    detail: target.label || target.el.outerHTML?.slice(0, 120) || 'send',
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+        if not isinstance(result, dict) or not result.get("ok"):
+            return False, str((result or {}).get("detail") or "no agent panel send button") if isinstance(result, dict) else "no agent panel send button"
+        try:
+            await page.mouse.click(float(result.get("x")), float(result.get("y")))
+            await asyncio.sleep(0.8)
+            return True, str(result.get("detail") or "send")
         except Exception as exc:
             return False, humanize_flow_error(str(exc))
 
@@ -14201,6 +14570,105 @@ exit 1
         except Exception as exc:
             return False, humanize_flow_error(str(exc))
 
+    async def _attach_flow_agent_source_file(self, page: Any, image_path: str) -> tuple[bool, str]:
+        source = Path(str(image_path or "")).expanduser()
+        if not source.is_file():
+            return False, f"source file missing: {source}"
+
+        async def _set_any_file_input() -> tuple[bool, str]:
+            for selector in ('input[type="file"][accept*="image"]', 'input[type="file"]'):
+                try:
+                    locator = page.locator(selector)
+                    count = await locator.count()
+                except Exception:
+                    count = 0
+                for index in range(count):
+                    try:
+                        await locator.nth(index).set_input_files(str(source))
+                        await asyncio.sleep(2.0)
+                        return True, f"{selector} #{index + 1}"
+                    except Exception:
+                        continue
+            return False, "no usable file input"
+
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 18 || rect.height < 18) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const textboxes = [...document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                    .filter(visible)
+                    .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                    .sort((a, b) => b.rect.bottom - a.rect.bottom);
+                  const box = textboxes.find((item) => /Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|thay đổi|thay doi|prompt|create/i.test(item.label))
+                    || textboxes[0];
+                  const boxRect = box?.rect || { left: 0, top: window.innerHeight * 0.55, right: window.innerWidth, bottom: window.innerHeight };
+                  const controls = [...document.querySelectorAll('button, [role="button"], label, [aria-label], [data-testid]')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const label = labelFor(el);
+                      const nearBox = rect.bottom >= boxRect.top - 96 && rect.top <= boxRect.bottom + 96;
+                      const addish = /\\+|add|upload|image|media|ảnh|anh|hình|hinh|thêm|them|add_2|attach|file/i.test(label);
+                      const leftish = rect.right <= boxRect.left + Math.max(180, boxRect.width * 0.32);
+                      const score = (nearBox ? 1000 : 0) + (addish ? 500 : 0) + (leftish ? 120 : 0) - Math.abs((rect.top + rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2);
+                      return { el, rect, label, score };
+                    })
+                    .filter((item) => item.score > 400)
+                    .sort((a, b) => b.score - a.score);
+                  const target = controls[0];
+                  if (!target) return { ok: false, detail: 'no agent add/upload control' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  const rect = target.el.getBoundingClientRect();
+                  return {
+                    ok: true,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    detail: target.label || target.el.outerHTML?.slice(0, 120) || target.el.tagName,
+                  };
+                }
+                """
+            )
+        except Exception:
+            result = {}
+
+        if isinstance(result, dict) and result.get("ok"):
+            detail = str(result.get("detail") or "agent add/upload control")
+            try:
+                async with page.expect_file_chooser(timeout=3500) as chooser_info:
+                    await page.mouse.click(float(result.get("x")), float(result.get("y")))
+                chooser = await chooser_info.value
+                await chooser.set_files(str(source))
+                await asyncio.sleep(2.0)
+                return True, f"file chooser via {detail}"
+            except Exception as exc:
+                input_ok, input_detail = await _set_any_file_input()
+                if input_ok:
+                    return True, f"{input_detail} after {detail}"
+                return False, f"{detail}: {humanize_flow_error(str(exc))}"
+
+        input_ok, input_detail = await _set_any_file_input()
+        if input_ok:
+            return True, input_detail
+        detail = str((result or {}).get("detail") or input_detail) if isinstance(result, dict) else input_detail
+        return False, detail
+
     async def _select_flow_edit_target_image(
         self,
         page: Any,
@@ -14353,7 +14821,14 @@ exit 1
                 return False, humanize_flow_error(str(exc))
         return ok, detail
 
-    def _flow_image_call_uses_selected_image(self, call: Any, reference_media_name: str, workflow_id: str) -> bool:
+    def _flow_image_call_uses_selected_image(
+        self,
+        call: Any,
+        reference_media_name: str,
+        workflow_id: str,
+        *,
+        allow_any_image_input: bool = False,
+    ) -> bool:
         payload = getattr(call, "req", None)
         if not isinstance(payload, dict):
             return False
@@ -14372,6 +14847,8 @@ exit 1
             if expected_workflow and str(client_context.get("workflowId") or "").strip() == expected_workflow:
                 return True
             image_inputs = item.get("imageInputs") if isinstance(item.get("imageInputs"), list) else []
+            if allow_any_image_input and image_inputs:
+                return True
             for image_input in image_inputs:
                 if not isinstance(image_input, dict):
                     continue
