@@ -13523,6 +13523,13 @@ exit 1
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
+        if reference_media_names and self._request_requires_flow_agent_ui(request):
+            await self.store.append_log(
+                job_id,
+                "Auto AI Trello dùng Tác nhân Flow: app sẽ chạy qua giao diện Flow Agent, không gửi API prompt thường.",
+            )
+            return await self._generate_images_via_ui(client, request, reference_media_names, job_id=job_id)
+
         try:
             return await self._generate_images_once(client, request, reference_media_names)
         except Exception as exc:
@@ -13622,41 +13629,38 @@ exit 1
         page = await client._bm.page()
         project_url = self._project_url(client.project_id)
         edit_url = f"{project_url}/edit/{quote(resolved_workflow_id, safe='')}" if resolved_workflow_id else project_url
+        target_url = project_url if flow_agent_enabled else edit_url
         if job_id:
-            await self.store.append_log(job_id, f"Fallback UI Flow: mở project và chọn ảnh nguồn {resolved_workflow_id}.")
+            await self.store.append_log(
+                job_id,
+                (
+                    f"Fallback UI Flow: mở project để dùng Tác nhân Flow với ảnh nguồn {resolved_workflow_id}."
+                    if flow_agent_enabled
+                    else f"Fallback UI Flow: mở project và chọn ảnh nguồn {resolved_workflow_id}."
+                ),
+            )
         try:
-            await page.goto(edit_url, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
         except Exception:
             try:
-                await page.goto(edit_url, wait_until="commit", timeout=60_000)
+                await page.goto(target_url, wait_until="commit", timeout=60_000)
             except Exception:
                 await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(2.5)
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: tab hiện tại {str(getattr(page, 'url', '') or '')[:160]}.")
-        selected, selected_detail = await self._select_flow_edit_target_image(
-            page,
-            reference_media_name,
-            allow_visible_fallback=True,
-        )
-        if not selected:
-            raise RuntimeError(
-                "Google Flow chua chon duoc anh goc tren project, nen em dung lai de tranh tao anh moi tu prompt. "
-                f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
-            )
-        if job_id:
-            await self.store.append_log(job_id, f"Fallback UI Flow: đã chọn ảnh gốc ({selected_detail[:120]}).")
 
         interceptor = UIInterceptor()
         interceptor.attach(page)
         interceptor.clear()
 
-        try:
-            await client._ui.open_settings_panel(page)
-            await client._ui.select_image_model(page, self._image_ui_model_label(model))
-            await client._ui.set_count(page, max(1, min(4, int(count or 1))))
-        except Exception:
-            pass
+        if not flow_agent_enabled:
+            try:
+                await client._ui.open_settings_panel(page)
+                await client._ui.select_image_model(page, self._image_ui_model_label(model))
+                await client._ui.set_count(page, max(1, min(4, int(count or 1))))
+            except Exception:
+                pass
 
         agent_opened = False
         if flow_agent_enabled:
@@ -13672,7 +13676,7 @@ exit 1
             if not agent_opened:
                 raise RuntimeError(
                     "Auto AI Trello bắt buộc dùng Tác nhân Flow. App chưa thấy nút Tác nhân trên màn hình Flow, "
-                    "nên đã dừng trước khi nhập prompt thường để tránh tạo ảnh không dùng ảnh nguồn."
+                    "nên đã dừng trước khi nhập lệnh để tránh tạo ảnh không dùng ảnh nguồn."
                 )
 
         filled = False
@@ -13694,6 +13698,20 @@ exit 1
                 job_id,
                 "Fallback UI Flow: đã điền prompt vào ô Tác nhân Flow." if flow_agent_enabled else "Fallback UI Flow: đã điền prompt vào ô tạo ảnh.",
             )
+
+        selected, selected_detail = await self._select_flow_edit_target_image(
+            page,
+            reference_media_name,
+            workflow_id=resolved_workflow_id,
+            allow_visible_fallback=not flow_agent_enabled,
+        )
+        if not selected:
+            raise RuntimeError(
+                "Google Flow chua gan duoc anh goc vao lenh tao anh, nen em dung lai de tranh tao anh moi tu prompt. "
+                f"Chi tiet: {selected_detail or 'khong tim thay anh co the click'}"
+            )
+        if job_id:
+            await self.store.append_log(job_id, f"Fallback UI Flow: đã gắn ảnh gốc vào lệnh ({selected_detail[:120]}).")
 
         try:
             known_media_before_submit = self._project_media_names(await client._api.get_project_data())
@@ -13828,10 +13846,35 @@ exit 1
                 return self._config_bool(settings.get("flowAgentAutoApprove"), default=enabled)
         return enabled
 
+    def _request_requires_flow_agent_ui(self, request: CreateJobRequest) -> bool:
+        if not self._flow_agent_enabled_for_request(request):
+            return False
+        marker = " ".join(
+            str(value or "")
+            for value in (
+                getattr(request, "title", ""),
+                getattr(request, "prompt", ""),
+                getattr(request, "prompt_notes", ""),
+                getattr(request, "prompt_product", ""),
+                getattr(request, "prompt_product_key", ""),
+            )
+        ).lower()
+        if self._normalize_trello_card_id(getattr(request, "trello_card_id", "")):
+            return True
+        return any(
+            token in marker
+            for token in (
+                "use google flow agent",
+                "flow agent",
+                "tác nhân flow",
+                "tac nhan flow",
+                "auto ai trello",
+            )
+        )
+
     async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
         locator_patterns = [
             re.compile(r"Tác\s*nhân|Tac\s*nhan|Agent", re.IGNORECASE),
-            re.compile(r"Bạn\s*muốn\s*tạo\s*gì|Ban\s*muon\s*tao\s*gi|What\s+do\s+you\s+want", re.IGNORECASE),
         ]
         for pattern in locator_patterns:
             for locator_factory in (
@@ -14163,13 +14206,15 @@ exit 1
         page: Any,
         reference_media_name: str,
         *,
+        workflow_id: str = "",
         allow_visible_fallback: bool = False,
     ) -> tuple[bool, str]:
         media_token = str(reference_media_name or "").strip()
+        workflow_token = str(workflow_id or "").strip()
         try:
             result = await page.evaluate(
                 """
-                ({ mediaToken, allowVisibleFallback }) => {
+                ({ mediaToken, workflowId, allowVisibleFallback }) => {
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
                     const rect = el.getBoundingClientRect();
@@ -14210,13 +14255,18 @@ exit 1
                     };
                   };
 
-                  const token = String(mediaToken || '').trim();
-                  if (token) {
+                  const tokens = [mediaToken, workflowId]
+                    .map((value) => String(value || '').trim())
+                    .filter(Boolean);
+                  for (const token of tokens) {
                     const escaped = token.replace(/["\\\\]/g, '\\\\$&');
                     const exact = [
                       `[data-media-id*="${escaped}"]`,
                       `[data-media-name*="${escaped}"]`,
+                      `[data-workflow-id*="${escaped}"]`,
                       `[data-testid*="${escaped}"]`,
+                      `a[href*="${escaped}"] img`,
+                      `a[href*="${escaped}"]`,
                       `img[alt*="${escaped}"]`,
                       `img[src*="${escaped}"]`,
                     ];
@@ -14227,7 +14277,8 @@ exit 1
                     }
                     for (const el of [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]) {
                       if (!visible(el)) continue;
-                      const haystack = `${el.getAttribute('alt') || ''} ${el.getAttribute('src') || ''} ${el.outerHTML || ''}`;
+                      const link = el.closest('a');
+                      const haystack = `${el.getAttribute('alt') || ''} ${el.getAttribute('src') || ''} ${link?.getAttribute('href') || ''} ${el.outerHTML || ''}`;
                       if (haystack.includes(token)) return rectInfo(el);
                     }
                   }
@@ -14265,11 +14316,12 @@ exit 1
                     }
                   }
 
-                  return {ok: false, detail: token ? `media token not visible: ${token}` : 'missing media token'};
+                  return {ok: false, detail: tokens.length ? `media/workflow token not visible: ${tokens.join(', ')}` : 'missing media token'};
                 }
                 """,
                 {
                     "mediaToken": media_token,
+                    "workflowId": workflow_token,
                     "allowVisibleFallback": bool(allow_visible_fallback),
                 },
             )

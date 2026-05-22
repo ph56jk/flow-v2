@@ -4858,6 +4858,36 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         reload_project.assert_awaited_once_with(fake_client)
         generate_via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
 
+    async def test_generate_images_with_retry_uses_flow_agent_ui_for_trello_reference(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
+            count=4,
+            trello_card_id="card-123",
+            flow_agent_enabled=True,
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+        fake_client = SimpleNamespace()
+        fake_image = SimpleNamespace(media_name="img-1")
+
+        with patch.object(self.service, "_generate_images_once", AsyncMock()) as generate_once, patch.object(
+            self.service,
+            "_generate_images_via_ui",
+            AsyncMock(return_value=[fake_image]),
+        ) as generate_via_ui:
+            result = await self.service._generate_images_with_retry(fake_client, job.id, request, ["source-media"])
+
+        self.assertEqual([fake_image], result)
+        generate_once.assert_not_awaited()
+        generate_via_ui.assert_awaited_once_with(fake_client, request, ["source-media"], job_id=job.id)
+
     async def test_generate_images_via_ui_uses_single_reference_fallback(self) -> None:
         request = CreateJobRequest(type="image", prompt="them kinh", count=1, aspect="portrait")
         fake_image = SimpleNamespace(media_name="img-1")
@@ -4943,7 +4973,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             self.service,
             "_select_flow_edit_target_image",
             AsyncMock(return_value=(True, "selected source")),
-        ), patch.object(
+        ) as select_image, patch.object(
             self.service,
             "_enable_flow_agent_mode",
             AsyncMock(return_value=(False, "no visible Tac nhan/Agent button")),
@@ -4961,6 +4991,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertIn("bắt buộc dùng Tác nhân Flow", str(ctx.exception))
         self.assertNotIn("fill_prompt", events)
+        select_image.assert_not_awaited()
 
     async def test_enable_flow_agent_mode_clicks_visible_tac_nhan_button(self) -> None:
         events: list[tuple[str, float, float]] = []
@@ -5033,6 +5064,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
             async def evaluate(self, script: str, payload: dict) -> dict:
                 self.media_token = payload.get("mediaToken")
+                self.workflow_id = payload.get("workflowId")
                 self.allow_visible_fallback = payload.get("allowVisibleFallback")
                 return {
                     "ok": True,
@@ -5048,6 +5080,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertTrue(ok)
         self.assertEqual("media-source", page.media_token)
+        self.assertEqual("", page.workflow_id)
         self.assertFalse(page.allow_visible_fallback)
         self.assertIn("drag", detail)
         self.assertIn(("down", None, None), events)
@@ -5088,12 +5121,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ok, detail = await self.service._select_flow_edit_target_image(
             page,
             "media-not-in-dom",
+            workflow_id="workflow-123",
             allow_visible_fallback=True,
         )
 
         self.assertTrue(ok)
         self.assertTrue(page.payload["allowVisibleFallback"])
         self.assertEqual("media-not-in-dom", page.payload["mediaToken"])
+        self.assertEqual("workflow-123", page.payload["workflowId"])
         self.assertIn("fallback visible edit image", detail)
         self.assertEqual(("click", 510, 780), events[-1])
 
