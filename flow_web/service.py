@@ -59,6 +59,7 @@ from .schemas import (
     PromptBatchRequest,
     PromptCreateRequest,
     ProjectEntry,
+    ResetReadyTrelloRequest,
     ReplayCleanupRequest,
     PublicSkillSnapshot,
     SkillCreateRequest,
@@ -127,6 +128,8 @@ class FlowWebService:
     TRELLO_TIMEOUT_S = 30
     TRELLO_UPSCALE_LONG_EDGE_PX = 2048
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
+    DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
+    DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
     DEFAULT_IMAGE_MODEL = "NARWHAL"
     IMAGE_MODEL_LABELS = {
@@ -2471,6 +2474,127 @@ class FlowWebService:
     def _auto_trello_waitable_empty_error(self, detail: str) -> bool:
         normalized = self._strip_accents(str(detail or "")).lower()
         return "chua tim thay card" in normalized or "khong tim thay card" in normalized
+
+    async def reset_ready_trello_outputs(self, request: ResetReadyTrelloRequest) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id
+            or trello_config.board_id
+            or os.getenv("TRELLO_BOARD_ID", "")
+            or self.DEFAULT_TRELLO_BOARD_URL
+        )
+        raw_list_id = self._normalize_trello_id(
+            request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
+            or self.DEFAULT_TRELLO_SOURCE_LIST_ID
+        )
+        if not board_id:
+            raise HTTPException(status_code=400, detail="Chưa có board Trello để reset.")
+        try:
+            list_id = await asyncio.to_thread(self._trello_resolve_board_list_id, key, token, board_id, raw_list_id)
+            if not list_id:
+                raise RuntimeError(f"Không tìm thấy list {self._default_trello_source_list_name()} trên board Trello.")
+            result = await asyncio.to_thread(self._reset_ready_trello_outputs_sync, key, token, board_id, list_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
+        return result
+
+    def _reset_ready_trello_outputs_sync(self, key: str, token: str, board_id: str, list_id: str) -> Dict[str, Any]:
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/cards",
+            key,
+            token,
+            fields={"fields": "id,name,idList,closed,url", "filter": "open"},
+        )
+        cards = [
+            card
+            for card in (payload if isinstance(payload, list) else [])
+            if isinstance(card, dict)
+            and not card.get("closed")
+            and self._normalize_trello_id(str(card.get("idList") or "")) == list_id
+        ]
+        deleted = 0
+        reset_cards: List[Dict[str, Any]] = []
+        already_unfinished = 0
+        no_source = 0
+        failed: List[Dict[str, Any]] = []
+
+        for card in cards:
+            card_id = self._normalize_trello_card_id(str(card.get("id") or ""))
+            if not card_id:
+                continue
+            attachments_payload = self._trello_get_json(
+                f"cards/{quote(card_id, safe='')}/attachments",
+                key,
+                token,
+                fields={"fields": "id,name,mimeType,date"},
+            )
+            attachments = attachments_payload if isinstance(attachments_payload, list) else []
+            image_attachments = [
+                item
+                for item in attachments
+                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            ]
+            source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            if not source_attachments:
+                no_source += 1
+                continue
+            if not flow_outputs:
+                already_unfinished += 1
+                continue
+
+            card_deleted = 0
+            card_failed: List[str] = []
+            for attachment in flow_outputs:
+                attachment_id = self._normalize_trello_id(str(attachment.get("id") or ""))
+                if not attachment_id:
+                    continue
+                try:
+                    self._trello_delete_attachment(key, token, card_id, attachment_id)
+                    deleted += 1
+                    card_deleted += 1
+                except Exception as exc:
+                    card_failed.append(humanize_flow_error(str(exc))[:160])
+            if card_deleted:
+                reset_cards.append(
+                    {
+                        "id": card_id,
+                        "name": str(card.get("name") or "").strip(),
+                        "url": str(card.get("url") or "").strip(),
+                        "deleted": card_deleted,
+                    }
+                )
+            if card_failed:
+                failed.append(
+                    {
+                        "id": card_id,
+                        "name": str(card.get("name") or "").strip(),
+                        "errors": card_failed[:3],
+                    }
+                )
+
+        return {
+            "ok": not failed,
+            "board_id": board_id,
+            "list_id": list_id,
+            "cards_seen": len(cards),
+            "cards_reset": len(reset_cards),
+            "attachments_deleted": deleted,
+            "already_unfinished": already_unfinished,
+            "without_source": no_source,
+            "failed": failed,
+            "reset_cards": reset_cards[:20],
+            "message": (
+                f"Đã reset {len(reset_cards)} card trong Ready for AI, xóa {deleted} ảnh output. "
+                "Ảnh nguồn được giữ nguyên."
+            ),
+        }
 
     def _continuous_auto_trello_idle_message(self, request: CreateJobRequest, poll_interval_s: int) -> str:
         summary = ""
@@ -8756,6 +8880,30 @@ exit 1
             raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
         except URLError as exc:
             raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
+
+    def _trello_delete_json(self, path: str, key: str, token: str) -> Any:
+        request = Request(
+            self._trello_endpoint(path, key, token),
+            headers={"Accept": "application/json"},
+            method="DELETE",
+        )
+        try:
+            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                raw_payload = response.read().decode("utf-8", errors="replace")
+                return json.loads(raw_payload) if raw_payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            detail = self._redact_trello_secret(detail or exc.reason, key, token)
+            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
+
+    def _trello_delete_attachment(self, key: str, token: str, card_id: str, attachment_id: str) -> Any:
+        return self._trello_delete_json(
+            f"cards/{quote(card_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
+            key,
+            token,
+        )
 
     def _trello_create_card(self, key: str, token: str, list_id: str, name: str, description: str) -> Dict[str, Any]:
         payload = self._trello_request_json(

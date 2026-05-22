@@ -277,6 +277,11 @@ class TrelloConfigUpdateRequest(BaseModel):
     persist_to_env: bool = False  # also write to .env.local so creds survive state resets
 
 
+class ResetReadyTrelloRequest(BaseModel):
+    trello_board_id: str = ""
+    trello_list_id: str = ""
+
+
 class IntegrationConfigUpdateRequest(BaseModel):
     gemini_api_key: str = ""
     gemini_model: str = ""

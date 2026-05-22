@@ -21,6 +21,7 @@ from .schemas import (
     IntegrationConfigUpdateRequest,
     PromptBatchRequest,
     PromptCreateRequest,
+    ResetReadyTrelloRequest,
     ReplayCleanupRequest,
     StoryboardPlanRequest,
     TrelloConfigUpdateRequest,
@@ -116,6 +117,11 @@ async def update_config(request: Request, payload: ConfigUpdateRequest) -> Dict[
 @app.put("/api/integrations/trello")
 async def update_trello_config(request: Request, payload: TrelloConfigUpdateRequest) -> Dict[str, Any]:
     return {"trello": await service(request).update_trello_config(payload)}
+
+
+@app.post("/api/trello/ready/reset")
+async def reset_ready_trello_outputs(request: Request, payload: ResetReadyTrelloRequest) -> Dict[str, Any]:
+    return await service(request).reset_ready_trello_outputs(payload)
 
 
 @app.get("/api/trello/cards/{card_id}/attachments/{attachment_id}/preview")

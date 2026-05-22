@@ -25,6 +25,7 @@ from flow_web.schemas import (
     JobRecord,
     PromptBatchRequest,
     PromptCreateRequest,
+    ResetReadyTrelloRequest,
     SkillRecord,
     StateSnapshot,
     StoryboardPlanRequest,
@@ -1068,6 +1069,40 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("1 card đã đủ 4 ảnh output", summary)
         self.assertIn("1 card còn thiếu ảnh", summary)
         self.assertIn("1 card chưa có ảnh nguồn", summary)
+
+    def test_reset_ready_trello_outputs_deletes_only_generated_images(self) -> None:
+        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+        cards_payload = [
+            {"id": "done-card", "name": "Done", "idList": "ready-list", "url": "https://trello.test/done"},
+            {"id": "new-card", "name": "New", "idList": "ready-list", "url": "https://trello.test/new"},
+        ]
+        done_attachments = [
+            {"id": "source", "name": "source.png", "mimeType": "image/png"},
+            {"id": "flow-1", "name": "flow-done-1.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-2", "name": "flow-done-2.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-3", "name": "flow-done-3.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-4", "name": "flow-done-4.jpg", "mimeType": "image/jpeg"},
+        ]
+        new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_get_json",
+            side_effect=[cards_payload, done_attachments, new_attachments],
+        ), patch.object(self.service, "_trello_delete_attachment", return_value={}) as delete_attachment:
+            result = asyncio.run(self.service.reset_ready_trello_outputs(request))
+
+        self.assertEqual(2, result["cards_seen"])
+        self.assertEqual(1, result["cards_reset"])
+        self.assertEqual(4, result["attachments_deleted"])
+        self.assertEqual(1, result["already_unfinished"])
+        deleted_ids = [call.args[3] for call in delete_attachment.call_args_list]
+        self.assertEqual(["flow-1", "flow-2", "flow-3", "flow-4"], deleted_ids)
+        self.assertNotIn("source", deleted_ids)
 
     def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
         previews = self.service._trello_candidate_image_previews(

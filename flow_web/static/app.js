@@ -762,6 +762,7 @@ const elements = {
   automationIncompleteRefreshButton: document.querySelector("#automationIncompleteRefreshButton"),
   automationUseStudioButton: document.querySelector("#automationUseStudioButton"),
   automationOpenFlowButton: document.querySelector("#automationOpenFlowButton"),
+  automationResetReadyButton: document.querySelector("#automationResetReadyButton"),
   automationAutoRunButton: document.querySelector("#automationAutoRunButton"),
   automationRunButton: document.querySelector("#automationRunButton"),
   automationRunImageButton: document.querySelector("#automationRunImageButton"),
@@ -2525,6 +2526,9 @@ function renderEasyPanel(stats) {
     elements.automationAutoRunButton.textContent = continuousAutoJob ? "Dừng auto" : autoTrelloReady && !batchItems.length ? "Auto AI Trello" : "Auto Trello";
     elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello"));
   }
+  if (elements.automationResetReadyButton) {
+    elements.automationResetReadyButton.disabled = stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
+  }
   if (elements.automationRunButton) {
     elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
   }
@@ -3976,6 +3980,58 @@ function resetAutomationConfig() {
   saveAutomationConfig(state.automation);
   renderAll();
   showMessage("Đã reset phần custom về mặc định.", "success");
+}
+
+async function resetReadyForAiOutputs() {
+  if (automationSubmitInFlight) {
+    return;
+  }
+  syncAutomationFromForm();
+  const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
+  const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
+  const confirmed = window.confirm(
+    "Reset Ready for AI sẽ xóa ảnh output do Flow tạo trên các card trong Ready for AI, giữ nguyên ảnh nguồn. Sau đó Auto sẽ chạy lại các card đó. Tiếp tục?"
+  );
+  if (!confirmed) {
+    return;
+  }
+  automationSubmitInFlight = true;
+  if (elements.automationResetReadyButton) {
+    elements.automationResetReadyButton.disabled = true;
+  }
+  if (elements.automationAutoRunButton) {
+    elements.automationAutoRunButton.disabled = true;
+  }
+  try {
+    const result = await api("/api/trello/ready/reset", {
+      method: "POST",
+      body: JSON.stringify({
+        trello_board_id: boardId,
+        trello_list_id: listId,
+      }),
+    });
+    const deleted = Number(result.attachments_deleted || 0);
+    const cardsReset = Number(result.cards_reset || 0);
+    const cardsSeen = Number(result.cards_seen || 0);
+    showMessage(
+      deleted
+        ? `Đã reset ${cardsReset} card trong Ready for AI, xóa ${deleted} ảnh output. Bấm Auto AI Trello để chạy lại.`
+        : `Ready for AI có ${cardsSeen} card nhưng chưa có ảnh output nào cần xóa.`,
+      "success",
+    );
+    await loadState({ silent: true });
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    automationSubmitInFlight = false;
+    if (elements.automationResetReadyButton) {
+      elements.automationResetReadyButton.disabled = false;
+    }
+    if (elements.automationAutoRunButton) {
+      elements.automationAutoRunButton.disabled = false;
+    }
+    renderAutomationDashboard();
+  }
 }
 
 async function saveTrelloConfig({ clearCredentials = false } = {}) {
@@ -5604,6 +5660,7 @@ elements.automationOpenFlowButton.addEventListener("click", openFlowProjectSurfa
 elements.automationRefreshButton.addEventListener("click", () => loadState());
 elements.automationHistoryRefreshButton.addEventListener("click", () => loadState());
 elements.automationIncompleteRefreshButton.addEventListener("click", () => loadState());
+elements.automationResetReadyButton?.addEventListener("click", resetReadyForAiOutputs);
 elements.automationRunButton.addEventListener("click", submitAutomationImage);
 elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
 elements.automationAutoRunButton?.addEventListener("click", () => {
