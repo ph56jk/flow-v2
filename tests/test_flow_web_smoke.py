@@ -5523,6 +5523,33 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("Phê duyệt", detail)
         self.assertEqual([("click", 90, 430), ("click", 720, 330)], events)
 
+    async def test_open_flow_agent_panel_clicks_unlabeled_bottom_right_arrow(self) -> None:
+        events: list[tuple[str, float, float]] = []
+
+        class FakeMouse:
+            async def click(self, x: float, y: float) -> None:
+                events.append(("click", x, y))
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str) -> dict:
+                self.script = script
+                return {"ok": True, "x": 612, "y": 760, "detail": "agent panel opener"}
+
+        page = FakePage()
+
+        with patch.object(
+            self.service,
+            "_flow_agent_panel_state",
+            AsyncMock(side_effect=[{"visible": False, "detail": "not yet"}, {"visible": True, "detail": "Phiên không có tiêu đề"}]),
+        ):
+            ok, detail = await self.service._open_flow_agent_panel(page, timeout_s=2)
+
+        self.assertTrue(ok)
+        self.assertIn("Phiên", detail)
+        self.assertEqual([("click", 612, 760)], events)
+
     async def test_select_flow_edit_target_image_drags_source_into_prompt(self) -> None:
         events: list[tuple[str, float | None, float | None]] = []
 

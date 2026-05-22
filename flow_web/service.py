@@ -14696,12 +14696,11 @@ exit 1
 
     async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
         locator_patterns = [
-            re.compile(r"Tác\s*nhân|Tac\s*nhan|Agent", re.IGNORECASE),
+            re.compile(r"^\s*(Tác\s*nhân|Tac\s*nhan|Agent)\s*$", re.IGNORECASE),
         ]
         for pattern in locator_patterns:
             for locator_factory in (
                 lambda pat=pattern: page.get_by_role("button", name=pat).first(),
-                lambda pat=pattern: page.get_by_text(pat).first(),
             ):
                 try:
                     locator = locator_factory()
@@ -14721,6 +14720,21 @@ exit 1
             result = await page.evaluate(
                 """
                 () => {
+                  const deepQuery = (selector, root = document, seen = new Set()) => {
+                    const found = [];
+                    const visit = (node) => {
+                      if (!node || seen.has(node)) return;
+                      seen.add(node);
+                      try {
+                        found.push(...node.querySelectorAll(selector));
+                        for (const el of node.querySelectorAll('*')) {
+                          if (el.shadowRoot) visit(el.shadowRoot);
+                        }
+                      } catch (_) {}
+                    };
+                    visit(root);
+                    return found;
+                  };
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
                     const rect = el.getBoundingClientRect();
@@ -14738,16 +14752,29 @@ exit 1
                     el.getAttribute('title') || '',
                     el.getAttribute('data-testid') || '',
                   ].join(' ').replace(/\\s+/g, ' ').trim();
-                  const controls = [...document.querySelectorAll('button, [role="button"], a, div, span')]
+                  const controls = deepQuery('button, [role="button"], a, div, span')
                     .filter(visible)
                     .map((el) => {
                       const control = el.closest('button, [role="button"], a') || el;
-                      return { el: control, rect: control.getBoundingClientRect(), label: `${labelFor(el)} ${labelFor(control)}`.trim() };
+                      const rect = control.getBoundingClientRect();
+                      const rawLabel = `${labelFor(el)} ${labelFor(control)}`.replace(/\\s+/g, ' ').trim();
+                      const exact = /^\\s*(Tác\\s*nhân|Tac\\s*nhan|Agent)\\s*$/i.test(rawLabel);
+                      const contains = /Tác\\s*nhân|Tac\\s*nhan|Agent/i.test(rawLabel);
+                      const compact = rect.width >= 52 && rect.width <= 280 && rect.height >= 28 && rect.height <= 110;
+                      const bottom = rect.top >= window.innerHeight * 0.35;
+                      const noisy = rawLabel.length > 120 || rect.width > window.innerWidth * 0.55 || rect.height > 180;
+                      const score = (exact ? 3000 : 0)
+                        + (contains ? 800 : 0)
+                        + (compact ? 900 : -700)
+                        + (bottom ? 250 : 0)
+                        - (noisy ? 1600 : 0)
+                        + rect.bottom / 100;
+                      return { el: control, rect, label: rawLabel, score, contains };
                     })
                     .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
-                    .filter(({ label }) => /Tác\\s*nhân|Tac\\s*nhan|Agent/i.test(label));
+                    .filter(({ contains, score }) => contains && score > 0);
                   const target = controls
-                    .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (a.rect.left - b.rect.left))[0];
+                    .sort((a, b) => b.score - a.score)[0];
                   if (!target) return { ok: false, detail: 'no visible Tac nhan/Agent button' };
                   target.el.scrollIntoView({ block: 'center', inline: 'center' });
                   const rect = target.el.getBoundingClientRect();
@@ -14786,6 +14813,21 @@ exit 1
                 result = await page.evaluate(
                     """
                     () => {
+                      const deepQuery = (selector, root = document, seen = new Set()) => {
+                        const found = [];
+                        const visit = (node) => {
+                          if (!node || seen.has(node)) return;
+                          seen.add(node);
+                          try {
+                            found.push(...node.querySelectorAll(selector));
+                            for (const el of node.querySelectorAll('*')) {
+                              if (el.shadowRoot) visit(el.shadowRoot);
+                            }
+                          } catch (_) {}
+                        };
+                        visit(root);
+                        return found;
+                      };
                       const visible = (el) => {
                         if (!el || !(el instanceof Element)) return false;
                         const rect = el.getBoundingClientRect();
@@ -14798,29 +14840,42 @@ exit 1
                           && rect.bottom > 0
                           && rect.top < window.innerHeight;
                       };
+                      const disabledish = (el) => Boolean(
+                        el.disabled
+                        || el.getAttribute('aria-disabled') === 'true'
+                        || el.closest('[disabled], [aria-disabled="true"]')
+                      );
                       const labelFor = (el) => [
                         el.textContent || '',
                         el.getAttribute('aria-label') || '',
                         el.getAttribute('title') || '',
                         el.getAttribute('data-testid') || '',
+                        el.getAttribute('jsname') || '',
+                        el.getAttribute('class') || '',
                       ].join(' ').replace(/\\s+/g, ' ').trim();
-                      const buttons = [...document.querySelectorAll('button, [role="button"], a')]
+                      const buttons = deepQuery('button, [role="button"], a, div, span, mat-icon, svg, [aria-label], [data-testid]')
                         .filter(visible)
                         .map((el) => {
-                          const rect = el.getBoundingClientRect();
-                          const label = labelFor(el);
+                          const control = el.closest('button, [role="button"], a, [tabindex]') || el;
+                          const rect = control.getBoundingClientRect();
+                          const label = `${labelFor(el)} ${labelFor(control)}`.replace(/\\s+/g, ' ').trim();
                           const bottomComposer = rect.top >= window.innerHeight * 0.55;
-                          const rightish = rect.left >= window.innerWidth * 0.45 || rect.right >= window.innerWidth * 0.72;
-                          const arrowish = /arrow_forward|arrow_upward|send|mũi\\s*tên|mui\\s*ten|open|expand|agent|tác\\s*nhân|tac\\s*nhan/i.test(label);
-                          const compact = rect.width <= 96 && rect.height <= 96;
+                          const rightish = rect.left >= window.innerWidth * 0.62 || rect.right >= window.innerWidth * 0.82;
+                          const arrowish = /arrow_forward|arrow_upward|arrow|send|gửi|gui|mũi\\s*tên|mui\\s*ten|open|expand|agent|tác\\s*nhân|tac\\s*nhan/i.test(label);
+                          const compact = rect.width >= 24 && rect.width <= 112 && rect.height >= 24 && rect.height <= 112;
+                          const unlabeledArrowSpot = !label && bottomComposer && rightish && compact;
+                          const noisy = label.length > 160 || rect.width > 240 || rect.height > 160;
                           const score = (bottomComposer ? 900 : 0)
-                            + (rightish ? 700 : 0)
+                            + (rightish ? 1000 : 0)
                             + (arrowish ? 900 : 0)
-                            + (compact ? 150 : 0)
+                            + (unlabeledArrowSpot ? 650 : 0)
+                            + (compact ? 250 : -900)
+                            - (noisy ? 1200 : 0)
                             + rect.right / 50;
-                          return { el, rect, label, score };
+                          return { el: control, rect, label, score, disabled: disabledish(control) };
                         })
-                        .filter((item) => item.score >= 1450)
+                        .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
+                        .filter((item) => !item.disabled && item.score >= 1800)
                         .sort((a, b) => b.score - a.score);
                       const target = buttons[0];
                       if (!target) return { ok: false, detail: 'no visible agent panel opener' };
