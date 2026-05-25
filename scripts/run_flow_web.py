@@ -118,8 +118,6 @@ def chromium_installed(path: Path) -> bool:
 def ensure_chromium(python: Path, path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(path)
-    if chromium_installed(path):
-        return
     run_checked("playwright install chromium", [str(python), "-m", "playwright", "install", "chromium"])
 
 

@@ -19,6 +19,7 @@ data/state.json
 data/_state_dump.json
 .flow-web.log
 .flow-web.pid
+logs/
 !data/uploads/.gitkeep
 !data/downloads/.gitkeep
 

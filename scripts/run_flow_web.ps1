@@ -72,10 +72,8 @@ if ($needsInstall) {
     Set-Content -Path $installStamp -Value (Get-Date).ToString("o") -Encoding UTF8
 }
 
-if (-not (Test-PlaywrightChromiumInstalled -BrowserPath $BrowserPath)) {
-    New-Item -ItemType Directory -Path $BrowserPath -Force | Out-Null
-    Invoke-Checked -Label "playwright install" -Script { & $python -m playwright install chromium }
-}
+New-Item -ItemType Directory -Path $BrowserPath -Force | Out-Null
+Invoke-Checked -Label "playwright install" -Script { & $python -m playwright install chromium }
 
 if ($PrepareOnly) {
     Write-Host "Da setup xong. Mo app bang: .\\scripts\\run_flow_web.ps1"

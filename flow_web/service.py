@@ -121,7 +121,8 @@ class FlowWebService:
     USER_ASSISTANT_CONTEXT_LIMIT = 1200
     USER_ASSISTANT_ANSWER_LIMIT = 1400
     AI_PROMPT_SUITE_SIZE = 6
-    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 4
+    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 8
+    FLOW_AGENT_TARGET_OUTPUT_COUNT = 8
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
@@ -1826,6 +1827,10 @@ class FlowWebService:
             )
         if request.auto_trello:
             base_request = self._auto_trello_flow_agent_request(base_request)
+            if not items and run_until_empty:
+                payload = _model_dump(base_request)
+                self._clear_auto_trello_search_filter(payload)
+                base_request = CreateJobRequest(**payload)
         if continuous:
             base_request, trello_source_hint = await self._continuous_auto_trello_base_request(base_request)
             batch_key = self._continuous_auto_trello_batch_key(base_request, trello_source_hint)
@@ -1900,7 +1905,7 @@ class FlowWebService:
             title = (
                 str(request.title or "").strip()
                 or (
-                    f"Auto Trello Flow Agent: tạo 4 ảnh cho {len(items)} card"
+                    f"Auto Trello Flow Agent: tạo 8 ảnh cho {len(items)} card"
                     if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
                     else f"Auto Trello Flow Agent: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
                     if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
@@ -2128,6 +2133,21 @@ class FlowWebService:
         self._force_auto_trello_flow_agent_policy(payload)
         return CreateJobRequest(**payload)
 
+    def _clear_auto_trello_search_filter(self, payload: Dict[str, Any]) -> None:
+        payload["prompt_product"] = ""
+        payload["prompt_product_key"] = ""
+        payload["prompt_notes"] = ""
+        payload["trello_card_id"] = ""
+        payload["trello_attachment_ids"] = []
+        self._sync_trello_scope_into_automation_graph(
+            payload,
+            board_id=str(payload.get("trello_board_id") or "").strip(),
+            list_id=str(payload.get("trello_list_id") or "").strip(),
+            card_id="",
+            attachment_ids=[],
+            clear_card=True,
+        )
+
     def _force_auto_trello_flow_agent_policy(self, payload: Dict[str, Any]) -> None:
         payload["aspect"] = "square"
         payload["count"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
@@ -2253,7 +2273,7 @@ class FlowWebService:
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
-            image_count = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            image_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             return f"Flow Agent {index + 1}/{total} · {label} · {image_count} ảnh"[:120]
         if item.get("generated_by_ai"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
@@ -2276,7 +2296,7 @@ class FlowWebService:
         payload["prompt_index"] = str(item.get("index") or "").strip()
         payload["prompt_notes"] = str(item.get("notes") or "").strip()
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
-            image_count = max(1, min(4, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            image_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             payload["count"] = image_count
             payload["flow_agent_enabled"] = True
             payload["flow_agent_auto_approve"] = True
@@ -2554,7 +2574,7 @@ class FlowWebService:
                 "complete": 0,
                 "eligible": 0,
                 "without_source": 0,
-                "target_output_count": self.FLOW_AGENT_DEFAULT_IMAGE_COUNT,
+                "target_output_count": self.FLOW_AGENT_TARGET_OUTPUT_COUNT,
                 "cards": [],
                 "message": f"{self._trello_source_scope_label()} chưa có list hợp lệ để kiểm tra.",
             }
@@ -2598,8 +2618,9 @@ class FlowWebService:
                 if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            output_count = len(outputs)
             status = "no_source"
-            if sources and len(outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
+            if sources and output_count:
                 complete += 1
                 status = "complete"
             elif sources:
@@ -2615,8 +2636,8 @@ class FlowWebService:
                     "list_id": self._normalize_trello_id(str(card.get("idList") or "")),
                     "status": status,
                     "source_count": len(sources),
-                    "output_count": len(outputs),
-                    "missing_count": max(0, self.FLOW_AGENT_DEFAULT_IMAGE_COUNT - len(outputs)) if sources else 0,
+                    "output_count": output_count,
+                    "missing_count": 0 if output_count else max(0, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - output_count) if sources else 0,
                 }
             )
         return {
@@ -2628,11 +2649,12 @@ class FlowWebService:
             "complete": complete,
             "eligible": eligible,
             "without_source": no_source,
-            "target_output_count": self.FLOW_AGENT_DEFAULT_IMAGE_COUNT,
+            "target_output_count": self.FLOW_AGENT_TARGET_OUTPUT_COUNT,
             "cards": card_summaries[:50],
             "message": (
                 f"{scope_label} có {len(cards)} card; {eligible} card có thể chạy; "
-                f"{complete} card đã đủ {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} ảnh output; {no_source} card chưa có ảnh nguồn."
+                f"{complete} card đã có ảnh output nên Auto sẽ bỏ qua; "
+                f"{no_source} card chưa có ảnh nguồn."
             ),
         }
 
@@ -2804,6 +2826,7 @@ class FlowWebService:
 
         complete = 0
         eligible = 0
+        no_output = 0
         no_source = 0
         for card in cards:
             card_id = str(card.get("id") or "").strip()
@@ -2822,22 +2845,24 @@ class FlowWebService:
                 if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(images)
-            if sources and len(outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
+            output_count = len(outputs)
+            if sources and output_count:
                 complete += 1
             elif sources:
                 eligible += 1
+                no_output += 1
             else:
                 no_source += 1
 
-        parts = [f"{scope_label} có {len(cards)} card"]
+        parts = [f"{scope_label} co {len(cards)} card"]
         if complete:
-            parts.append(f"{complete} card đã đủ {self.FLOW_AGENT_DEFAULT_IMAGE_COUNT} ảnh output")
-        if eligible:
-            parts.append(f"{eligible} card còn thiếu ảnh và sẽ chạy ở lượt quét kế tiếp")
+            parts.append(f"{complete} card da co anh output nen Auto se bo qua")
+        if no_output:
+            parts.append(f"{no_output} card chua co output va se tao 8 anh trong 1 lan")
         if no_source:
-            parts.append(f"{no_source} card chưa có ảnh nguồn hợp lệ")
+            parts.append(f"{no_source} card chua co anh nguon hop le")
         if not eligible and complete:
-            parts.append("Auto đang chờ card mới hoặc card chưa đủ ảnh")
+            parts.append("Auto dang cho card moi hoac card duoc reset de tao lai du 8 anh")
         return "; ".join(parts) + "."
 
     async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
@@ -3228,7 +3253,7 @@ class FlowWebService:
         return " ".join(parts)
 
     def _flow_agent_reference_prompt_style_guide(self, target_count: int) -> str:
-        target = max(1, min(4, int(target_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
         return (
             "Use the learned product-prompt style: write like a meticulous ecommerce art director. "
             "Before generating, state a compact design analysis of the reference product, then create a numbered shot brief. "
@@ -3236,7 +3261,14 @@ class FlowWebService:
             "For every shot, specify the subject count, exact product placement, background, props, lighting direction, camera angle, and which source details must stay unchanged. "
             "Keep all source motifs, embroidery/print placement, names, colors, fabric texture, proportions, and handmade irregularities consistent. "
             "For handmade or embroidered products, include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
-            "Use soft bright natural light, airy clean styling, warm nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography, no watermark, no extra text overlay."
+            "Use soft bright natural light, airy clean styling, warm nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography. "
+            + self._flow_agent_no_tag_label_rule()
+        )
+
+    def _flow_agent_no_tag_label_rule(self) -> str:
+        return (
+            "Do not add any sticker, tag, price tag, hang tag, loose label, barcode, QR code, sale badge, watermark, "
+            "new logo, fake brand mark, or extra text overlay unless that exact mark already exists on the source product image."
         )
 
     def _flow_operator_steps(
@@ -3352,7 +3384,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy automation Flow",
-                    "detail": f"Quét {self._trello_source_scope_label()}, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo 4 ảnh, rồi upload về đúng card Trello để duyệt.",
+                    "detail": f"Quét {self._trello_source_scope_label()}, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo 8 ảnh trong một job, rồi upload về đúng card Trello để duyệt.",
                     "action": "run_auto_trello",
                     "payload": {"limit": 1, "test_mode": True} if "test" in self._normalize_skill_token(instruction) else {},
                     "requires_confirmation": True,
@@ -3382,7 +3414,7 @@ class FlowWebService:
             "title": "Flow AI Operator",
             "summary": (
                 "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, chuẩn bị lệnh cho Tác nhân Google Flow, "
-                "để Flow Agent tự viết prompt/tạo 4 ảnh rồi upload ngay về đúng card Trello để duyệt."
+                "để Flow Agent tự viết prompt/tạo 8 ảnh trong một job rồi upload ngay về đúng card Trello để duyệt."
             ),
             "intent": "trello_sheet_flow_telegram_automation",
             "product_filter": product_filter,
@@ -3403,7 +3435,7 @@ class FlowWebService:
             [
                 "Bạn là Flow AI Operator trong app Flow v2.",
                 "Nhiệm vụ: biến yêu cầu người dùng thành kế hoạch automation có thể thao tác Google Flow.",
-                f"Quy trình bắt buộc: Trello {self._trello_source_scope_label()} attachment -> app chọn đúng card/ảnh -> ưu tiên nút Tác nhân/Agent trong Google Flow -> Flow Agent tự viết prompt và tạo/chỉnh 4 ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
+                f"Quy trình bắt buộc: Trello {self._trello_source_scope_label()} attachment -> app chọn đúng card/ảnh -> ưu tiên nút Tác nhân/Agent trong Google Flow -> Flow Agent tự viết prompt và tạo/chỉnh 8 ảnh trong một job bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
                 "Bạn không được yêu cầu secret trong chat và không in API key/token/cookie.",
                 "Trả về duy nhất JSON object, không markdown.",
                 "Schema JSON:",
@@ -3642,7 +3674,7 @@ class FlowWebService:
         gemini = context.get("gemini", {})
         jobs = context.get("jobs", {})
         lines = [
-            f"Quy trình chuẩn: Trello {self._trello_source_scope_label()} card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 4 ảnh -> upload lại đúng card Trello để duyệt trực tiếp.",
+            f"Quy trình chuẩn: Trello {self._trello_source_scope_label()} card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 8 ảnh trong một job -> upload lại đúng card Trello để duyệt trực tiếp.",
             f"Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list {self._trello_source_scope_label()}; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
             f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}; Auto AI Trello dùng Tác nhân Flow nên không bắt buộc workflow mặc định ({'workflow chỉnh sửa đã chọn' if flow.get('workflow_set') else 'workflow chỉnh sửa đang để trống'}).",
             f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
@@ -3944,7 +3976,7 @@ class FlowWebService:
                     "detail": (
                         "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Trello."
                         if test_run
-                        else f"App sẽ quét card {self._trello_source_scope_label()} có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo 4 ảnh rồi upload về đúng card Trello."
+                        else f"App sẽ quét card {self._trello_source_scope_label()} có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo 8 ảnh trong một job rồi upload về đúng card Trello."
                     ),
                     "action": "run_auto_trello",
                     "payload": payload,
@@ -4354,7 +4386,7 @@ class FlowWebService:
         prompt_text = "\n".join(
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
-                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 4 ảnh, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
+                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 8 ảnh trong một job, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
                 "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, chọn đúng card/ảnh và đưa các nút thao tác thật; prompt ảnh cuối do Tác nhân trong Google Flow viết.",
                 f"Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list {self._trello_source_scope_label()}. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
                 "Không được yêu cầu người dùng chọn workflow mặc định để chạy Auto AI Trello; workflow mặc định chỉ hữu ích cho luồng chỉnh/sửa ảnh cũ, còn Auto AI Trello chạy bằng project Flow + Tác nhân Flow + ảnh Trello.",
@@ -6309,7 +6341,8 @@ exit 1
                 payload["aspect"] = str(settings.get("imageAspect") or "").strip()
             if settings.get("imageCount"):
                 try:
-                    payload["count"] = max(1, min(4, int(settings.get("imageCount") or 1)))
+                    max_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT if flow_agent_enabled else 4
+                    payload["count"] = max(1, min(max_count, int(settings.get("imageCount") or 1)))
                 except Exception:
                     pass
             if "flowAgentAutoApprove" in settings:
@@ -8592,6 +8625,16 @@ exit 1
                     "brief": "Artisan gift-ready scene with the apron folded partly open beside embroidery thread, needle, linen ribbon, dried flowers or baking tools, communicating handmade premium quality.",
                     "must_include": "handmade craft props, premium gift presentation, apron embroidery visible",
                 },
+                {
+                    "label": "Hands embroidering apron",
+                    "brief": "Close commercial craft scene with human hands actively sewing or embroidering the selected apron, needle and thread visible, while the apron fabric, color, motif, and embroidery placement stay exactly consistent with the source product.",
+                    "must_include": "human hands sewing or embroidering, needle and thread, selected apron reference design, exact fabric and motif",
+                },
+                {
+                    "label": "Prep table detail",
+                    "brief": "Close commercial scene on a kitchen prep table with flour, rolling pin, or pastry tools while the apron remains the main product and embroidery stays visible.",
+                    "must_include": "kitchen prep context, embroidery visible, premium product styling",
+                },
             ]
 
         if signals.get("is_doll") or signals.get("is_plush"):
@@ -8624,13 +8667,23 @@ exit 1
                 },
                 {
                     "label": "Flat lay styling",
-                    "brief": "Overhead flat lay of the doll/plush arranged neatly on a light wooden or linen surface with tasteful toys, ribbon, name tag, or gift props.",
+                    "brief": "Overhead flat lay of the doll/plush arranged neatly on a light wooden or linen surface with tasteful toys, ribbon, soft fabric props, or gift props.",
                     "must_include": "flat lay, full product layout, tasteful toy/gift props",
                 },
                 {
                     "label": "Gift ready scene",
-                    "brief": "Premium gift-ready scene with the doll/plush beside wrapping tissue, ribbon, small card, or keepsake box while preserving the source product identity.",
+                    "brief": "Premium gift-ready scene with the doll/plush beside wrapping tissue, ribbon, folded fabric, or keepsake box while preserving the source product identity.",
                     "must_include": "premium gift presentation, doll/plush details visible, clean commercial finish",
+                },
+                {
+                    "label": "Hands sewing doll detail",
+                    "brief": "Close commercial craft scene with human hands sewing, hand-stitching, or embroidering the selected doll/plush, needle and thread visible, while preserving the exact face, clothing, silhouette, seams, and fabric from the source product.",
+                    "must_include": "human hands sewing or embroidering, needle and thread, exact doll/plush identity, handmade craft detail",
+                },
+                {
+                    "label": "Handheld scale detail",
+                    "brief": "Gentle close lifestyle shot with hands holding or presenting the doll/plush to show size, softness, fabric pile, seams, and tactile handmade quality.",
+                    "must_include": "hands for scale, tactile detail, source product unchanged",
                 },
             ]
 
@@ -8656,7 +8709,7 @@ exit 1
                 },
                 {
                     "label": "Gift box presentation",
-                    "brief": "Premium gift-ready scene with the pillowcase or cushion neatly presented in a box, basket, or folded with tissue paper, ribbon, tag, and soft nursery props.",
+                    "brief": "Premium gift-ready scene with the pillowcase or cushion neatly presented in a box, basket, or folded with tissue paper, ribbon, and soft nursery props.",
                     "must_include": "gift packaging, full product detail, handmade premium feel",
                 },
                 {
@@ -8668,6 +8721,16 @@ exit 1
                     "label": "Collection variation scene",
                     "brief": "Tasteful collection-style scene with one to three pillows/cushions in different nursery placements while keeping the source embroidery style, fabric quality, and handmade look consistent.",
                     "must_include": "coherent pillow collection, varied placement, source style consistent",
+                },
+                {
+                    "label": "Hands embroidering pillowcase",
+                    "brief": "Close commercial craft scene with human hands actively sewing or embroidering the selected pillowcase/cushion, needle and thread visible, while the name, motif, fabric color, weave, and stitch placement stay exactly consistent with the source product.",
+                    "must_include": "human hands sewing or embroidering, needle and thread, exact embroidery motif/name, pillowcase fabric unchanged",
+                },
+                {
+                    "label": "Personalized detail vignette",
+                    "brief": "Commercial close vignette focused on the name, motif, or personalized embroidery with matching soft props while preserving every stitch and fabric color from the source.",
+                    "must_include": "personalized embroidery detail, matching props, exact stitching and fabric color",
                 },
             ]
 
@@ -8700,8 +8763,18 @@ exit 1
                 },
                 {
                     "label": "Gift ready scene",
-                    "brief": "Premium packaging or gift-ready apparel scene with folded shirt, tissue paper, tag, or box.",
+                    "brief": "Premium packaging or gift-ready apparel scene with folded shirt, tissue paper, ribbon, or box.",
                     "must_include": "gift presentation, shirt details, clean commercial finish",
+                },
+                {
+                    "label": "Hands sewing shirt detail",
+                    "brief": "Close commercial craft scene with human hands sewing or embroidering the selected shirt, needle and thread visible near the collar, sleeve, hem, or design area, while keeping the shirt color, print/embroidery, fabric, and shape unchanged.",
+                    "must_include": "human hands sewing or embroidering, needle and thread, source shirt design unchanged, fabric detail",
+                },
+                {
+                    "label": "Merchandising stack",
+                    "brief": "Clean ecommerce merchandising scene with the shirt folded or stacked with simple matching accessories while the main design remains visible and premium.",
+                    "must_include": "folded shirt, design visible, premium merchandising styling",
                 },
             ]
 
@@ -8736,6 +8809,16 @@ exit 1
                 "brief": "Premium packaging or gift-ready scene that makes the product feel handmade, valuable, and ready to sell.",
                 "must_include": "premium presentation, product details, clean commercial finish",
             },
+            {
+                "label": "Hands sewing product",
+                "brief": "Close commercial craft scene with human hands sewing or embroidering the selected product, needle and thread visible, while preserving the exact product shape, material, color, motif, print or embroidery details from the source image.",
+                "must_include": "human hands sewing or embroidering, needle and thread, exact source product identity, handmade craft detail",
+            },
+            {
+                "label": "Merchandising scene",
+                "brief": "Clean commercial display with tasteful props, scale cues, and premium styling that keeps the exact source product as the clear main subject.",
+                "must_include": "commercial display, scale cues, exact source product identity",
+            },
         ]
 
     def _flow_operator_prompt_for_trello_card(
@@ -8754,21 +8837,33 @@ exit 1
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
-        target_count = max(1, min(4, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
-        existing_flow_count = max(0, min(4, int(existing_flow_count or 0)))
+        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
+        rerun_full_set = existing_flow_count > 0 and target_count >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
         all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-        shots = all_shots[existing_flow_count : existing_flow_count + target_count] or all_shots[:target_count]
+        shot_start = 0 if rerun_full_set else existing_flow_count
+        shots = all_shots[shot_start : shot_start + target_count]
+        if len(shots) < target_count and all_shots:
+            shots = [*shots, *all_shots[: target_count - len(shots)]]
+        shots = shots or all_shots[:target_count]
         shot_summary = "; ".join(
             f"{position + 1}. {item.get('label')}: {item.get('brief')}"
             for position, item in enumerate(shots)
             if item.get("label") or item.get("brief")
         )
-        resume_note = (
-            f"This Trello card already has {existing_flow_count} Flow output image(s). "
-            f"Generate only the {target_count} missing standalone image(s), not a full new 4-image set."
-            if existing_flow_count
-            else ""
-        )
+        if rerun_full_set:
+            resume_note = (
+                f"This Trello card already has {existing_flow_count} Flow output image(s), but Auto was started again. "
+                f"Create a fresh full {target_count}-image set from the Ready for AI source image; do not reuse old outputs."
+            )
+        elif existing_flow_count:
+            resume_note = (
+                f"This Trello card already has {existing_flow_count} Flow output image(s), but the user explicitly started it again. "
+                f"Create a fresh full {target_count}-image set from the Ready for AI source image; do not reuse old outputs."
+            )
+        else:
+            resume_note = ""
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             design_analysis,
@@ -8815,18 +8910,23 @@ exit 1
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
             selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
-            existing_flow_count = max(0, min(4, int(card.get("_flow_output_count") or 0)))
-            missing_image_count = max(1, self.FLOW_AGENT_DEFAULT_IMAGE_COUNT - existing_flow_count)
+            existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
+            rerun_full_set = existing_flow_count > 0
+            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-            shots = all_shots[existing_flow_count : existing_flow_count + missing_image_count] or all_shots[:missing_image_count]
+            shot_start = 0 if rerun_full_set else existing_flow_count
+            shots = all_shots[shot_start : shot_start + image_count]
+            if len(shots) < image_count and all_shots:
+                shots = [*shots, *all_shots[: image_count - len(shots)]]
+            shots = shots or all_shots[:image_count]
             shot_labels = [str(shot.get("label") or "").strip() for shot in shots if str(shot.get("label") or "").strip()]
             prompt = self._flow_operator_prompt_for_trello_card(
                 request,
                 card,
                 len(expanded) + 1,
                 design_analysis=design_analysis,
-                image_count=missing_image_count,
+                image_count=image_count,
                 existing_flow_count=existing_flow_count,
             )
             expanded.append(
@@ -8841,7 +8941,7 @@ exit 1
                     "index": str(len(expanded) + 1),
                     "notes": (
                         f"{design_analysis} Flow Agent will write the final prompts and generate "
-                        f"{missing_image_count} missing image(s). Google Sheet prompt not required."
+                        f"{image_count} fresh image(s). Google Sheet prompt not required."
                     ),
                     "trello_card_id": card_id,
                     "trello_list_id": card_list_id,
@@ -8854,7 +8954,7 @@ exit 1
                     "shot_labels": shot_labels,
                     "design_analysis": design_analysis,
                     "flow_agent_instruction": True,
-                    "flow_agent_image_count": missing_image_count,
+                    "flow_agent_image_count": image_count,
                     "flow_agent_existing_output_count": existing_flow_count,
                     "generated_by_ai": False,
                     "generated_by_flow_agent": True,
@@ -9084,7 +9184,7 @@ exit 1
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
             source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
-            if len(flow_outputs) >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT:
+            if flow_outputs:
                 continue
             if source_attachments:
                 card["_image_attachments"] = source_attachments
@@ -9140,9 +9240,6 @@ exit 1
             or name.startswith("flow_")
             or stem.startswith("flow-")
             or stem.startswith("flow_")
-            or "generated image" in name
-            or "generated_image" in name
-            or "google flow" in name
         )
 
     def _trello_generated_series_prefix(self, attachment: Dict[str, Any]) -> str:
@@ -10876,7 +10973,7 @@ exit 1
 
         async def _compat_set_count(_self: Any, page: Any, count: int) -> bool:
             await _compat_open_settings_panel(_self, page)
-            return await _compat_click_menu_tab(page, [f"x{max(1, min(4, count))}"])
+            return await _compat_click_menu_tab(page, [f"x{max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, count))}"])
 
         async def _compat_get_video_model_selector(_self: Any, page: Any) -> str:
             await _compat_open_settings_panel(_self, page)
@@ -11394,7 +11491,7 @@ exit 1
 
             interceptor = UIInterceptor()
             interceptor.attach(page)
-            target_count = max(1, min(4, int(count or 1)))
+            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
 
             mode = GenerationMode.FRAME_TO_VIDEO if start_image else GenerationMode.VIDEO
             ratio = AspectRatio.PORTRAIT if aspect == "portrait" else AspectRatio.LANDSCAPE
@@ -11520,7 +11617,7 @@ exit 1
 
             interceptor = UIInterceptor()
             interceptor.attach(page)
-            target_count = max(1, min(4, int(count or 1)))
+            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
 
             ratio = (
                 AspectRatio.PORTRAIT
@@ -11534,7 +11631,7 @@ exit 1
             max_attempts = max(target_count, 1) + 1
             while len(images) < target_count and attempts < max_attempts:
                 remaining = target_count - len(images)
-                batch_target = max(1, min(4, remaining))
+                batch_target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, remaining))
                 attempts += 1
 
                 try:
@@ -13589,8 +13686,10 @@ exit 1
         if request.type == "video" and len(request.reference_image_paths) > 4:
             raise HTTPException(status_code=400, detail="Tối đa 4 ảnh tham chiếu cho một lượt tạo video.")
 
-        if request.type in {"video", "image"} and not 1 <= int(request.count) <= 4:
-            raise HTTPException(status_code=400, detail="Số lượng cho tác vụ tạo nội dung phải nằm trong khoảng 1 đến 4.")
+        if request.type in {"video", "image"}:
+            max_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT if request.type == "image" and self._flow_agent_enabled_for_request(request) else 4
+            if not 1 <= int(request.count) <= max_count:
+                raise HTTPException(status_code=400, detail=f"Số lượng cho tác vụ tạo nội dung phải nằm trong khoảng 1 đến {max_count}.")
 
         if request.type == "image" and self._normalize_image_model(request.model) not in self.IMAGE_MODEL_LABELS:
             raise HTTPException(status_code=400, detail="Model ảnh này hiện chưa được hỗ trợ trong app.")
@@ -14191,7 +14290,7 @@ exit 1
             seen.add(media_name)
 
         images.sort(key=lambda item: str(getattr(item, "_flow_workflow_create_time", "") or ""), reverse=True)
-        return images[: max(1, min(4, int(limit or 1)))]
+        return images[: max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(limit or 1)))]
 
     def _prompt_from_flow_request_data(self, request_data: Dict[str, Any]) -> str:
         prompt_inputs = request_data.get("promptInputs", []) if isinstance(request_data, dict) else []
@@ -14244,7 +14343,7 @@ exit 1
         fallback_workflow_id: str = "",
         settle_s: float = 4.0,
     ) -> List[Any]:
-        target = max(1, min(4, int(target_count or 1)))
+        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
         deadline = time.monotonic() + max(5.0, float(timeout_s or 30))
         settle_window = max(1.0, float(settle_s or 4.0))
         best: List[Any] = []
@@ -14338,7 +14437,7 @@ exit 1
                     "seed": random.randint(0, 2**31 - 1),
                     "imageInputs": list(image_inputs),
                 }
-                for _ in range(max(1, min(4, int(count or 1))))
+                for _ in range(max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1))))
             ],
         }
         data = await client._api._fetch(
@@ -14394,7 +14493,7 @@ exit 1
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
-        target_count = max(1, min(4, int(request.count or 1)))
+        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1)))
         if reference_media_names:
             return await self._generate_image_edit_result(
                 client,
@@ -14425,7 +14524,7 @@ exit 1
                 raise RuntimeError(
                     "Flow API dang chan nhanh ghep nhieu anh, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
                 )
-            target_count = max(1, min(4, int(request.count or 1)))
+            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1)))
             flow_agent_enabled = self._flow_agent_enabled_for_request(request)
             source_workflow_id = str(request.workflow_id or "").strip()
             if flow_agent_enabled and not source_workflow_id:
@@ -14497,7 +14596,7 @@ exit 1
             request.prompt,
             model=self._image_ui_model_label(request.model),
             aspect=request.aspect,
-            count=max(1, min(4, int(request.count or 1))),
+            count=max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1))),
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
         )
 
@@ -14535,15 +14634,47 @@ exit 1
                 "label": "alternate angle, flat lay, or gift-ready merchandising image",
                 "brief": (
                     "Make a clearly different merchandising image: overhead flat lay, three-quarter/side/back angle, folded/packaged view, or gift-ready presentation. "
-                    "Use a new layout with tasteful props such as ribbon, box, tissue paper, craft tools, tag, books, toys, or theme-matching decor. "
+                    "Use a new layout with tasteful props such as ribbon, box, tissue paper, craft tools, books, toys, or theme-matching decor. "
                     "Reveal construction, scale, packaging, or alternate detail that the previous shots do not show."
                 ),
                 "must_not": "Do not repeat the macro, front hero, or lifestyle composition; do not place the product in the same pose/background again.",
             },
+            {
+                "label": "overhead flat lay story image",
+                "brief": (
+                    "Make an overhead flat lay with the product arranged neatly on linen, light wood, or a clean studio surface. "
+                    "Add tasteful props that support the product story such as thread, ribbon, toys, tools, flowers, packaging, or theme-matching decor."
+                ),
+                "must_not": "Do not make a collage or repeat the first hero composition.",
+            },
+            {
+                "label": "premium gift-ready image",
+                "brief": (
+                    "Make a gift-ready or packaging scene with tissue paper, ribbon, box, basket, or folded presentation. "
+                    "The product must still be clearly visible and feel handmade, premium, and ready to sell."
+                ),
+                "must_not": "Do not hide the product inside packaging; do not change the source design.",
+            },
+            {
+                "label": "hands sewing or embroidering image",
+                "brief": (
+                    "Make a close commercial craft scene with human hands actively sewing or embroidering the selected product. "
+                    "Show needle and thread, keep hands realistic, and preserve the exact product shape, fabric, color, motif, print, or embroidery placement."
+                ),
+                "must_not": "Do not change the product design; do not create extra incorrect fingers or hands covering the key motif.",
+            },
+            {
+                "label": "commercial merchandising display image",
+                "brief": (
+                    "Make a clean ecommerce merchandising display with tasteful props, scale cues, and premium styling. "
+                    "Keep the exact source product as the clear main subject and make this composition visibly different from the other seven images."
+                ),
+                "must_not": "Do not repeat a previous background, camera angle, or prop layout.",
+            },
         ]
 
     def _flow_agent_multi_image_prompt(self, prompt: str, total: int) -> str:
-        total = max(1, min(4, int(total or 1)))
+        total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(total or 1)))
         shot_specs = self._flow_agent_shot_specs()[:total]
         shot_lines = " ".join(
             f"{index}. {shot['label']}: {shot['brief']} Negative direction: {shot['must_not']}"
@@ -14557,7 +14688,8 @@ exit 1
             f"CURRENT SHOT PLAN: {shot_lines} "
             "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
             "If two ideas look like the same product-on-table view, change one before generating. "
-            "Do NOT create a 4-frame grid, contact sheet, collage, storyboard, multi-panel layout, or four images inside one canvas. "
+            f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
+            f"{self._flow_agent_no_tag_label_rule()} "
             "Use the attached Trello source product image as the reference for every output. "
             "Keep every output 1:1 square, commercial product photography, and consistent with the same product identity."
         )
@@ -14585,6 +14717,7 @@ exit 1
             raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
         ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
+        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
         page = await client._bm.page()
         project_url = self._project_url(client.project_id)
         edit_url = f"{project_url}/edit/{quote(resolved_workflow_id, safe='')}" if resolved_workflow_id else project_url
@@ -14616,9 +14749,9 @@ exit 1
         try:
             await client._ui.open_settings_panel(page)
             await client._ui.select_image_model(page, self._image_ui_model_label(model))
-            await client._ui.set_count(page, max(1, min(4, int(count or 1))))
+            await client._ui.set_count(page, target_count)
             if job_id:
-                await self.store.append_log(job_id, f"Fallback UI Flow: đã đặt số lượng ảnh x{max(1, min(4, int(count or 1)))}.")
+                await self.store.append_log(job_id, f"Fallback UI Flow: đã đặt số lượng ảnh x{target_count}.")
         except Exception as settings_exc:
             if job_id:
                 await self.store.append_log(
@@ -14821,7 +14954,7 @@ exit 1
                             client,
                             known_media_before_submit,
                             prompt=prompt,
-                            target_count=max(1, min(4, int(count or 1))),
+                            target_count=target_count,
                             timeout_s=min(120.0, max(20.0, ui_timeout_s / 2)),
                             fallback_workflow_id=resolved_workflow_id,
                         )
@@ -14831,7 +14964,7 @@ exit 1
                                     job_id,
                                     f"Fallback UI Flow: Flow Agent đã tạo {len(images)} ảnh mới trong project.",
                                 )
-                            return images[: max(1, min(4, int(count or 1)))]
+                            return images[:target_count]
                     except Exception as project_exc:
                         if job_id:
                             await self.store.append_log(
@@ -14866,12 +14999,11 @@ exit 1
                 client,
                 known_media_before_submit,
                 prompt=prompt,
-                target_count=max(1, min(4, int(count or 1))),
+                target_count=target_count,
                 timeout_s=ui_timeout_s,
                 fallback_workflow_id=resolved_workflow_id,
             )
-        elif flow_agent_enabled and len(images) < max(1, min(4, int(count or 1))):
-            target_count = max(1, min(4, int(count or 1)))
+        elif flow_agent_enabled and len(images) < target_count:
             if job_id:
                 await self.store.append_log(
                     job_id,
@@ -14915,7 +15047,7 @@ exit 1
 
         if not images:
             raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
-        return images[: max(1, min(4, int(count or 1)))]
+        return images[:target_count]
 
     def _flow_agent_enabled_for_request(self, request: CreateJobRequest) -> bool:
         enabled = self._config_bool(getattr(request, "flow_agent_enabled", True), default=True)
@@ -15535,8 +15667,10 @@ exit 1
                         return found;
                       };
                       const bodyText = document.body?.innerText || '';
-                      const isApproveLabel = (label) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm/i.test(label)
-                        && !/Từ\\s*chối|Tu\\s*choi|Reject|Cancel|không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
+                      const isApproveLabel = (label) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|Run|Start/i.test(label)
+                        && !/Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|không\\s*cho\\s*phép|khong\\s*cho\\s*phep|không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
+                      const isNegativeLabel = (label) => /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep/i.test(label)
+                        && !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
                       const approveButtons = deepQuery('button, [role="button"]')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
@@ -15553,9 +15687,26 @@ exit 1
                         })
                         .filter(({ label, rect }) => label.length <= 120 && isApproveLabel(label) && rect.width <= 420 && rect.height <= 140)
                         .sort((a, b) => ((a.rect.width * a.rect.height) - (b.rect.width * b.rect.height)) || (b.rect.right - a.rect.right));
-                      const approve = approveButtons[0] || textCandidates[0];
+                      const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
+                      const dialogRoots = deepQuery('[role="dialog"], [aria-modal="true"], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane')
+                        .filter(visible)
+                        .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                        .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.right - a.rect.right));
+                      const approvalDialogRoots = dialogRoots.filter((root) => {
+                        const text = `${root.label || ''} ${root.el?.innerText || ''}`;
+                        return /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(text);
+                      });
+                      const dialogFallbackButtons = waiting
+                        ? approvalDialogRoots.flatMap((root) =>
+                            Array.from(root.el.querySelectorAll('button, [role="button"]'))
+                              .filter(visible)
+                              .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                          )
+                            .filter(({ label, rect }) => !isNegativeLabel(label) && rect.width >= 32 && rect.height >= 24 && rect.width <= 360 && rect.height <= 120)
+                            .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.right - a.rect.right))
+                        : [];
+                      const approve = approveButtons[0] || textCandidates[0] || dialogFallbackButtons[0];
                       if (!approve) {
-                        const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
                         return { ok: false, waiting, detail: waiting ? 'approval text visible, approve button not found' : 'approval dialog not visible' };
                       }
                       const rememberControls = deepQuery('input[type="checkbox"], input[type="radio"], [role="checkbox"], [role="radio"], label, button, [role="button"], div')
