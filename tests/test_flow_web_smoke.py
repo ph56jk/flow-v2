@@ -650,7 +650,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         attach_url.assert_called_once()
         self.assertEqual("abc123", attach_url.call_args.args[2])
-        self.assertTrue(attach_url.call_args.args[5])
+        self.assertFalse(attach_url.call_args.args[5])
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
@@ -901,6 +901,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(b"upscaled-jpeg-bytes", attach_bytes.call_args.args[3])
         self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
         self.assertEqual("abc123", attach_bytes.call_args.args[2])
+        self.assertFalse(attach_bytes.call_args.args[6])
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
@@ -1038,7 +1039,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_retries_file_upload_without_cover_when_preview_generation_fails(self) -> None:
+    def test_trello_archive_file_upload_does_not_set_cover(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
                 TrelloConfigUpdateRequest(
@@ -1060,19 +1061,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         with patch.object(
             self.service,
             "_trello_attach_file_bytes",
-            side_effect=[
-                RuntimeError('Trello API lỗi 400: {"message":"Failed to generate previews for attachment to set as cover"}'),
-                {"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
-            ],
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
         ) as attach_bytes, patch.object(
             self.service,
             "_trello_attach_url",
         ) as attach_url:
             result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
 
-        self.assertEqual(2, attach_bytes.call_count)
-        self.assertTrue(attach_bytes.call_args_list[0].args[6])
-        self.assertFalse(attach_bytes.call_args_list[1].args[6])
+        attach_bytes.assert_called_once()
+        self.assertFalse(attach_bytes.call_args.args[6])
         attach_url.assert_not_called()
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
@@ -1111,7 +1108,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
 
-    def test_trello_archive_retries_url_upload_without_cover_when_preview_generation_fails(self) -> None:
+    def test_trello_archive_url_upload_does_not_set_cover(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
                 TrelloConfigUpdateRequest(
@@ -1130,16 +1127,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         with patch.object(
             self.service,
             "_trello_attach_url",
-            side_effect=[
-                RuntimeError('Trello API lỗi 400: {"message":"Failed to generate previews for attachment to set as cover"}'),
-                {"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
-            ],
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
         ) as attach_url:
             result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
 
-        self.assertEqual(2, attach_url.call_count)
-        self.assertTrue(attach_url.call_args_list[0].args[5])
-        self.assertFalse(attach_url.call_args_list[1].args[5])
+        attach_url.assert_called_once()
+        self.assertFalse(attach_url.call_args.args[5])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 

@@ -7641,7 +7641,8 @@ exit 1
         )
         if list_id and board_id:
             list_id = await asyncio.to_thread(self._trello_resolve_board_list_id, key, token, board_id, list_id)
-        set_cover = bool(request.trello_set_cover and trello_config.set_cover is not False)
+        # Generated outputs must never replace the card's existing product cover.
+        set_cover = False
         card_url = ""
         created_card = False
 
