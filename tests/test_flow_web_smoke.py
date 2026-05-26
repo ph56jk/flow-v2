@@ -77,6 +77,16 @@ class TempAppPathsMixin:
 class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.start_temp_paths()
+        self._batch_pause_env = patch.dict(
+            os.environ,
+            {
+                "FLOW_AGENT_BATCH_PAUSE_MIN_S": "0",
+                "FLOW_AGENT_BATCH_PAUSE_MAX_S": "0",
+            },
+            clear=False,
+        )
+        self._batch_pause_env.start()
+        self.addCleanup(self._batch_pause_env.stop)
         self.store = StateStore()
         self.service = FlowWebService(self.store)
 
@@ -2820,6 +2830,16 @@ class StateStoreRegressionTests(TempAppPathsMixin, unittest.TestCase):
 class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.start_temp_paths()
+        self._batch_pause_env = patch.dict(
+            os.environ,
+            {
+                "FLOW_AGENT_BATCH_PAUSE_MIN_S": "0",
+                "FLOW_AGENT_BATCH_PAUSE_MAX_S": "0",
+            },
+            clear=False,
+        )
+        self._batch_pause_env.start()
+        self.addCleanup(self._batch_pause_env.stop)
         self.store = StateStore()
         self.service = FlowWebService(self.store)
 
@@ -4395,6 +4415,47 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(0, saved.result["failed"])
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
         self.assertEqual(["Sheet 1/2 · Hoop #1", "Sheet 2/2 · Blanket #2"], [job.title for job in child_jobs])
+
+    async def test_flow_agent_batch_waits_between_image_sets(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        base = CreateJobRequest(type="image", prompt="", count=8)
+        items = [
+            {
+                "prompt": "first card",
+                "product": "First",
+                "trello_card_id": "card-1",
+                "flow_agent_instruction": True,
+                "flow_agent_image_count": 8,
+            },
+            {
+                "prompt": "second card",
+                "product": "Second",
+                "trello_card_id": "card-2",
+                "flow_agent_instruction": True,
+                "flow_agent_image_count": 8,
+            },
+        ]
+        batch = JobRecord(type="batch_image", status="queued", title="batch", input=base.model_dump(mode="json"))
+        await self.store.add_job(batch)
+        seen_prompts: list[str] = []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_prompts.append(child_request.prompt)
+            await self.store.patch_job(job_id, status="completed", result={"count": 8, "mode": "image"})
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ), patch.object(
+            self.service,
+            "_sleep_between_flow_agent_batches",
+            new=AsyncMock(),
+        ) as pause:
+            await self.service._run_prompt_batch(batch.id, base, items)
+
+        self.assertEqual(["first card", "second card"], seen_prompts)
+        pause.assert_awaited_once_with(batch.id, 2, 2)
 
     async def test_trello_prompt_batch_runs_one_matching_prompt_and_dedupes_active_batch(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

@@ -124,6 +124,8 @@ class FlowWebService:
     AI_PROMPT_SUITE_SIZE = 6
     FLOW_AGENT_DEFAULT_IMAGE_COUNT = 8
     FLOW_AGENT_TARGET_OUTPUT_COUNT = 8
+    FLOW_AGENT_BATCH_PAUSE_MIN_S = 60
+    FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
@@ -2501,6 +2503,8 @@ class FlowWebService:
                     current_index=index + 1,
                     current_child_job_id="",
                 )
+                if uses_flow_agent and index < total - 1 and not self._prompt_batch_stop_requested(batch_id):
+                    await self._sleep_between_flow_agent_batches(batch_id, index + 2, total)
 
             final_status = "failed" if failed == total else "completed"
             error = f"{failed}/{total} card bị lỗi trong batch." if failed == total and uses_flow_agent else f"{failed}/{total} prompt bị lỗi trong batch." if failed == total else ""
@@ -2515,6 +2519,47 @@ class FlowWebService:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(batch_id, status="failed", error=detail)
             await self.store.append_log(batch_id, f"Batch sheet thất bại: {detail}")
+
+    def _flow_agent_batch_pause_range_s(self) -> tuple[int, int]:
+        def parse_env(name: str, default: int) -> int:
+            raw = os.getenv(name, "").strip()
+            if not raw:
+                return default
+            try:
+                return int(float(raw))
+            except ValueError:
+                return default
+
+        min_s = parse_env("FLOW_AGENT_BATCH_PAUSE_MIN_S", self.FLOW_AGENT_BATCH_PAUSE_MIN_S)
+        max_s = parse_env("FLOW_AGENT_BATCH_PAUSE_MAX_S", self.FLOW_AGENT_BATCH_PAUSE_MAX_S)
+        min_s = max(0, min(600, min_s))
+        max_s = max(0, min(600, max_s))
+        if max_s < min_s:
+            min_s, max_s = max_s, min_s
+        return min_s, max_s
+
+    async def _sleep_between_flow_agent_batches(self, batch_id: str, next_index: int, total: int) -> None:
+        min_s, max_s = self._flow_agent_batch_pause_range_s()
+        if max_s <= 0:
+            return
+        pause_s = float(random.randint(min_s, max_s))
+        if pause_s <= 0:
+            return
+        pause_label = f"{int(pause_s)}s"
+        await self.store.set_progress_hint(
+            batch_id,
+            stage="polling",
+            detail=f"Nghi {pause_label} truoc khi tao bo anh tiep theo ({next_index}/{total}) de giam loi Flow.",
+        )
+        await self.store.append_log(
+            batch_id,
+            f"Nghi {pause_label} truoc khi tao bo anh tiep theo ({next_index}/{total}) de Flow on dinh hon.",
+        )
+        remaining = pause_s
+        while remaining > 0 and not self._prompt_batch_stop_requested(batch_id):
+            chunk = min(5.0, remaining)
+            await asyncio.sleep(chunk)
+            remaining -= chunk
 
     def _prompt_batch_stop_requested(self, batch_id: str) -> bool:
         job = self.store.get_job(batch_id)
@@ -2997,7 +3042,7 @@ class FlowWebService:
 
                 fresh_items: List[Dict[str, Any]] = []
                 skipped_seen = 0
-                for item in items:
+                for item_offset, item in enumerate(items):
                     item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
                     if item_card_id and item_card_id in seen_card_ids:
                         skipped_seen += 1
@@ -3095,6 +3140,8 @@ class FlowWebService:
                         current_child_job_id="",
                         extra={"seen_card_ids": sorted(seen_card_ids)},
                     )
+                    if item_offset < len(items) - 1 and not self._prompt_batch_stop_requested(batch_id):
+                        await self._sleep_between_flow_agent_batches(batch_id, completed + failed + 1, planned_total)
 
                 if not self._prompt_batch_stop_requested(batch_id):
                     await self.store.append_log(batch_id, f"Đã xử lý xong lô hiện tại. App tiếp tục chờ card mới sau {poll_interval_s}s.")
