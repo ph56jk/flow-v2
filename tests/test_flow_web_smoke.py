@@ -401,6 +401,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("generate exactly 12", items[0]["prompt"])
         self.assertIn("clean clear white neutral daylight", items[0]["prompt"])
         self.assertIn("no yellow/orange/golden/tungsten", items[0]["prompt"])
+        self.assertIn("use a different plausible name for each fabric colorway", items[0]["prompt"])
         self.assertEqual(
             [
                 "Embroidery craft proof",
@@ -451,6 +452,49 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ],
             items[0]["shot_labels"],
         )
+        self.assertIn("different embroidered name", items[0]["prompt"])
+
+    def test_auto_trello_hoop_uses_name_variants_instead_of_colorways(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        cards = [
+            {
+                "id": "hoop-card",
+                "shortLink": "hoop",
+                "idList": "ready",
+                "name": "wedding hoop personalized embroidery",
+                "url": "https://trello.example/c/hoop",
+                "_image_attachments": [{"id": "source-att", "name": "wedding_hoop_emma.jpg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["source-att"],
+                "_flow_output_count": 0,
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertEqual(12, items[0]["flow_agent_image_count"])
+        self.assertIn("embroidery hoop or embroidery frame shape", items[0]["design_analysis"])
+        self.assertNotIn("Pastel fabric colorway lineup", items[0]["shot_labels"])
+        self.assertNotIn("Color option display", items[0]["shot_labels"])
+        self.assertEqual(
+            [
+                "Hoop embroidery craft proof",
+                "Full hoop hero",
+                "Nursery or wall decor scene",
+                "Gift ready hoop presentation",
+                "Hoop flat lay story",
+                "Hoop angle and frame detail",
+                "Hands embroidering hoop",
+                "Personalized name detail",
+                "Different name hoop lineup",
+                "Nursery shelf name variants",
+                "Name customization flat lay",
+                "Four personalized hoop options",
+            ],
+            items[0]["shot_labels"],
+        )
+        self.assertIn("different embroidered names", items[0]["prompt"])
+        self.assertIn("not fabric color", items[0]["prompt"])
 
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
         project_data = {
