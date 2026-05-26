@@ -1332,6 +1332,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual([], cards)
         get_json.assert_not_called()
 
+    def test_trello_extra_source_lists_are_disabled_by_default(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"TRELLO_EXTRA_SOURCE_LIST_NAMES": "Ideas", "TRELLO_ALLOW_EXTRA_SOURCE_LISTS": ""},
+            clear=False,
+        ):
+            self.assertEqual([], self.service._default_trello_extra_source_list_names())
+
+        with patch.dict(
+            os.environ,
+            {"TRELLO_EXTRA_SOURCE_LIST_NAMES": "Ideas", "TRELLO_ALLOW_EXTRA_SOURCE_LISTS": "true"},
+            clear=False,
+        ):
+            self.assertEqual(["Ideas"], self.service._default_trello_extra_source_list_names())
+
     def test_trello_image_card_scan_skips_complete_cards_and_keeps_partial_outputs(self) -> None:
         cards_payload = [
             {"id": "done-card", "name": "Done", "idList": "ready-list"},
@@ -1392,7 +1407,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["generated-source"], cards[0]["_selected_attachment_ids"])
         self.assertEqual(0, cards[0]["_flow_output_count"])
 
-    def test_trello_image_card_scan_prefers_newest_source_attachment(self) -> None:
+    def test_trello_image_card_scan_prefers_oldest_source_attachment(self) -> None:
         cards_payload = [{"id": "card-1", "name": "Product", "idList": "ready-list"}]
         attachments = [
             {"id": "old-source", "name": "old-source.png", "mimeType": "image/png", "date": "2026-05-20T08:00:00.000Z"},
@@ -1404,11 +1419,11 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual(["card-1"], [card["id"] for card in cards])
-        self.assertEqual("new-source", cards[0]["_image_attachments"][0]["id"])
-        self.assertEqual(["new-source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual("old-source", cards[0]["_image_attachments"][0]["id"])
+        self.assertEqual(["old-source"], cards[0]["_selected_attachment_ids"])
         self.assertEqual(1, cards[0]["_flow_output_count"])
 
-    def test_auto_trello_default_scope_includes_ready_and_ideas_lists(self) -> None:
+    def test_auto_trello_default_scope_uses_ready_list_only(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="",
@@ -1462,9 +1477,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 0)
 
-        self.assertEqual(["ready-card", "ideas-card"], [item["trello_card_id"] for item in items])
-        self.assertEqual(["ready-list", "ideas-list"], discovery["list_ids"])
-        self.assertEqual("Ready for AI / Ideas", discovery["list_name"])
+        self.assertEqual(["ready-card"], [item["trello_card_id"] for item in items])
+        self.assertEqual(["ready-list"], discovery["list_ids"])
+        self.assertEqual("Ready for AI", discovery["list_name"])
 
     def test_trello_image_card_scan_counts_numbered_generated_series_as_outputs(self) -> None:
         cards_payload = [
@@ -1797,7 +1812,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, len(paths))
         self.assertTrue(Path(paths[0]).exists())
 
-    def test_download_trello_card_image_attachments_uses_newest_source_by_default(self) -> None:
+    def test_download_trello_card_image_attachments_uses_oldest_source_by_default(self) -> None:
         attachments = [
             {"id": "old-source", "name": "old.png", "url": "https://trello.local/old.png", "mimeType": "image/png", "date": "2026-05-20T08:00:00.000Z"},
             {"id": "new-source", "name": "new.png", "url": "https://trello.local/new.png", "mimeType": "image/png", "date": "2026-05-22T08:00:00.000Z"},
@@ -1819,10 +1834,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "token",
                 "card-1",
                 "job12345",
-                1,
+                4,
             )
 
-        self.assertEqual(["new-source"], downloaded)
+        self.assertEqual(["old-source"], downloaded)
         self.assertEqual(1, len(paths))
         self.assertTrue(Path(paths[0]).exists())
 
@@ -1866,7 +1881,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             hint = self.service._trello_matching_image_card_hint(request, items)
 
-        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list,ideas-list")
+        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list")
         self.assertEqual("ready-card", hint["card_id"])
         self.assertEqual("ready-list", hint["list_id"])
         self.assertEqual("Ready for AI", hint["list_name"])
@@ -2111,7 +2126,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
         self.assertTrue(pin_action["payload"]["run_after_select"])
         self.assertTrue(pin_action["label"].startswith("Chọn & chạy"))
-        self.assertIn("ảnh attachment đầu tiên", pin_action["detail"])
+        self.assertIn("ảnh attachment cũ nhất", pin_action["detail"])
 
     def test_user_assistant_searches_child_shirt_candidates_by_synonym(self) -> None:
         asyncio.run(
@@ -5368,14 +5383,16 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("barcode", seen[0][0])
         self.assertNotIn("name tag", seen[0][0])
 
-    async def test_auto_trello_runs_explicit_card_outside_ready(self) -> None:
+    async def test_auto_trello_rejects_explicit_card_outside_ready(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        await self.store.replace_trello_config(TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list"))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="làm một bộ ảnh sản phẩm này",
                 count=1,
                 trello_board_id="https://trello.com/b/board123/demo-board",
+                trello_list_id="ideas-list",
                 trello_card_id="outside-card",
                 trello_attachment_ids=["att-1"],
                 automation_graph={
@@ -5384,7 +5401,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                             "id": "trello-source-1",
                             "type": "trello_source",
                             "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board", "trelloList": "ideas-list"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
@@ -5405,12 +5422,6 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 {"id": "att-2", "name": "wrong-apron.png", "mimeType": "image/png"},
             ],
         }
-        seen: list[tuple[str, list[str]]] = []
-
-        async def fake_run_flow_job(job_id, child_request):
-            seen.append((child_request.trello_card_id, list(child_request.trello_attachment_ids)))
-            await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
-
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
             self.service,
             "get_auth_status",
@@ -5435,22 +5446,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             self.service,
             "_trello_list_name",
             return_value="Ideas",
-        ), patch.object(
-            self.service,
-            "_run_flow_job",
-            side_effect=fake_run_flow_job,
         ):
-            batch = await self.service.enqueue_prompt_batch(request)
-            await self.service._tasks[batch.id]
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service.enqueue_prompt_batch(request)
 
         image_cards.assert_not_called()
-        saved = self.store.get_job(batch.id)
-        self.assertEqual("completed", saved.status)
-        self.assertEqual("ideas-list", saved.result["trello_source_hint"]["list_id"])
-        self.assertEqual("outside-card", saved.input["items"][0]["trello_card_id"])
-        self.assertEqual(["att-1"], saved.input["items"][0]["trello_attachment_ids"])
-        self.assertTrue(seen)
-        self.assertTrue(all(card_id == "outside-card" and attachment_ids == ["att-1"] for card_id, attachment_ids in seen))
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("Ready for AI", str(ctx.exception.detail))
 
     async def test_auto_trello_ai_suite_for_apron_includes_hand_embroidery_shot(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

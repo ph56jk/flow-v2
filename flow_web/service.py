@@ -150,7 +150,7 @@ class FlowWebService:
     TRELLO_TIMEOUT_S = 30
     TRELLO_UPSCALE_LONG_EDGE_PX = 2048
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
-    DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ("Ideas",)
+    DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ()
     DEFAULT_TRELLO_REVIEW_LIST_NAME = "Content Review"
     DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
     DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
@@ -4445,7 +4445,7 @@ class FlowWebService:
                     "detail": (
                         f"Card có {item.get('image_count') or 0} ảnh attachment; "
                         + (
-                            "app sẽ tự dùng ảnh attachment đầu tiên để chạy."
+                            "app sẽ tự dùng ảnh attachment cũ nhất để chạy."
                             if first_attachment_id
                             else (f"đang ở {self._trello_source_scope_label()}." if in_ready else "app sẽ chạy trực tiếp card đã chọn, không tự lấy card khác.")
                         )
@@ -6968,10 +6968,10 @@ exit 1
             or os.getenv("TRELLO_CARD_ID", "")
         )
         raw_list_id = (
-            module_request.trello_list_id
-            or request.trello_list_id
-            or trello_config.list_id
+            trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
+            or module_request.trello_list_id
+            or request.trello_list_id
         )
         key, token = self._trello_credentials()
         if not key or not token:
@@ -8144,7 +8144,7 @@ exit 1
             image_attachments = selected_attachments
         else:
             if source_attachments:
-                image_attachments = source_attachments
+                image_attachments = source_attachments[:1]
             elif generated_attachments:
                 raise RuntimeError(
                     "Card Trello này chỉ còn ảnh output cũ của Flow, không có ảnh nguồn mới để làm reference."
@@ -8222,9 +8222,9 @@ exit 1
         if not board_id:
             return {}
         raw_list_id = (
-            request.trello_list_id
-            or trello_config.list_id
+            trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
+            or request.trello_list_id
         )
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
         if not list_ids:
@@ -8258,9 +8258,9 @@ exit 1
             or os.getenv("TRELLO_CARD_ID", "")
         )
         raw_list_id = (
-            request.trello_list_id
-            or trello_config.list_id
+            trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
+            or request.trello_list_id
         )
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id) if board_id else []
         list_id = list_ids[0] if list_ids else self._normalize_trello_id(raw_list_id)
@@ -8419,6 +8419,9 @@ exit 1
         return os.getenv("TRELLO_REVIEW_LIST_NAME", self.DEFAULT_TRELLO_REVIEW_LIST_NAME).strip() or self.DEFAULT_TRELLO_REVIEW_LIST_NAME
 
     def _default_trello_extra_source_list_names(self) -> List[str]:
+        allow_extra = os.getenv("TRELLO_ALLOW_EXTRA_SOURCE_LISTS", "").strip().lower() in {"1", "true", "yes", "on"}
+        if not allow_extra:
+            return []
         raw = os.getenv("TRELLO_EXTRA_SOURCE_LIST_NAMES", ",".join(self.DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES))
         names: List[str] = []
         seen: set[str] = set()
@@ -8616,20 +8619,19 @@ exit 1
             raise RuntimeError("Auto Trello cần Board URL/Board ID để tìm card có ảnh.")
 
         raw_list_id = (
-            request.trello_list_id
-            or trello_config.list_id
+            trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
+            or request.trello_list_id
         )
         explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
         selected_attachment_ids = self._normalize_trello_attachment_ids(request.trello_attachment_ids)
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
         list_id = list_ids[0] if list_ids else ""
         if not list_ids:
-            if not explicit_card_id:
-                raise RuntimeError(
-                    f"Auto Trello chỉ quét cột {self._trello_source_scope_label()}. "
-                    "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
-                )
+            raise RuntimeError(
+                f"Auto Trello chỉ quét cột {self._trello_source_scope_label()}. "
+                "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
+            )
         if explicit_card_id:
             selected_card = self._trello_image_card_by_id(key, token, explicit_card_id)
             if not selected_card:
@@ -8642,8 +8644,14 @@ exit 1
                     "Ảnh Trello đã chọn không nằm trên card đã chọn hoặc không phải attachment ảnh. "
                     "App đã dừng để tránh dùng nhầm ảnh khác trong card."
                 )
-            cards = [selected_card]
             card_list_id = self._normalize_trello_id(str(selected_card.get("idList") or ""))
+            allowed_list_ids = set(list_ids)
+            if allowed_list_ids and card_list_id not in allowed_list_ids:
+                raise RuntimeError(
+                    f"Card Trello đã chọn không nằm trong cột {self._trello_source_scope_label()}; "
+                    "Auto Trello đã dừng để chỉ lấy card trong Ready for AI."
+                )
+            cards = [selected_card]
             if card_list_id:
                 list_id = card_list_id
         else:
@@ -9783,7 +9791,7 @@ exit 1
             else:
                 source_attachments.append(item)
 
-        source_attachments = self._sort_trello_attachments_by_date(source_attachments, newest_first=True)
+        source_attachments = self._sort_trello_attachments_by_date(source_attachments)
         flow_outputs = self._sort_trello_attachments_by_date(flow_outputs)
         return source_attachments, flow_outputs
 
