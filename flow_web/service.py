@@ -8624,7 +8624,6 @@ exit 1
             or request.trello_list_id
         )
         explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
-        selected_attachment_ids = self._normalize_trello_attachment_ids(request.trello_attachment_ids)
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
         list_id = list_ids[0] if list_ids else ""
         if not list_ids:
@@ -8638,11 +8637,6 @@ exit 1
                 raise RuntimeError(
                     "Card Trello đã chọn chưa có attachment ảnh hoặc app không đọc được card đó. "
                     "App đã dừng để tránh lấy nhầm ảnh từ card khác."
-                )
-            if selected_attachment_ids and not self._select_trello_card_attachments(selected_card, selected_attachment_ids):
-                raise RuntimeError(
-                    "Ảnh Trello đã chọn không nằm trên card đã chọn hoặc không phải attachment ảnh. "
-                    "App đã dừng để tránh dùng nhầm ảnh khác trong card."
                 )
             card_list_id = self._normalize_trello_id(str(selected_card.get("idList") or ""))
             allowed_list_ids = set(list_ids)
@@ -8713,6 +8707,7 @@ exit 1
                         **item,
                         "trello_card_id": card_id,
                         "trello_list_id": card_list_id,
+                        "trello_attachment_ids": self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or []),
                         "trello_card_name": hint["card_name"],
                         "trello_card_url": hint["card_url"],
                     }

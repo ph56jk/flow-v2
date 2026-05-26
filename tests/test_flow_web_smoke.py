@@ -1481,6 +1481,46 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["ready-list"], discovery["list_ids"])
         self.assertEqual("Ready for AI", discovery["list_name"])
 
+    def test_auto_trello_explicit_card_ignores_stale_attachment_id_for_oldest_source(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="board123",
+            trello_list_id="ready-list",
+            trello_card_id="ready-card",
+            trello_attachment_ids=["new-source"],
+        )
+        card = {
+            "id": "ready-card",
+            "shortLink": "ready",
+            "idList": "ready-list",
+            "name": "ready product",
+            "url": "https://trello.example/c/ready",
+            "_image_attachments": [
+                {"id": "old-source", "name": "old.jpg", "mimeType": "image/jpeg", "date": "2026-05-20T08:00:00.000Z"},
+                {"id": "new-source", "name": "new.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T08:00:00.000Z"},
+            ],
+            "_selected_attachment_ids": ["old-source"],
+            "_flow_output_count": 0,
+        }
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_card_by_id",
+            return_value=card,
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ):
+            items, _discovery = self.service._trello_prompt_items_for_image_cards(request, [], 0)
+
+        self.assertEqual(["old-source"], items[0]["trello_attachment_ids"])
+
     def test_trello_image_card_scan_counts_numbered_generated_series_as_outputs(self) -> None:
         cards_payload = [
             {"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"},
