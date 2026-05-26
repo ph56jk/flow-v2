@@ -7651,6 +7651,8 @@ exit 1
                 "Accept changes in scene, camera angle, styling, props, fabric colorway, and presentation.",
                 "Reject any output whose main product category, silhouette, construction, motif/design, embroidered/printed text, personalized name, material identity, or source product family does not match the source.",
                 "Reject if the output appears to come from another Trello card or another product, even if it is visually high quality.",
+                "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
+                "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
                 "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
                 f"Source card/product title: {request.prompt_product or request.title or ''}",
                 f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
@@ -8937,6 +8939,41 @@ exit 1
                 any(term in normalized for term in ("hoop", "embroidery_hoop", "wedding_hoop", "embroidery_frame", "khung_theu", "vong_theu"))
                 or any(term in compact for term in ("embroideryhoop", "weddinghoop", "khungtheu", "vongtheu", "hoopswithphotos"))
             ),
+            "is_pennant": (
+                any(
+                    term in normalized
+                    for term in (
+                        "pennant",
+                        "banner",
+                        "flag",
+                        "wall_hanging",
+                        "hanging_banner",
+                        "nursery_banner",
+                        "nursery_pennant",
+                        "co_treo",
+                        "co_vai",
+                        "co_theu",
+                        "banner_treo",
+                        "co_trang_tri",
+                    )
+                )
+                or any(
+                    term in compact
+                    for term in (
+                        "pennantshaped",
+                        "pennantbanner",
+                        "wallhanging",
+                        "hangingbanner",
+                        "nurserybanner",
+                        "nurserypennant",
+                        "cotreotuong",
+                        "covaitheu",
+                        "cotheu",
+                        "bannertrangtri",
+                    )
+                )
+                or ("co" in tokens and bool({"treo", "vai", "theu", "banner", "trang", "tri", "tuong"} & tokens))
+            ),
             "is_pillowcase": any(
                 term in normalized
                 for term in ("goi", "vo_goi", "vỏ_gối", "pillow", "pillowcase", "cushion", "baby_pillow")
@@ -8983,6 +9020,10 @@ exit 1
         product_bits: List[str] = []
         if signals.get("is_apron"):
             product_bits.append("apron silhouette, chest bib, waist tie, shoulder/neck straps, hem length, and fit")
+        elif signals.get("is_pennant"):
+            product_bits.append(
+                "pennant/banner wall hanging product, flat hanging fabric panel, top dowel or rod, cord/string hanger, straight side seams, pointed V bottom, flat linen surface, embroidered motif/name placement, and wall decor scale"
+            )
         elif signals.get("is_doll"):
             product_bits.append("doll body shape, face, hair/clothing/accessories, fabric texture, proportions, and collectible toy identity")
         elif signals.get("is_plush"):
@@ -9133,6 +9174,47 @@ exit 1
             },
         ]
 
+    def _flow_operator_pennant_colorway_variant_shots(self) -> List[Dict[str, str]]:
+        palette = "ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow"
+        return [
+            {
+                "label": "Pennant fabric colorway lineup",
+                "brief": (
+                    f"Clean white-daylight ecommerce lineup showing three to four embroidered pennant/banner wall hangings in {palette}. "
+                    "Every variant must stay a flat hanging pennant with the same top dowel/rod, cord hanger, straight side seams, pointed V bottom, motif placement, stitch texture, and wall-hanging scale. "
+                    "Only if the source image visibly contains an embroidered/personalized name, use a different plausible embroidered name on each pennant while preserving the same lettering style; otherwise keep every pennant nameless. "
+                    "Do not turn any variant into a pillow, cushion, blanket, hoop, shirt, or framed print."
+                ),
+                "must_include": "multiple pennant/banner wall hangings, pastel fabric colors, same dowel cord and V bottom, different names only if source has a name, no pillow or cushion product",
+            },
+            {
+                "label": "Nursery wall colorway trio",
+                "brief": (
+                    "Bright white nursery wall or shelf display with three coordinated pennant/banner color options hanging from small dowels. "
+                    "Keep the banner flat, thin, and wall-mounted; preserve the source motif/name style and embroidery texture. "
+                    "Pillows, toys, shelves, or blankets may appear only as plain background props and must not carry the source design."
+                ),
+                "must_include": "pennants hanging on wall, three pastel variants, same source motif/name style, clean white daylight, props without copied embroidery",
+            },
+            {
+                "label": "Pennant material swatch flat lay",
+                "brief": (
+                    "Overhead flat lay with the selected pennant/banner wall hanging beside folded pastel fabric swatches, thread, needle, and small craft tools. "
+                    "The main product must remain a flat pennant with top rod/cord and pointed V bottom visible; fabric swatches are props only and must not become separate embroidered products."
+                ),
+                "must_include": "flat pennant with dowel and V bottom, fabric swatches, thread texture, no tags, no pillow/cushion",
+            },
+            {
+                "label": "Four pennant option display",
+                "brief": (
+                    "Polished ecommerce display with four real pennant/banner wall hanging options arranged naturally as separate hanging fabric flags, not a collage. "
+                    "Preserve the source product construction, thin fabric panel, dowel, cord hanger, pointed bottom, embroidery motif, and handmade stitch quality while varying fabric color. "
+                    "Never place the source motif or name onto a pillow, cushion, blanket, tote, shirt, hoop, or other product."
+                ),
+                "must_include": "four pennant options, same construction, pastel color options, wall hanging product only, no design transferred to other products",
+            },
+        ]
+
     def _flow_operator_shot_suite_for_trello_card(
         self,
         request: CreateJobRequest,
@@ -9188,6 +9270,62 @@ exit 1
                     "must_include": "kitchen prep context, embroidery visible, premium product styling",
                 },
                 *self._flow_operator_colorway_variant_shots("apron"),
+            ]
+
+        if signals.get("is_pennant"):
+            return [
+                {
+                    "label": "Pennant embroidery craft proof",
+                    "brief": (
+                        "Extreme macro close-up of the selected pennant/banner embroidery on the flat fabric panel, showing raised thread fibers, stitch direction, fabric weave, edge seam, and handmade irregularities. "
+                        "Do not show a pillow/cushion carrying the design."
+                    ),
+                    "must_include": "flat pennant fabric, visible embroidery stitches, edge seam, source motif/name, no pillow design transfer",
+                },
+                {
+                    "label": "Full hanging pennant hero",
+                    "brief": (
+                        "Clean full-front product hero shot of the complete pennant/banner wall hanging: flat rectangular fabric panel, top dowel/rod, cord/string hanger, straight side seams, pointed V bottom, and exact embroidery layout fully visible."
+                    ),
+                    "must_include": "full pennant/banner, top dowel, cord hanger, V bottom, exact source design, clean white daylight",
+                },
+                {
+                    "label": "Nursery wall decor scene",
+                    "brief": (
+                        "Bright white nursery wall scene with the pennant/banner hanging naturally as the main product. "
+                        "Background props such as crib, shelf, toy, or plain cushion are allowed only if they stay secondary and do not contain the source motif, name, or embroidery."
+                    ),
+                    "must_include": "pennant hanging on wall, design visible, plain background props only, white balanced nursery light",
+                },
+                {
+                    "label": "Side seam and hanging detail",
+                    "brief": "Three-quarter close view showing the pennant top dowel, cord hanger, fabric thickness, side seam, bottom point, and raised embroidery depth while preserving the flat banner shape.",
+                    "must_include": "dowel, cord, side seam, V bottom, embroidery depth, flat wall hanging construction",
+                },
+                {
+                    "label": "Pennant flat lay styling",
+                    "brief": "Overhead flat lay of the full pennant/banner arranged on clean white linen or light wood with matching thread, needle, small scissors, and tasteful nursery craft props.",
+                    "must_include": "full flat pennant, top rod and V bottom visible, craft props, source design unchanged",
+                },
+                {
+                    "label": "Gift ready pennant presentation",
+                    "brief": (
+                        "Premium gift-ready scene with the pennant/banner folded partly open or laid beside tissue paper, ribbon, and a box while keeping the top rod, cord, pointed bottom, and embroidery visible. "
+                        "No hang tags, loose labels, or copied design on other products."
+                    ),
+                    "must_include": "gift presentation, pennant visible, dowel/cord, no tags, no pillow/cushion with motif",
+                },
+                {
+                    "label": "Hands embroidering pennant",
+                    "brief": "Close commercial craft scene with human hands actively sewing or embroidering the selected pennant/banner fabric, needle and thread visible, while preserving the exact motif/name placement, fabric color, edge seams, and flat banner construction.",
+                    "must_include": "human hands sewing or embroidering, pennant fabric, needle and thread, exact source design",
+                },
+                {
+                    "label": "Personalized pennant detail",
+                    "brief": "Commercial close vignette focused on the embroidered name or motif on the pennant/banner, with fabric weave, stitch depth, and clean white daylight; the product remains a flat hanging flag, not a cushion.",
+                    "must_include": "personalized embroidery detail, flat pennant fabric, stitch texture, no cushion/pillow product",
+                },
+                *self._flow_operator_pennant_colorway_variant_shots(),
             ]
 
         if signals.get("is_doll") or signals.get("is_plush"):
@@ -9441,6 +9579,7 @@ exit 1
         query = self._trello_auto_search_query(request)
         card_description_note = self._flow_operator_trello_card_description_note(card)
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
+        signals = self._flow_operator_card_product_signals(request, card)
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
         target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
@@ -9477,8 +9616,15 @@ exit 1
             (
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a pillow, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category."
+                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary."
             ),
+            (
+                "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
+                "Every main generated product must remain a pennant/banner with a top dowel or rod, cord/string hanger, straight side seams, pointed V bottom, flat linen/fabric panel, and the same embroidery layout. "
+                "Never create a pillow/cushion/blanket/shirt/hoop version of this design, and never place the source motif or name onto a pillow/cushion/blanket/shirt/hoop. "
+                "If a nursery scene includes a pillow, cushion, toy, blanket, or fabric swatch, it must be a plain prop without the source embroidery/design."
+            ) if signals.get("is_pennant") else "",
             resume_note,
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
             f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The full target is {target_output_count} generated output images plus the 1 source image; create only the missing generated outputs for this run.",
@@ -15775,6 +15921,7 @@ exit 1
             "Lighting for every output must be clean clear white neutral daylight with accurate whites; no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             "Every stitched or embroidered area in every output must look like real hand embroidery: raised thread, visible stitch direction, tactile fibers, crisp embroidered edges, and natural thread shadows; never make embroidery look flat printed, painted, digital, vinyl, or sticker-like. "
             "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
+            "Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. "
             "For non-hoop fabric colorways, only if the source image visibly contains an embroidered or personalized name may each fabric color option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
             f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
             f"{self._flow_agent_no_tag_label_rule()} "

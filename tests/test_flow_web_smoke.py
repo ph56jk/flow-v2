@@ -376,6 +376,47 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("baby pillowcase or cushion shape", items[0]["design_analysis"])
         self.assertIn("Hands embroidering pillowcase", items[0]["shot_labels"])
 
+    def test_auto_trello_pennant_card_keeps_banner_category(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        cards = [
+            {
+                "id": "card-pennant",
+                "shortLink": "pennant",
+                "idList": "ready",
+                "name": "Small_pennant-shaped_white_linen_nursery_202605260834.jpeg",
+                "url": "https://trello.example/c/pennant",
+                "_image_attachments": [{"id": "att-pennant", "name": "small_pennant_bear_noah.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-pennant"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertIn("pennant/banner wall hanging product", item["design_analysis"])
+        self.assertIn("Pennant/banner category lock", item["prompt"])
+        self.assertIn("top dowel or rod", item["prompt"])
+        self.assertIn("Never create a pillow/cushion/blanket/shirt/hoop version", item["prompt"])
+        self.assertNotIn("Nursery hero arrangement", item["shot_labels"])
+        self.assertEqual(
+            [
+                "Pennant embroidery craft proof",
+                "Full hanging pennant hero",
+                "Nursery wall decor scene",
+                "Side seam and hanging detail",
+                "Pennant flat lay styling",
+                "Gift ready pennant presentation",
+                "Hands embroidering pennant",
+                "Personalized pennant detail",
+                "Pennant fabric colorway lineup",
+                "Nursery wall colorway trio",
+                "Pennant material swatch flat lay",
+                "Four pennant option display",
+            ],
+            item["shot_labels"],
+        )
+
     def test_auto_trello_partial_card_generates_missing_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
