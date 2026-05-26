@@ -90,6 +90,7 @@ class FlowBrowserProfile:
     index: int
     label: str
     path: Path
+    project_id: str = ""
 
     @property
     def key(self) -> str:
@@ -423,6 +424,8 @@ class FlowWebService:
                     {
                         "label": profile.label,
                         "path": str(profile.path),
+                        "project_id": self._flow_profile_project_id(profile, ""),
+                        "project_url": self._project_url(self._flow_profile_project_id(profile, "")) if self._flow_profile_project_id(profile, "") else "",
                         "active": profile.key == active_flow_profile.key,
                         "quota_blocked": self._flow_profile_is_quota_blocked(profile),
                     }
@@ -1037,10 +1040,12 @@ class FlowWebService:
     async def open_flow_project_surface(self) -> Dict[str, Any]:
         self._assert_windows_interactive_browser_session("mở project Google Flow")
         config = self._normalized_config(self.store.snapshot().config)
-        target_url = self._project_url(config.project_id) if config.project_id else "https://labs.google/fx/vi/tools/flow"
+        profile = self._current_flow_profile()
+        project_id = self._flow_profile_project_id(profile, config.project_id)
+        target_url = self._project_url(project_id) if project_id else "https://labs.google/fx/vi/tools/flow"
         async with self._browser_session_lock:
-            browser = await self._ensure_shared_browser()
-            if config.project_id:
+            browser = await self._ensure_shared_browser(profile)
+            if project_id:
                 await self._repair_placeholder_flow_tabs(browser, target_url)
                 page = await self._acquire_fresh_flow_page(browser, target_url)
                 await self._ensure_valid_flow_project_page(page, target_url)
@@ -1850,7 +1855,8 @@ class FlowWebService:
 
     async def enqueue_job(self, request: CreateJobRequest) -> JobRecord:
         config = self._normalized_config(self.store.snapshot().config)
-        if not config.project_id:
+        profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
+        if not config.project_id and not any(profile.project_id for profile in profiles):
             raise HTTPException(status_code=400, detail="Vui lòng lưu mã project trước.")
         request = self._resolve_job_request(request, config)
         self._validate_job_request(request)
@@ -1879,7 +1885,8 @@ class FlowWebService:
 
     async def enqueue_prompt_batch(self, request: PromptBatchRequest) -> JobRecord:
         config = self._normalized_config(self.store.snapshot().config)
-        if not config.project_id:
+        profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
+        if not config.project_id and not any(profile.project_id for profile in profiles):
             raise HTTPException(status_code=400, detail="Vui lòng lưu mã project trước.")
         if not self.get_auth_status().authenticated:
             raise HTTPException(
@@ -10832,14 +10839,14 @@ exit 1
     ) -> Any:
         FlowClient, _, _, _, _ = self._flow_modules(client_only=True)
         config = self._normalized_config(self.store.snapshot().config)
-        if not config.project_id:
+        profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
+        if not config.project_id and not any(profile.project_id for profile in profiles):
             raise HTTPException(status_code=400, detail="Mã project là bắt buộc.")
         effective_timeout_s = max(30, int(timeout_s or config.generation_timeout_s))
         resolved_workflow_id = workflow_id or config.active_workflow_id or None
 
         if self._should_keep_flow_browser_open(config):
             async with self._browser_session_lock:
-                profiles = self._flow_profile_specs()
                 attempts = max(1, len(profiles))
                 last_quota_error: Exception | None = None
                 for _ in range(attempts):
@@ -10852,11 +10859,14 @@ exit 1
                                 "Hay dang nhap them profile khac, cho quota reset, hoac restart app neu muon bo danh dau tam thoi."
                             ),
                         )
+                    profile_project_id = self._flow_profile_project_id(profile, config.project_id)
+                    if not profile_project_id:
+                        raise HTTPException(status_code=400, detail="Mã project là bắt buộc.")
                     try:
                         browser = await self._ensure_shared_browser(profile)
                         client = await self._build_client_from_shared_browser(
                             browser,
-                            project_id=config.project_id,
+                            project_id=profile_project_id,
                             workflow_id=resolved_workflow_id,
                             timeout_s=effective_timeout_s,
                         )
@@ -10971,6 +10981,8 @@ exit 1
                     )
                 )
 
+        project_map = self._flow_profile_project_map()
+        positional_projects = self._flow_profile_positional_projects()
         deduped: List[FlowBrowserProfile] = []
         seen: set[str] = set()
         for spec in specs:
@@ -10978,8 +10990,61 @@ exit 1
             if key in seen:
                 continue
             seen.add(key)
-            deduped.append(FlowBrowserProfile(index=len(deduped), label=spec.label, path=spec.path))
+            profile_index = len(deduped)
+            project_id = (
+                project_map.get(spec.label.strip().lower(), "")
+                or project_map.get(key, "")
+                or project_map.get(spec.path.name.strip().lower(), "")
+                or (positional_projects[profile_index] if profile_index < len(positional_projects) else "")
+            )
+            deduped.append(
+                FlowBrowserProfile(
+                    index=profile_index,
+                    label=spec.label,
+                    path=spec.path,
+                    project_id=project_id,
+                )
+            )
         return deduped or [FlowBrowserProfile(index=0, label="Flow profile 1", path=self._resolve_flow_profile_path("default"))]
+
+    def _flow_profile_project_entries(self) -> List[str]:
+        raw = (
+            os.getenv("FLOW_CHROME_PROFILE_PROJECTS", "").strip()
+            or os.getenv("FLOW_PROFILE_PROJECTS", "").strip()
+            or os.getenv("GOOGLE_FLOW_PROFILE_PROJECTS", "").strip()
+        )
+        return self._split_flow_profile_env(raw)
+
+    def _flow_profile_project_map(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for entry in self._flow_profile_project_entries():
+            if "=" not in entry:
+                continue
+            key, value = entry.split("=", 1)
+            project_id = self._normalize_project_id(value)
+            if not key.strip() or not project_id:
+                continue
+            raw_key = key.strip().strip('"').strip("'")
+            mapping[raw_key.lower()] = project_id
+            try:
+                mapping[self._resolve_flow_profile_path(raw_key).resolve().as_posix().lower()] = project_id
+                mapping[str(self._resolve_flow_profile_path(raw_key).resolve()).lower()] = project_id
+            except Exception:
+                pass
+        return mapping
+
+    def _flow_profile_positional_projects(self) -> List[str]:
+        projects: List[str] = []
+        for entry in self._flow_profile_project_entries():
+            if "=" in entry:
+                continue
+            project_id = self._normalize_project_id(entry)
+            if project_id:
+                projects.append(project_id)
+        return projects
+
+    def _flow_profile_project_id(self, profile: FlowBrowserProfile, fallback_project_id: str = "") -> str:
+        return self._normalize_project_id(profile.project_id or fallback_project_id)
 
     def _flow_profile_block_seconds(self) -> float:
         raw = os.getenv("FLOW_CHROME_PROFILE_QUOTA_BLOCK_S", "").strip()
@@ -11145,7 +11210,7 @@ exit 1
         browser = BrowserManager(headless=False, profile_dir=selected_profile.path)
         await browser.start()
         config = self.store.snapshot().config
-        project_id = self._normalize_project_id(config.project_id or config.project_url)
+        project_id = self._flow_profile_project_id(selected_profile, self._normalize_project_id(config.project_id or config.project_url))
         target_url = self._project_url(project_id) if project_id else "https://labs.google/fx/tools/flow"
         await self._close_placeholder_flow_tabs(browser, target_url)
         self._shared_browser = browser

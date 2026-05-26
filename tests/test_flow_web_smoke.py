@@ -119,6 +119,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {
                 "FLOW_CHROME_PROFILE_DIRS": f"Main={first};Backup={second}",
+                "FLOW_CHROME_PROFILE_PROJECTS": (
+                    "Backup=https://labs.google/fx/vi/tools/flow/project/4671337a-b32d-468a-a47a-bac90541ca2e"
+                ),
                 "FLOW_CHROME_PROFILE_COUNT": "",
             },
             clear=False,
@@ -128,6 +131,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["Main", "Backup"], [spec.label for spec in specs])
         self.assertEqual(first, specs[0].path)
         self.assertEqual(second, specs[1].path)
+        self.assertEqual("", specs[0].project_id)
+        self.assertEqual("4671337a-b32d-468a-a47a-bac90541ca2e", specs[1].project_id)
 
     def test_prompt_batch_child_request_syncs_trello_graph_scope_to_item(self) -> None:
         base = CreateJobRequest(
@@ -3204,6 +3209,31 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(2, build_client.await_count)
         self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
+
+    async def test_with_client_uses_profile_specific_project_id(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="default-project", headless=False, generation_timeout_s=300))
+        profile = FlowBrowserProfile(
+            index=0,
+            label="Acc2",
+            path=self.temp_root / "acc2-profile",
+            project_id="4671337a-b32d-468a-a47a-bac90541ca2e",
+        )
+        fake_browser = SimpleNamespace()
+        fake_client = SimpleNamespace(name="profile-client")
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=[profile]), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(return_value=fake_browser),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=fake_client),
+        ) as build_client:
+            result = await self.service._with_client(lambda client: asyncio.sleep(0, result=client.name))
+
+        self.assertEqual("profile-client", result)
+        self.assertEqual("4671337a-b32d-468a-a47a-bac90541ca2e", build_client.await_args.kwargs["project_id"])
 
     async def test_open_login_flow_page_opens_new_tab_and_brings_it_to_front(self) -> None:
         page = SimpleNamespace(

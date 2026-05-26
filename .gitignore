@@ -15,6 +15,7 @@ outputs/
 .DS_Store
 data/uploads/*
 data/downloads/*
+data/flow-profiles/*
 data/state.json
 data/_state_dump.json
 .flow-web.log
@@ -22,6 +23,7 @@ data/_state_dump.json
 logs/
 !data/uploads/.gitkeep
 !data/downloads/.gitkeep
+!data/flow-profiles/.gitkeep
 
 # Beads / Dolt files (added by bd init)
 .dolt/

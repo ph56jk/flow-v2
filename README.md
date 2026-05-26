@@ -221,7 +221,10 @@ Tạo file `.env.local` với nội dung:
 # Multi-account Flow Agent fallback. Each path is one separate Chrome profile.
 # Use ; to separate profiles on Windows. The token "default" keeps the normal
 # flow-py profile as the first account.
-# FLOW_CHROME_PROFILE_DIRS=default;data\flow-profiles\account-2;data\flow-profiles\account-3
+# FLOW_CHROME_PROFILE_DIRS=Acc1=default;Acc2=data\flow-profiles\account-2;Acc3=data\flow-profiles\account-3
+# Optional: map each profile to its own Flow project. Profiles without a
+# mapping use the project saved in the app UI.
+# FLOW_CHROME_PROFILE_PROJECTS=Acc2=https://labs.google/fx/vi/tools/flow/project/project-id-2;Acc3=https://labs.google/fx/vi/tools/flow/project/project-id-3
 # FLOW_CHROME_PROFILE_QUOTA_BLOCK_S=86400
 ```
 
