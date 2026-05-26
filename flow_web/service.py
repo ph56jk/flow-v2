@@ -3354,11 +3354,13 @@ class FlowWebService:
             "Before generating, state a compact design analysis of the reference product, then create a numbered shot brief. "
             f"Request exactly {target} separate standalone 1:1 images, generated one by one; never make a collage, contact sheet, grid, or multiple small frames inside one image. "
             "For every shot, specify the subject count, exact product placement, background, props, lighting direction, camera angle, and which source details must stay unchanged. "
-            "Keep all source motifs, embroidery/print placement, names, colors, fabric texture, proportions, and handmade irregularities consistent unless a shot brief explicitly asks for personalized name variants; then vary only the name text while preserving lettering style, stitch quality, motif placement, and product identity. "
+            "Keep all source motifs, embroidery/print placement, names, colors, fabric texture, proportions, and handmade irregularities consistent unless a shot brief explicitly asks for personalized name variants and the source image visibly contains an embroidered/personalized name; then vary only the name text while preserving lettering style, stitch quality, motif placement, and product identity. "
+            "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, clear stitch direction, tactile fibers, crisp embroidered edges, natural thread shadows, and no flat printed, painted, digital, vinyl, or sticker-like texture. "
             "For handmade or embroidered products, include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
             "Use clean clear white neutral daylight for every image: soft bright studio or nursery light, accurate white balance, crisp whites, and no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             "Use airy clean styling, white nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography. "
-            "For fabric products, include pastel colorway variety when the shot plan allows: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow fabric options while preserving the source motif and embroidery style; if the product has an embroidered/personalized name, use a different plausible name for each fabric colorway. "
+            "For fabric products, include pastel colorway variety when the shot plan allows: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow fabric options while preserving the source motif and embroidery style. "
+            "Only if the source image visibly contains an embroidered/personalized name may multi-product, colorway, or hoop variant shots include embroidered names; then use a different plausible name for each product option. If the source has no embroidered name, keep all variants nameless and never add sample names, loose labels, tag cards, or text overlays. "
             + self._flow_agent_no_tag_label_rule()
         )
 
@@ -8825,36 +8827,36 @@ exit 1
                     "brief": (
                         "White-daylight nursery shelf or crib display with three to four pillow/cushion colorways side by side, inspired by the reference examples: "
                         f"{palette}. Keep the same personalized embroidery style, motif scale, stitch texture, and pillow shape while varying the fabric base colors. "
-                        "If there is an embroidered name, use a different plausible name on each fabric color option while keeping the same lettering style."
+                        "Only if the source image visibly contains an embroidered/personalized name, use a different plausible name on each fabric color option while keeping the same lettering style; otherwise keep every color option nameless."
                     ),
-                    "must_include": "multiple pastel fabric colors, different personalized names if names exist, white neutral daylight, same pillow embroidery style, no tag or label",
+                    "must_include": "multiple pastel fabric colors, different personalized names only if the source has an embroidered name, white neutral daylight, same pillow embroidery style, no tag or label",
                 },
                 {
                     "label": "Crib colorway trio",
                     "brief": (
                         "Clean white crib or nursery-bed scene showing a coordinated trio of pillow/cushion color options, such as ivory, blush pink, and mint or pale blue. "
                         "The motif and name style must feel like the same handmade product family, with crisp whites and no yellow cast. "
-                        "If personalized names are visible, assign a different name to each colorway."
+                        "Only if the source image has a visible embroidered/personalized name, assign a different embroidered name to each colorway; otherwise do not add names."
                     ),
-                    "must_include": "crib or nursery bed, three pastel fabric variants, different visible names if applicable, source motif/name style preserved, clean white light",
+                    "must_include": "crib or nursery bed, three pastel fabric variants, different visible names only if source has a name, source motif/name style preserved, clean white light",
                 },
                 {
                     "label": "Pastel swatch flat lay",
                     "brief": (
                         "Overhead merchandising flat lay with the pillow/cushion plus folded fabric swatches and matching embroidery threads in pastel color options. "
                         "Show fabric weave and soft handmade texture clearly in neutral white daylight. "
-                        "If the product is personalized, show different sample names for the color options without adding tag cards or text overlays."
+                        "Only if the source image visibly has an embroidered name, show different embroidered sample names on the product variants; never add tag cards or text overlays."
                     ),
-                    "must_include": "fabric swatches, pastel palette, different personalized names if applicable, embroidery thread, pillow texture, no tags",
+                    "must_include": "fabric swatches, pastel palette, different personalized names only if source has a name, embroidery thread, pillow texture, no tags",
                 },
                 {
                     "label": "Color option display",
                     "brief": (
                         "Ecommerce color-option display with four separate pillow/cushion variants arranged naturally, not as a grid or collage, using pastel fabric colors from the reference examples. "
                         "Keep each option realistic, softly stuffed, and consistent with the source product's motif and embroidery quality. "
-                        "If names appear, each color option should carry a different embroidered name."
+                        "Only if the source image visibly has an embroidered/personalized name, each color option should carry a different embroidered name; otherwise all options must remain nameless."
                     ),
-                    "must_include": "four color options, pastel fabric variety, different embroidered names if applicable, exact handmade style, white balanced light",
+                    "must_include": "four color options, pastel fabric variety, different embroidered names only if source has a name, exact handmade style, white balanced light",
                 },
             ]
         return [
@@ -8863,36 +8865,36 @@ exit 1
                 "brief": (
                     f"Clean white-daylight product lineup showing coordinated {label} fabric colorways in {palette}. "
                     "Keep the exact source product category, motif, print or embroidery style, proportions, and handmade texture; vary fabric base colors when plausible. "
-                    "If the product has an embroidered/personalized name, use a different plausible name on each fabric color option."
+                    "Only if the source image visibly contains an embroidered/personalized name, use a different plausible name on each fabric color option; otherwise keep all variants nameless."
                 ),
-                "must_include": "pastel fabric variety, different personalized names if applicable, source product identity, white neutral daylight, no tag or label",
+                "must_include": "pastel fabric variety, different personalized names only if source has an embroidered name, source product identity, white neutral daylight, no tag or label",
             },
             {
                 "label": "Soft room colorway trio",
                 "brief": (
                     f"Bright white nursery/home/studio scene with three coordinated {label} color options in soft pastel fabric colors. "
                     "The design must look like one product family and must avoid yellow or warm color grading. "
-                    "If personalized names are visible, make each one different while preserving lettering and stitch style."
+                    "Only if the source image visibly has an embroidered/personalized name, make each name different while preserving lettering and stitch style; otherwise do not add names."
                 ),
-                "must_include": "three pastel variants, different names if applicable, white balanced room light, source design preserved",
+                "must_include": "three pastel variants, different names only if source has an embroidered name, white balanced room light, source design preserved",
             },
             {
                 "label": "Pastel swatch flat lay",
                 "brief": (
                     f"Overhead flat lay with the {label} beside folded pastel fabric swatches, matching thread, and restrained craft props. "
                     "Show fabric texture and material options without adding tags, labels, price cards, or text overlays. "
-                    "If name personalization exists, include different embroidered sample names on the product variants rather than on separate labels."
+                    "Only if the source image visibly has a personalized embroidered name, include different embroidered sample names on the product variants rather than on separate labels; otherwise keep variants nameless."
                 ),
-                "must_include": "fabric swatches, pastel palette, different embroidered sample names if applicable, material texture, no tags",
+                "must_include": "fabric swatches, pastel palette, different embroidered sample names only if source has a name, material texture, no tags",
             },
             {
                 "label": "Color option display",
                 "brief": (
                     f"Ecommerce merchandising display with four natural {label} color options arranged as real products, not a collage. "
                     "Preserve the source motif/design quality while varying fabric colors like ivory, pale blue, mint, blush, and butter yellow. "
-                    "If names appear, each fabric color option must have a different embroidered name."
+                    "Only if the source image visibly has an embroidered/personalized name, each fabric color option must have a different embroidered name; otherwise do not add names."
                 ),
-                "must_include": "four color options, different embroidered names if applicable, product family consistency, clean white daylight",
+                "must_include": "four color options, different embroidered names only if source has a name, product family consistency, clean white daylight",
             },
         ]
 
@@ -8902,32 +8904,36 @@ exit 1
                 "label": "Different name hoop lineup",
                 "brief": (
                     "Clean white-daylight lineup of three to four embroidery hoops using the same hoop size, fabric tone, motif style, thread texture, and handmade quality, "
-                    "but with different embroidered names such as Emma, Olivia, Arthur, and Harper. The main variation is the name, not fabric color."
+                    "but only if the source image visibly contains an embroidered/personalized name, use different embroidered names such as Emma, Olivia, Arthur, and Harper. "
+                    "If the source has no embroidered name, show multiple same-style hoop variants without any names. The main variation is personalization/name when allowed, not fabric color."
                 ),
-                "must_include": "multiple embroidery hoops, different embroidered names, same hoop style, no colorway focus, no tags",
+                "must_include": "multiple embroidery hoops, different embroidered names only if source has a name, same hoop style, no colorway focus, no tags",
             },
             {
                 "label": "Nursery shelf name variants",
                 "brief": (
-                    "Bright white nursery shelf or wall display with several personalized embroidery hoops from the same product family, each carrying a different name. "
+                    "Bright white nursery shelf or wall display with several personalized embroidery hoops from the same product family; each may carry a different name only when the source image visibly has an embroidered/personalized name. "
+                    "If the source has no name, keep the hoops nameless. "
                     "Keep motifs, hoop frame, fabric tension, and stitch quality consistent; do not turn this into a pastel fabric color option scene."
                 ),
-                "must_include": "nursery shelf or wall, different names, consistent embroidery hoop design, clean white light",
+                "must_include": "nursery shelf or wall, different names only if source has a name, consistent embroidery hoop design, clean white light",
             },
             {
                 "label": "Name customization flat lay",
                 "brief": (
-                    "Overhead craft flat lay showing the hoop with thread, needle, and small fabric/thread samples while presenting different embroidered name examples on actual hoops. "
+                    "Overhead craft flat lay showing the hoop with thread, needle, and small fabric/thread samples while presenting different embroidered name examples on actual hoops only if the source image visibly has an embroidered name. "
+                    "If the source has no name, present same-style hoop options without names. "
                     "Use the same product design language and avoid separate text cards, tags, or labels."
                 ),
-                "must_include": "different name examples on hoops, craft props, thread texture, no tags or text overlays",
+                "must_include": "different name examples only if source has a name, craft props, thread texture, no tags or text overlays",
             },
             {
                 "label": "Four personalized hoop options",
                 "brief": (
-                    "Ecommerce display with four real embroidery hoop variants arranged naturally, each with a different stitched name while preserving the same motif placement, hoop frame, fabric base, and handmade texture."
+                    "Ecommerce display with four real embroidery hoop variants arranged naturally; use different stitched names only if the source image visibly contains an embroidered/personalized name. "
+                    "If the source has no name, keep every hoop nameless while preserving the same motif placement, hoop frame, fabric base, and handmade texture."
                 ),
-                "must_include": "four personalized name options, same hoop product family, clean white daylight, no fabric colorway emphasis",
+                "must_include": "four personalized name options only if source has a name, same hoop product family, clean white daylight, no fabric colorway emphasis",
             },
         ]
 
@@ -9274,6 +9280,7 @@ exit 1
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
             resume_note,
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
+            f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The full target is {target_output_count} generated output images plus the 1 source image; create only the missing generated outputs for this run.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
             "Lighting and color rule for every output: clean clear white neutral daylight, accurate whites, crisp bright product color, no yellow/orange/golden/tungsten/sepia/beige cast, and no warm color grading.",
@@ -15260,13 +15267,15 @@ exit 1
         correction = (
             f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
             f"{run_scope} "
+            "These generated outputs are in addition to the attached Trello source/reference image; never count the source image as one of the generated outputs. "
             "Each output must be its own separate 1:1 image file, not panels inside one canvas. "
             f"{shot_plan_text}"
             "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
             "If two ideas look like the same product-on-table view, change one before generating. "
             "Lighting for every output must be clean clear white neutral daylight with accurate whites; no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
-            "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with different personalized embroidered name variants while keeping the hoop/fabric/motif style consistent. "
-            "For non-hoop fabric colorways, if an embroidered or personalized name appears, each fabric color option must use a different plausible name while preserving the same lettering and stitch style. "
+            "Every stitched or embroidered area in every output must look like real hand embroidery: raised thread, visible stitch direction, tactile fibers, crisp embroidered edges, and natural thread shadows; never make embroidery look flat printed, painted, digital, vinyl, or sticker-like. "
+            "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
+            "For non-hoop fabric colorways, only if the source image visibly contains an embroidered or personalized name may each fabric color option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
             f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
             f"{self._flow_agent_no_tag_label_rule()} "
             "Use the attached Trello source product image as the reference for every output. "

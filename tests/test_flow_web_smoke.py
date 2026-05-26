@@ -401,7 +401,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("generate exactly 12", items[0]["prompt"])
         self.assertIn("clean clear white neutral daylight", items[0]["prompt"])
         self.assertIn("no yellow/orange/golden/tungsten", items[0]["prompt"])
-        self.assertIn("use a different plausible name for each fabric colorway", items[0]["prompt"])
+        self.assertIn("Every output must make stitched or embroidered areas look genuinely hand embroidered", items[0]["prompt"])
+        self.assertIn("Only if the source image visibly contains an embroidered/personalized name", items[0]["prompt"])
+        self.assertIn("If the source has no embroidered name, keep all variants nameless", items[0]["prompt"])
+        self.assertIn("12 generated output images plus the 1 source image", items[0]["prompt"])
         self.assertEqual(
             [
                 "Embroidery craft proof",
@@ -452,7 +455,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ],
             items[0]["shot_labels"],
         )
-        self.assertIn("different embroidered name", items[0]["prompt"])
+        self.assertIn("Only if the source image visibly has an embroidered/personalized name", items[0]["prompt"])
+        self.assertIn("otherwise all options must remain nameless", items[0]["prompt"])
+
+    def test_auto_trello_ten_output_card_generates_exactly_two_missing_images(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        cards = [
+            {
+                "id": "nearly-complete-card",
+                "shortLink": "nearly",
+                "idList": "ready",
+                "name": "embroidered pillowcase",
+                "url": "https://trello.example/c/nearly",
+                "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["source-att"],
+                "_flow_output_count": 10,
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertEqual(2, items[0]["flow_agent_image_count"])
+        self.assertEqual(10, items[0]["flow_agent_existing_output_count"])
+        self.assertIn("already has 10/12 Flow output", items[0]["prompt"])
+        self.assertIn("Continue the same set by creating exactly 2 new missing image", items[0]["prompt"])
+        self.assertIn("source image is not a generated output", items[0]["prompt"])
+        self.assertEqual(
+            [
+                "Pastel swatch flat lay",
+                "Color option display",
+            ],
+            items[0]["shot_labels"],
+        )
 
     def test_auto_trello_hoop_uses_name_variants_instead_of_colorways(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -493,7 +528,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ],
             items[0]["shot_labels"],
         )
-        self.assertIn("different embroidered names", items[0]["prompt"])
+        self.assertIn("Only if the source image visibly contains an embroidered/personalized name", items[0]["prompt"])
+        self.assertIn("If the source has no name, keep the hoops nameless", items[0]["prompt"])
         self.assertIn("not fabric color", items[0]["prompt"])
 
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
@@ -6069,6 +6105,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("flat lay, or gift-ready merchandising image", prompt)
         self.assertIn("hands sewing or embroidering image", prompt)
         self.assertIn("visibly different from each other", prompt)
+        self.assertIn("real hand embroidery", prompt)
+        self.assertIn("never count the source image as one of the generated outputs", prompt)
+        self.assertIn("if the source has no name, do not invent names", prompt)
         self.assertIn("sticker", prompt)
         self.assertIn("price tag", prompt)
         self.assertIn("barcode", prompt)
@@ -6114,6 +6153,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("using the x4 image setting", second_prompt)
         self.assertIn("pastel fabric colorway lineup image", second_prompt)
         self.assertIn("no yellow, orange, golden-hour", second_prompt)
+        self.assertIn("real hand embroidery", second_prompt)
+        self.assertIn("never count the source image as one of the generated outputs", second_prompt)
+        self.assertIn("if the source has no name, do not invent names", second_prompt)
         pause.assert_awaited_once_with(job.id, 2, 2)
 
     async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
