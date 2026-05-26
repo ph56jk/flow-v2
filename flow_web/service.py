@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
 import ctypes
 import io
@@ -7599,6 +7600,139 @@ exit 1
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
 
+    def _trello_source_validation_required(self, request: CreateJobRequest) -> bool:
+        if request.type != "image" or not request.trello_enabled:
+            return False
+        graph = self._automation_graph_payload(request)
+        return any(
+            isinstance(module, dict)
+            and module.get("enabled")
+            and module.get("type") == "trello_source"
+            for module in graph.get("modules", [])
+        )
+
+    def _inline_gemini_image_part(self, image_bytes: bytes, mime_type: str) -> Dict[str, Any]:
+        mime = str(mime_type or "image/jpeg").strip() or "image/jpeg"
+        return {
+            "inline_data": {
+                "mime_type": mime,
+                "data": base64.b64encode(image_bytes).decode("ascii"),
+            }
+        }
+
+    async def _artifact_validation_image_bytes(
+        self,
+        job_id: str,
+        artifact: JobArtifact,
+        index: int,
+    ) -> tuple[bytes, str]:
+        artifact_url = str(artifact.url or artifact.public_url or "").strip()
+        return await self._trello_artifact_file_bytes(job_id, artifact, index, artifact_url)
+
+    def _gemini_validate_trello_source_artifacts(
+        self,
+        request: CreateJobRequest,
+        source_path: str,
+        generated_items: List[tuple[int, bytes, str]],
+    ) -> Dict[str, Any]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Chưa cấu hình Gemini để kiểm tra ảnh trước khi upload Trello.")
+        source_file = Path(source_path).expanduser()
+        if not source_file.is_file():
+            raise RuntimeError("Không tìm thấy ảnh nguồn Trello local để kiểm tra trước khi upload.")
+
+        source_bytes = source_file.read_bytes()
+        source_mime = mimetypes.guess_type(str(source_file))[0] or "image/jpeg"
+        prompt = "\n".join(
+            [
+                "You are a strict ecommerce QA checker before uploading generated images to Trello.",
+                "Compare SOURCE_IMAGE with each OUTPUT_IMAGE.",
+                "Accept changes in scene, camera angle, styling, props, fabric colorway, and presentation.",
+                "Reject any output whose main product category, silhouette, construction, motif/design, embroidered/printed text, personalized name, material identity, or source product family does not match the source.",
+                "Reject if the output appears to come from another Trello card or another product, even if it is visually high quality.",
+                "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
+                f"Source card/product title: {request.prompt_product or request.title or ''}",
+                f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
+            ]
+        )
+        parts: List[Dict[str, Any]] = [{"text": prompt}, {"text": "SOURCE_IMAGE"}, self._inline_gemini_image_part(source_bytes, source_mime)]
+        for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_TARGET_OUTPUT_COUNT]:
+            parts.append({"text": f"OUTPUT_IMAGE_{index + 1}"})
+            parts.append(self._inline_gemini_image_part(image_bytes, mime))
+
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 512,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Không gọi được Gemini để kiểm tra ảnh: {exc.reason}") from exc
+
+        text = self._extract_gemini_text(body)
+        parsed = self._parse_json_candidate(text)
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
+        return parsed
+
+    async def _validate_trello_source_artifacts_before_upload(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifacts: List[JobArtifact],
+    ) -> None:
+        if not self._trello_source_validation_required(request):
+            return
+        source_path = next((str(path or "").strip() for path in request.reference_image_paths or [] if str(path or "").strip()), "")
+        if not source_path:
+            raise RuntimeError("Trello Source thiếu ảnh nguồn local, app đã dừng trước khi upload để tránh nhầm sản phẩm.")
+        if not artifacts:
+            raise RuntimeError("Flow chưa có ảnh generated hợp lệ, app đã dừng trước khi upload Trello.")
+
+        generated_items: List[tuple[int, bytes, str]] = []
+        for index, artifact in enumerate(artifacts[: self.FLOW_AGENT_TARGET_OUTPUT_COUNT]):
+            image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
+            generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
+
+        result = await asyncio.to_thread(
+            self._gemini_validate_trello_source_artifacts,
+            request,
+            source_path,
+            generated_items,
+        )
+        ok = bool(result.get("ok"))
+        bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
+        reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
+        if not ok or bad_indexes:
+            display_indexes = ", ".join(str(int(item) + 1) for item in bad_indexes if isinstance(item, (int, float))) or "không rõ"
+            raise RuntimeError(
+                f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
+            )
+        await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
+
     async def _archive_trello_artifacts(
         self,
         job_id: str,
@@ -7677,6 +7811,8 @@ exit 1
                 "failed": len(artifacts),
                 "error": "missing_trello_target",
             }
+
+        await self._validate_trello_source_artifacts_before_upload(job_id, request, artifacts)
 
         upload_mode = (trello_config.upload_mode or os.getenv("TRELLO_UPLOAD_MODE", "file")).strip().lower()
         if upload_mode not in {"file", "url"}:
@@ -15335,6 +15471,7 @@ exit 1
             if flow_agent_enabled and not source_workflow_id:
                 raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
+            require_project_media_baseline = self._trello_source_validation_required(request)
             if flow_agent_enabled and target_count > self._flow_agent_max_images_per_run():
                 max_per_run = self._flow_agent_max_images_per_run()
                 run_counts: List[int] = []
@@ -15376,6 +15513,7 @@ exit 1
                                 flow_agent_enabled=True,
                                 flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
                                 job_id=job_id,
+                                require_project_media_baseline=require_project_media_baseline,
                             )
                             break
                         except Exception as exc:
@@ -15446,6 +15584,7 @@ exit 1
                         flow_agent_enabled=flow_agent_enabled,
                         flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
                         job_id=job_id,
+                        require_project_media_baseline=require_project_media_baseline,
                     )
                     break
                 except Exception as exc:
@@ -15660,6 +15799,7 @@ exit 1
         flow_agent_enabled: bool = True,
         flow_agent_auto_approve: bool = True,
         job_id: str = "",
+        require_project_media_baseline: bool = False,
     ) -> List[Any]:
         from flow._models import AspectRatio
         from flow._ui_interceptor import UIInterceptor
@@ -15829,7 +15969,12 @@ exit 1
 
         try:
             known_media_before_submit = self._project_media_names(await client._api.get_project_data())
-        except Exception:
+        except Exception as exc:
+            if require_project_media_baseline:
+                raise RuntimeError(
+                    "Auto AI Trello không đọc được danh sách ảnh hiện có trong Flow trước khi bấm tạo. "
+                    "App đã dừng để tránh lấy nhầm ảnh cũ trong project rồi upload sai card."
+                ) from exc
             known_media_before_submit = set()
 
         if flow_agent_enabled:

@@ -853,6 +853,91 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(0, result["sent"])
         self.assertEqual(1, result["failed"])
 
+    def test_trello_archive_blocks_upload_when_source_validation_fails(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/source123/source-card",
+                    upload_mode="url",
+                )
+            )
+        )
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_card_id="https://trello.com/c/source123/source-card",
+            reference_image_paths=[str(self.uploads_dir / "source.jpg")],
+            automation_graph={
+                "modules": [
+                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                ]
+            },
+        )
+        artifact = JobArtifact(label="Anh 1", media_name="media", url="https://example.com/wrong.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_validate_trello_source_artifacts_before_upload",
+            new=AsyncMock(side_effect=RuntimeError("source mismatch")),
+        ) as validate, patch.object(
+            self.service,
+            "_trello_attach_url",
+        ) as attach_url:
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        validate.assert_awaited_once()
+        attach_url.assert_not_called()
+
+    def test_trello_archive_validates_source_before_uploading_generated_images(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/source123/source-card",
+                    upload_mode="url",
+                )
+            )
+        )
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_card_id="https://trello.com/c/source123/source-card",
+            reference_image_paths=[str(self.uploads_dir / "source.jpg")],
+            automation_graph={
+                "modules": [
+                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                ]
+            },
+        )
+        artifact = JobArtifact(label="Anh 1", media_name="media", url="https://example.com/right.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_validate_trello_source_artifacts_before_upload",
+            new=AsyncMock(return_value=None),
+        ) as validate, patch.object(
+            self.service,
+            "_trello_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        validate.assert_awaited_once()
+        attach_url.assert_called_once()
+        self.assertEqual(1, result["sent"])
+
     def test_trello_archive_upsamples_image_to_2k_before_file_upload(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
@@ -6611,6 +6696,93 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertLess(events.index("fill_panel"), events.index("drag"))
         self.assertLess(events.index("drag"), events.index("send"))
         self.assertLess(events.index("send"), events.index("approve"))
+
+    async def test_single_reference_ui_requires_project_media_baseline_for_trello_source(self) -> None:
+        events: list[str] = []
+
+        class FakePage:
+            url = "https://labs.google/fx/tools/flow/project/pid"
+
+            async def goto(self, *_args: object, **_kwargs: object) -> None:
+                events.append("goto")
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return FakePage()
+
+        class FakeFlowUI:
+            async def open_settings_panel(self, _page: FakePage) -> None:
+                events.append("settings")
+
+            async def select_image_model(self, _page: FakePage, _model: str) -> None:
+                events.append("model")
+
+            async def set_aspect_ratio(self, _page: FakePage, _ratio: object) -> None:
+                events.append("aspect")
+
+            async def set_count(self, _page: FakePage, _count: int) -> None:
+                events.append("count")
+
+        class FakeFlowAPI:
+            async def get_project_data(self) -> dict:
+                events.append("project_data")
+                raise RuntimeError("project data unavailable")
+
+        class FakeInterceptor:
+            def attach(self, _page: FakePage) -> None:
+                events.append("interceptor")
+
+            def clear(self) -> None:
+                events.append("clear")
+
+        fake_client = SimpleNamespace(
+            project_id="pid",
+            _bm=FakeBrowserManager(),
+            _ui=FakeFlowUI(),
+            _api=FakeFlowAPI(),
+        )
+
+        with patch("flow._ui_interceptor.UIInterceptor", return_value=FakeInterceptor()), patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="wf-source"),
+        ), patch.object(
+            self.service,
+            "_enable_flow_agent_mode",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("agent") or (True, "Tác nhân")),
+        ), patch.object(
+            self.service,
+            "_open_flow_agent_panel",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("panel") or (True, "agent panel visible")),
+        ), patch.object(
+            self.service,
+            "_fill_flow_agent_panel_instruction",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("fill_panel") or (True, "panel textbox")),
+        ), patch.object(
+            self.service,
+            "_select_flow_edit_target_image",
+            AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("drag") or (True, "drag source into agent panel")),
+        ), patch.object(
+            self.service,
+            "_click_flow_agent_panel_send",
+            AsyncMock(),
+        ) as send:
+            with self.assertRaisesRegex(RuntimeError, "tránh lấy nhầm ảnh cũ"):
+                await self.service._generate_single_reference_image_via_ui(
+                    fake_client,
+                    "tao 4 anh san pham tu anh goc",
+                    model="NARWHAL",
+                    reference_media_name="source-media",
+                    reference_image_path="/tmp/source.jpg",
+                    count=1,
+                    flow_agent_enabled=True,
+                    flow_agent_auto_approve=True,
+                    require_project_media_baseline=True,
+                )
+
+        send.assert_not_awaited()
+        self.assertIn("project_data", events)
+        self.assertNotIn("send", events)
 
     async def test_enable_flow_agent_mode_clicks_visible_tac_nhan_button(self) -> None:
         events: list[tuple[str, float, float]] = []
