@@ -652,6 +652,72 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["content_review"]["moved"])
         self.assertEqual("review-list", result["content_review"]["list_id"])
 
+    def test_trello_archive_moves_partial_card_when_total_outputs_reaches_twelve(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    board_id="board123",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="url",
+                )
+            )
+        )
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_board_id="board123",
+            trello_card_id="https://trello.com/c/abc123/demo-card",
+        )
+        artifacts = [
+            JobArtifact(label=f"Anh {index + 1}", media_name=f"media-{index}", url=f"https://example.com/cat-{index}.jpg", mime_type="image/jpeg")
+            for index in range(4)
+        ]
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(
+            self.service,
+            "_trello_attach_url",
+            side_effect=[
+                {"id": f"att-{index}", "name": f"flow-test-{index}.jpg", "url": f"https://trello.example/att-{index}"}
+                for index in range(4)
+            ],
+        ), patch.object(
+            self.service,
+            "_trello_card_flow_output_count",
+            return_value=12,
+        ) as output_count, patch.object(
+            self.service,
+            "_trello_content_review_list_id",
+            return_value="review-list",
+        ), patch.object(
+            self.service,
+            "_trello_move_card_to_list",
+            return_value={"id": "abc123", "idList": "review-list", "url": "https://trello.example/c/abc123"},
+        ) as move_card:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
+
+        output_count.assert_called_once_with("key", "token", "abc123")
+        move_card.assert_called_once_with("key", "token", "abc123", "review-list")
+        self.assertEqual(4, result["sent"])
+        self.assertTrue(result["content_review"]["moved"])
+
+    def test_trello_card_flow_output_count_excludes_original_source_image(self) -> None:
+        attachments = [
+            {"id": "source", "name": "original-source.png", "mimeType": "image/png"},
+            *[
+                {"id": f"flow-{index}", "name": f"flow-job123-{index}.jpg", "mimeType": "image/jpeg"}
+                for index in range(1, 13)
+            ],
+        ]
+
+        with patch.object(self.service, "_trello_get_json", return_value=attachments):
+            output_count = self.service._trello_card_flow_output_count("key", "token", "abc123")
+
+        self.assertEqual(12, output_count)
+
     def test_trello_archive_does_not_create_new_card_when_source_attachment_has_no_card(self) -> None:
         request = CreateJobRequest(
             type="image",

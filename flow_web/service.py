@@ -7745,7 +7745,7 @@ exit 1
             else:
                 await self.store.append_log(job_id, f"Đã lưu {stored} ảnh lên Trello.")
         review_move: Dict[str, Any] = {}
-        if stored >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT and board_id and card_id:
+        if stored and board_id and card_id:
             review_move = await self._move_trello_card_to_content_review_if_complete(
                 job_id,
                 key,
@@ -7778,7 +7778,7 @@ exit 1
             if output_count < target_count:
                 await self.store.append_log(
                     job_id,
-                    f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output.",
+                    f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output, khong tinh 1 anh goc.",
                 )
                 return {
                     "moved": False,
@@ -7798,7 +7798,7 @@ exit 1
             if not review_list_id:
                 await self.store.append_log(
                     job_id,
-                    f"Trello da du {output_count}/{target_count} anh nhung khong tim thay list {review_list_name}.",
+                    f"Trello da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, nhung khong tim thay list {review_list_name}.",
                 )
                 return {
                     "moved": False,
@@ -7817,7 +7817,7 @@ exit 1
             )
             await self.store.append_log(
                 job_id,
-                f"Da du {output_count}/{target_count} anh, da chuyen card Trello sang {review_list_name}.",
+                f"Da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, da chuyen card Trello sang {review_list_name}.",
             )
             return {
                 "moved": True,
