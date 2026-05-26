@@ -7076,8 +7076,16 @@ exit 1
         if board_id:
             payload["trello_board_id"] = board_id
         if list_id:
-            payload["trello_list_id"] = payload.get("trello_list_id") or list_id
-        payload["trello_card_id"] = payload.get("trello_card_id") or card_id
+            payload["trello_list_id"] = list_id
+        payload["trello_card_id"] = card_id
+        payload["trello_attachment_ids"] = selected_attachment_ids
+        self._sync_trello_scope_into_automation_graph(
+            payload,
+            board_id=board_id,
+            list_id=list_id,
+            card_id=card_id,
+            attachment_ids=selected_attachment_ids,
+        )
 
         await self._set_automation_module_status(
             job_id,
@@ -7607,10 +7615,16 @@ exit 1
         trello_config = self.store.snapshot().trello_config
         request_card_id = self._normalize_trello_card_id(request.trello_card_id)
         selected_source_attachment_ids = self._normalize_trello_attachment_ids(request.trello_attachment_ids)
-        if selected_source_attachment_ids and not request_card_id:
+        graph = self._automation_graph_payload(request)
+        has_trello_source = any(
+            module.get("enabled") and module.get("type") == "trello_source"
+            for module in graph.get("modules", [])
+            if isinstance(module, dict)
+        )
+        if (has_trello_source or selected_source_attachment_ids) and not request_card_id:
             await self.store.append_log(
                 job_id,
-                "Trello Archive đã dừng: job có attachment nguồn nhưng thiếu card nguồn, tránh upload nhầm sang card/list khác.",
+                "Trello Archive da dung: job co Trello Image Source nhung thieu card nguon, tranh upload nham sang card/list khac.",
             )
             return {
                 "configured": True,

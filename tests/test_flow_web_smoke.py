@@ -813,6 +813,46 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(0, result["sent"])
         self.assertEqual(1, result["failed"])
 
+    def test_trello_archive_with_source_module_does_not_fallback_to_config_card(self) -> None:
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/configcard/default-card",
+                    list_id="ready-list",
+                    upload_mode="url",
+                )
+            )
+        )
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_list_id="ready-list",
+            automation_graph={
+                "modules": [
+                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                ]
+            },
+        )
+        artifact = JobArtifact(label="Anh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.object(self.service, "_trello_create_card") as create_card, patch.object(
+            self.service,
+            "_trello_attach_url",
+        ) as attach_url:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        create_card.assert_not_called()
+        attach_url.assert_not_called()
+        self.assertEqual("source_card_missing", result["error"])
+        self.assertEqual(0, result["sent"])
+        self.assertEqual(1, result["failed"])
+
     def test_trello_archive_upsamples_image_to_2k_before_file_upload(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
@@ -4284,6 +4324,103 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("abc123", trello_node["output"]["card_id"])
         self.assertEqual(["abc123"], archive_cards)
         self.assertEqual("abc123", saved.result["trello_direct_review"]["card_id"])
+
+    async def test_trello_source_overrides_stale_request_card_before_archive(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        source_image = self.uploads_dir / "trello-source-stale.jpg"
+        source_image.write_bytes(b"source-image")
+        request = CreateJobRequest(
+            type="image",
+            prompt="turn the Trello product photo into an Etsy lifestyle image",
+            count=1,
+            trello_card_id="wrong-card",
+            trello_enabled=True,
+            automation_graph={
+                "modules": [
+                    {
+                        "id": "trello-source-1",
+                        "type": "trello_source",
+                        "title": "Trello Image Source",
+                        "settings": {
+                            "trelloBoard": "https://trello.com/b/board123/demo-board",
+                            "trelloList": "ready-list",
+                            "trelloCard": "https://trello.com/c/source123/source-card",
+                        },
+                    },
+                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "wrong-card"}},
+                ]
+            },
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+        fake_image = SimpleNamespace(
+            media_name="img-1",
+            workflow_id="wf-1",
+            fife_url="https://example.com/generated.jpg",
+            prompt=request.prompt,
+            dimensions={"width": 1024, "height": 1024},
+        )
+        captured: dict[str, object] = {}
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(SimpleNamespace())
+
+        async def fake_generate_images(client, job_id, module_request, reference_media_names):
+            captured["flow_card"] = module_request.trello_card_id
+            return [fake_image]
+
+        async def fake_archive(job_id, module_request, artifacts):
+            captured["archive_card"] = module_request.trello_card_id
+            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_card_hint_by_id",
+            return_value={"card_id": "source123", "list_id": "ready-list", "list_name": "Ready for AI"},
+        ), patch.object(
+            self.service,
+            "_download_trello_card_image_attachments",
+            return_value=[str(source_image)],
+        ) as download_images, patch.object(
+            self.service,
+            "_resolve_image_reference_media",
+            AsyncMock(return_value=["trello-media"]),
+        ), patch.object(
+            self.service,
+            "_generate_images_with_retry",
+            side_effect=fake_generate_images,
+        ), patch.object(
+            self.service,
+            "_archive_trello_artifacts",
+            side_effect=fake_archive,
+        ):
+            await self.service._run_flow_job(job.id, request)
+
+        self.assertEqual("source123", download_images.call_args.args[2])
+        self.assertEqual("source123", captured["flow_card"])
+        self.assertEqual("source123", captured["archive_card"])
+        saved = self.store.get_job(job.id)
+        self.assertEqual("source123", saved.input["trello_card_id"])
+        trello_modules = [
+            module
+            for module in saved.input["automation_graph"]["modules"]
+            if module["type"] in {"trello_source", "trello"}
+        ]
+        self.assertTrue(all(module["settings"]["trelloCard"] == "source123" for module in trello_modules))
 
     async def test_trello_source_resolves_board_link_to_image_card(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
