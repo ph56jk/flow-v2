@@ -6157,6 +6157,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             flow_agent_enabled=True,
             flow_agent_auto_approve=True,
             reference_image_paths=["/tmp/source.jpg"],
+            workflow_id="stale-active-workflow",
         )
         fake_images = [SimpleNamespace(media_name=f"img-{index}") for index in range(8)]
         fake_client = SimpleNamespace()
@@ -6181,6 +6182,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("Create exactly 8 separate standalone images now in ONE Flow Agent run", prompt)
         self.assertIn("using the x8 image setting", prompt)
         self.assertIn("Do NOT create a 8-frame grid", prompt)
+        self.assertIn("HARD REFERENCE LOCK", prompt)
+        self.assertIn("ignore other Flow project thumbnails", prompt)
+        self.assertIn("same pennant/banner shape", prompt)
+        self.assertIn("1:1 square image file", prompt)
         self.assertIn("detail/craft proof macro image", prompt)
         self.assertIn("full front hero ecommerce image", prompt)
         self.assertIn("lifestyle use-context image", prompt)
@@ -6233,6 +6238,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("using the x8 image setting", first_prompt)
         self.assertIn("images 9-12 of a 12-image product set", second_prompt)
         self.assertIn("using the x4 image setting", second_prompt)
+        self.assertIn("HARD REFERENCE LOCK", second_prompt)
+        self.assertIn("not landscape, not portrait", second_prompt)
         self.assertIn("pastel fabric colorway lineup image", second_prompt)
         self.assertIn("no yellow, orange, golden-hour", second_prompt)
         self.assertIn("real hand embroidery", second_prompt)
@@ -6259,6 +6266,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
             async def select_image_model(self, _page: FakePage, _model: str) -> None:
                 events.append("model")
+
+            async def set_aspect_ratio(self, _page: FakePage, _ratio: object) -> None:
+                events.append("aspect")
 
             async def set_count(self, _page: FakePage, _count: int) -> None:
                 events.append("count")
@@ -6328,6 +6338,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
             async def select_image_model(self, _page: FakePage, _model: str) -> None:
                 events.append("model")
+
+            async def set_aspect_ratio(self, _page: FakePage, _ratio: object) -> None:
+                events.append("aspect")
 
             async def set_count(self, _page: FakePage, _count: int) -> None:
                 events.append("count")
@@ -6420,6 +6433,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         select_image.assert_awaited_once()
         attach_file.assert_not_awaited()
         self.assertFalse(ensure_panel.await_args.kwargs["submit_if_needed"])
+        self.assertLess(events.index("model"), events.index("aspect"))
+        self.assertLess(events.index("aspect"), events.index("count"))
         self.assertLess(events.index("panel"), events.index("fill_panel"))
         self.assertLess(events.index("fill_panel"), events.index("drag"))
         self.assertLess(events.index("drag"), events.index("send"))

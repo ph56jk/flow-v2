@@ -9320,6 +9320,11 @@ exit 1
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             design_analysis,
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
+            (
+                "Critical source lock: the selected Trello attachment is the only authoritative product image. "
+                "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
+                "Do not turn the source into a pillow, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category."
+            ),
             resume_note,
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
             f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The full target is {target_output_count} generated output images plus the 1 source image; create only the missing generated outputs for this run.",
@@ -9338,6 +9343,7 @@ exit 1
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
             "Do not change the source product into a different category; if the source is a doll or plush, it must remain a doll or plush, not an apron, shirt, mug, or unrelated object.",
+            "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas.",
             "Do not use Google Sheet prompts; do not ask the local app AI to write the final prompt.",
         ]
         if user_instruction:
@@ -15304,8 +15310,10 @@ exit 1
             target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1)))
             flow_agent_enabled = self._flow_agent_enabled_for_request(request)
             source_workflow_id = str(request.workflow_id or "").strip()
-            if flow_agent_enabled and not source_workflow_id:
-                source_workflow_id = await self._find_workflow_id_for_media(client, reference_media_names[0])
+            if flow_agent_enabled:
+                media_workflow_id = await self._find_workflow_id_for_media(client, reference_media_names[0])
+                if media_workflow_id:
+                    source_workflow_id = media_workflow_id
             if flow_agent_enabled and not source_workflow_id:
                 raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
@@ -15344,6 +15352,7 @@ exit 1
                                 workflow_id=source_workflow_id,
                                 reference_media_name=reference_media_names[0],
                                 reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                                aspect=request.aspect,
                                 count=run_count,
                                 timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
                                 flow_agent_enabled=True,
@@ -15413,6 +15422,7 @@ exit 1
                         workflow_id=source_workflow_id,
                         reference_media_name=reference_media_names[0],
                         reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                        aspect=request.aspect,
                         count=target_count,
                         timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
                         flow_agent_enabled=flow_agent_enabled,
@@ -15596,8 +15606,13 @@ exit 1
             f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
             f"{run_scope} "
             "These generated outputs are in addition to the attached Trello source/reference image; never count the source image as one of the generated outputs. "
-            "Each output must be its own separate 1:1 image file, not panels inside one canvas. "
+            "Each output must be its own separate 1:1 square image file, not landscape, not portrait, not panels inside one canvas. "
+            "The product must sit inside a square 1:1 frame with no side-by-side contact sheet, no wide cinematic crop, and no UI/gallery screenshot look. "
             f"{shot_plan_text}"
+            "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
+            "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
+            "Do not reinterpret, upgrade, or transform the source into another product type: a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
+            "If a planned scene would require changing the product shape or design, keep the product unchanged and only change the surrounding styling, props, camera angle, or background. "
             "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
             "If two ideas look like the same product-on-table view, change one before generating. "
             "Lighting for every output must be clean clear white neutral daylight with accurate whites; no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
@@ -15606,8 +15621,9 @@ exit 1
             "For non-hoop fabric colorways, only if the source image visibly contains an embroidered or personalized name may each fabric color option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
             f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
             f"{self._flow_agent_no_tag_label_rule()} "
+            "Do not add any readable name, initials, year, EST date, quote, slogan, label, or decorative text unless that readable text is visibly embroidered/printed on the source product image; for allowed name variants, keep the same product shape and motif exactly. "
             "Use the attached Trello source product image as the reference for every output. "
-            "Keep every output 1:1 square, commercial product photography, and consistent with the same product identity."
+            "Keep every output 1:1 square, commercial product photography, and visually identical to the same source product identity."
         )
         return f"{base}\n\n{correction}" if base else correction
 
@@ -15619,6 +15635,7 @@ exit 1
         model: str,
         reference_media_name: str,
         reference_image_path: str = "",
+        aspect: str = "square",
         workflow_id: str = "",
         count: int = 1,
         timeout_s: int = 120,
@@ -15626,6 +15643,7 @@ exit 1
         flow_agent_auto_approve: bool = True,
         job_id: str = "",
     ) -> List[Any]:
+        from flow._models import AspectRatio
         from flow._ui_interceptor import UIInterceptor
 
         resolved_workflow_id = str(workflow_id or "").strip() or await self._find_workflow_id_for_media(client, reference_media_name)
@@ -15634,6 +15652,14 @@ exit 1
 
         ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
         target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
+        aspect_value = self._parse_aspect(aspect or "square")
+        ratio = (
+            AspectRatio.PORTRAIT
+            if aspect_value == "portrait"
+            else AspectRatio.SQUARE
+            if aspect_value == "square"
+            else AspectRatio.LANDSCAPE
+        )
         page = await client._bm.page()
         project_url = self._project_url(client.project_id)
         edit_url = f"{project_url}/edit/{quote(resolved_workflow_id, safe='')}" if resolved_workflow_id else project_url
@@ -15665,6 +15691,7 @@ exit 1
         try:
             await client._ui.open_settings_panel(page)
             await client._ui.select_image_model(page, self._image_ui_model_label(model))
+            await client._ui.set_aspect_ratio(page, ratio)
             await client._ui.set_count(page, target_count)
             if job_id:
                 await self.store.append_log(job_id, f"Fallback UI Flow: đã đặt số lượng ảnh x{target_count}.")
