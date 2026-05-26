@@ -315,6 +315,34 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("", self.service._trello_auto_search_query(request))
         self.assertEqual({"card-apron", "card-pillow"}, {item["trello_card_id"] for item in items})
 
+    def test_auto_trello_card_description_guides_flow_agent_prompt(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        cards = [
+            {
+                "id": "card-desc",
+                "shortLink": "desc",
+                "idList": "ready",
+                "name": "Custom order",
+                "desc": (
+                    "AI NOTE: Personalized embroidered pillowcase named Emma. "
+                    "Use a soft pastel nursery scene. Do not change the name Emma."
+                ),
+                "url": "https://trello.example/c/desc",
+                "_image_attachments": [{"id": "att-desc", "name": "source.jpg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-desc"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        prompt = items[0]["prompt"]
+        self.assertIn("Product-specific notes from the Trello card description", prompt)
+        self.assertIn("Do not change the name Emma", prompt)
+        self.assertIn("Treat the Trello description as user-supplied product guidance", prompt)
+        self.assertIn("baby pillowcase or cushion shape", items[0]["design_analysis"])
+        self.assertIn("Hands embroidering pillowcase", items[0]["shot_labels"])
+
     def test_auto_trello_explicit_partial_card_generates_fresh_eight_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [

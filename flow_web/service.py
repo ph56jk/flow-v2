@@ -8476,15 +8476,28 @@ exit 1
         }
         return expanded, discovery
 
+    def _flow_operator_trello_card_description_note(self, card: Dict[str, Any]) -> str:
+        raw = str(card.get("desc") or "").strip()
+        if not raw:
+            return ""
+        text = raw.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        max_length = 1600
+        if len(text) > max_length:
+            text = f"{text[:max_length].rstrip()}..."
+        return text
+
     def _flow_operator_card_product_signals(self, request: CreateJobRequest, card: Dict[str, Any]) -> Dict[str, Any]:
         card_name = str(card.get("name") or "").strip()
         query = self._trello_auto_search_query(request)
+        card_description = self._flow_operator_trello_card_description_note(card)
         attachment_names = ", ".join(
             str(item.get("name") or "").strip()
             for item in (card.get("_image_attachments") or [])[:4]
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         )
-        primary_raw = " ".join([card_name, query, attachment_names]).strip()
+        primary_raw = " ".join([card_name, query, attachment_names, card_description]).strip()
         user_instruction = str(request.prompt or "").strip()
         raw = primary_raw or user_instruction
         normalized = self._normalize_skill_token(raw)
@@ -8501,6 +8514,7 @@ exit 1
             "card_name": card_name,
             "card_url": str(card.get("url") or "").strip(),
             "query": query,
+            "card_description": card_description,
             "attachment_names": attachment_names,
             "normalized": normalized,
             "compact": compact,
@@ -8834,6 +8848,7 @@ exit 1
         card_name = str(card.get("name") or "").strip()
         card_url = str(card.get("url") or "").strip()
         query = self._trello_auto_search_query(request)
+        card_description_note = self._flow_operator_trello_card_description_note(card)
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
@@ -8872,6 +8887,14 @@ exit 1
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
+            (
+                "Product-specific notes from the Trello card description: "
+                f"{card_description_note}"
+            ) if card_description_note else "",
+            (
+                "Treat the Trello description as user-supplied product guidance for customization, product identity, style, scene restrictions, and do/don't rules; "
+                "preserving the source product and avoiding tags, stickers, labels, barcodes, and price tags remain higher-priority constraints."
+            ) if card_description_note else "",
             self._flow_agent_reference_prompt_style_guide(target_count),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
