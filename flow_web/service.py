@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import unicodedata
 import uuid
@@ -872,6 +873,47 @@ class FlowWebService:
             return any(candidate.is_file() and candidate.name in executable_names for candidate in path.rglob("*"))
         except OSError:
             return False
+
+    def _default_playwright_browsers_path(self) -> Path:
+        env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        if env_path:
+            return Path(env_path)
+        if os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+            base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+            return base / "ms-playwright"
+        return Path.home() / ".cache" / "ms-playwright"
+
+    def _ensure_playwright_browsers_available(self) -> None:
+        browser_path = self._default_playwright_browsers_path()
+        if self._playwright_browsers_installed(browser_path):
+            return
+
+        cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Playwright Chromium chua duoc cai va app khong tu cai duoc. "
+                "Hay chay: .\\.venv\\Scripts\\python.exe -m playwright install chromium"
+            ) from exc
+
+        if result.returncode != 0 or not self._playwright_browsers_installed(browser_path):
+            detail = (result.stderr or result.stdout or "").strip()
+            if len(detail) > 800:
+                detail = f"{detail[:800].rstrip()}..."
+            raise RuntimeError(
+                "Playwright Chromium chua san sang nen Google Flow khong mo duoc browser. "
+                "Hay chay: .\\.venv\\Scripts\\python.exe -m playwright install chromium"
+                + (f" Chi tiet: {detail}" if detail else "")
+            )
 
     def get_auth_status(self) -> AuthStatus:
         _, is_authenticated, _, _, _ = self._flow_modules()
@@ -10453,6 +10495,7 @@ exit 1
         if await self._shared_browser_is_usable():
             return self._shared_browser
         await self._close_shared_browser()
+        self._ensure_playwright_browsers_available()
         BrowserManager, _, _, _, _ = self._flow_modules()
         browser = BrowserManager(headless=False)
         await browser.start()
