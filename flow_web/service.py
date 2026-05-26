@@ -131,6 +131,7 @@ class FlowWebService:
     TRELLO_UPSCALE_LONG_EDGE_PX = 2048
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
     DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ("Ideas",)
+    DEFAULT_TRELLO_REVIEW_LIST_NAME = "Content Review"
     DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
     DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
@@ -7689,6 +7690,15 @@ exit 1
                 )
             else:
                 await self.store.append_log(job_id, f"Đã lưu {stored} ảnh lên Trello.")
+        review_move: Dict[str, Any] = {}
+        if stored >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT and board_id and card_id:
+            review_move = await self._move_trello_card_to_content_review_if_complete(
+                job_id,
+                key,
+                token,
+                board_id,
+                card_id,
+            )
         return {
             "configured": True,
             "sent": stored,
@@ -7697,7 +7707,82 @@ exit 1
             "card_url": card_url,
             "created_card": created_card,
             "attachments": attachments,
+            "content_review": review_move,
         }
+
+    async def _move_trello_card_to_content_review_if_complete(
+        self,
+        job_id: str,
+        key: str,
+        token: str,
+        board_id: str,
+        card_id: str,
+    ) -> Dict[str, Any]:
+        target_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        try:
+            output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
+            if output_count < target_count:
+                await self.store.append_log(
+                    job_id,
+                    f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output.",
+                )
+                return {
+                    "moved": False,
+                    "reason": "not_enough_outputs",
+                    "output_count": output_count,
+                    "target_output_count": target_count,
+                }
+
+            review_list_name = self._default_trello_review_list_name()
+            review_list_id = await asyncio.to_thread(
+                self._trello_content_review_list_id,
+                key,
+                token,
+                board_id,
+                review_list_name,
+            )
+            if not review_list_id:
+                await self.store.append_log(
+                    job_id,
+                    f"Trello da du {output_count}/{target_count} anh nhung khong tim thay list {review_list_name}.",
+                )
+                return {
+                    "moved": False,
+                    "reason": "review_list_missing",
+                    "output_count": output_count,
+                    "target_output_count": target_count,
+                    "list_name": review_list_name,
+                }
+
+            payload = await asyncio.to_thread(
+                self._trello_move_card_to_list,
+                key,
+                token,
+                card_id,
+                review_list_id,
+            )
+            await self.store.append_log(
+                job_id,
+                f"Da du {output_count}/{target_count} anh, da chuyen card Trello sang {review_list_name}.",
+            )
+            return {
+                "moved": True,
+                "output_count": output_count,
+                "target_output_count": target_count,
+                "list_id": review_list_id,
+                "list_name": review_list_name,
+                "card_id": str(payload.get("id") or card_id).strip() if isinstance(payload, dict) else card_id,
+                "card_url": str(payload.get("url") or payload.get("shortUrl") or "").strip() if isinstance(payload, dict) else "",
+            }
+        except Exception as exc:
+            detail = humanize_flow_error(str(exc))
+            await self.store.append_log(job_id, f"Khong chuyen duoc card sang Content Review: {detail}")
+            return {
+                "moved": False,
+                "reason": "move_failed",
+                "error": detail,
+                "target_output_count": target_count,
+            }
 
     async def _trello_artifact_file_bytes(
         self,
@@ -8190,6 +8275,23 @@ exit 1
         card["_flow_output_count"] = len(generated_attachments)
         return card
 
+    def _trello_card_flow_output_count(self, key: str, token: str, card_id: str) -> int:
+        card_id = self._normalize_trello_card_id(card_id)
+        if not card_id:
+            return 0
+        attachments_payload = self._trello_get_json(
+            f"cards/{quote(card_id, safe='')}/attachments",
+            key,
+            token,
+            fields={"fields": "id,name,url,mimeType,date"},
+        )
+        attachments = attachments_payload if isinstance(attachments_payload, list) else []
+        image_attachments = [
+            item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
+        ]
+        _sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+        return len(outputs)
+
     def _select_trello_card_attachments(
         self,
         card: Dict[str, Any],
@@ -8214,6 +8316,9 @@ exit 1
 
     def _default_trello_source_list_name(self) -> str:
         return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
+
+    def _default_trello_review_list_name(self) -> str:
+        return os.getenv("TRELLO_REVIEW_LIST_NAME", self.DEFAULT_TRELLO_REVIEW_LIST_NAME).strip() or self.DEFAULT_TRELLO_REVIEW_LIST_NAME
 
     def _default_trello_extra_source_list_names(self) -> List[str]:
         raw = os.getenv("TRELLO_EXTRA_SOURCE_LIST_NAMES", ",".join(self.DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES))
@@ -8295,6 +8400,19 @@ exit 1
             fields={"fields": "id,name,closed", "filter": "open"},
         )
         return [item for item in payload if isinstance(item, dict) and not item.get("closed")] if isinstance(payload, list) else []
+
+    def _trello_content_review_list_id(self, key: str, token: str, board_id: str, list_name: str = "") -> str:
+        target_name = str(list_name or "").strip() or self._default_trello_review_list_name()
+        target_key = self._compact_match_text(target_name)
+        target_id = self._normalize_trello_id(target_name)
+        for item in self._trello_board_lists(key, token, board_id):
+            list_id = self._normalize_trello_id(str(item.get("id") or ""))
+            list_label = str(item.get("name") or "").strip()
+            if list_id and list_id == target_id:
+                return list_id
+            if list_label and self._compact_match_text(list_label) == target_key:
+                return list_id
+        return ""
 
     def _trello_resolve_board_list_id(self, key: str, token: str, board_id: str, list_value: str = "") -> str:
         board_id = self._normalize_trello_board_id(board_id)
@@ -9443,6 +9561,25 @@ exit 1
         except URLError as exc:
             raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
 
+    def _trello_put_json(self, path: str, key: str, token: str, fields: Dict[str, Any] | None = None) -> Any:
+        payload = urlencode({k: v for k, v in (fields or {}).items() if str(v) != ""}).encode("utf-8")
+        request = Request(
+            self._trello_endpoint(path, key, token),
+            data=payload,
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+            method="PUT",
+        )
+        try:
+            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                raw_payload = response.read().decode("utf-8", errors="replace")
+                return json.loads(raw_payload) if raw_payload else {}
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            detail = self._redact_trello_secret(detail or exc.reason, key, token)
+            raise RuntimeError(f"Trello API lá»—i {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
+
     def _trello_delete_json(self, path: str, key: str, token: str) -> Any:
         request = Request(
             self._trello_endpoint(path, key, token),
@@ -9478,6 +9615,15 @@ exit 1
                 "desc": description,
                 "pos": "top",
             },
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def _trello_move_card_to_list(self, key: str, token: str, card_id: str, list_id: str) -> Dict[str, Any]:
+        payload = self._trello_put_json(
+            f"cards/{quote(card_id, safe='')}",
+            key,
+            token,
+            fields={"idList": list_id},
         )
         return payload if isinstance(payload, dict) else {}
 
