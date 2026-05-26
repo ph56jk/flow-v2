@@ -10,6 +10,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException, UploadFile
@@ -33,7 +34,7 @@ from flow_web.schemas import (
     TrelloConfigUpdateRequest,
     UserAssistantRequest,
 )
-from flow_web.service import FlowWebService
+from flow_web.service import FlowAgentQuotaError, FlowBrowserProfile, FlowWebService
 from flow_web.store import StateStore
 
 
@@ -110,6 +111,23 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual(400, ctx.exception.status_code)
         self.assertIn("đăng nhập", str(ctx.exception.detail).lower())
+
+    def test_flow_profile_specs_support_multiple_chrome_profiles_from_env(self) -> None:
+        first = self.temp_root / "flow-a"
+        second = self.temp_root / "flow-b"
+        with patch.dict(
+            os.environ,
+            {
+                "FLOW_CHROME_PROFILE_DIRS": f"Main={first};Backup={second}",
+                "FLOW_CHROME_PROFILE_COUNT": "",
+            },
+            clear=False,
+        ):
+            specs = self.service._flow_profile_specs()
+
+        self.assertEqual(["Main", "Backup"], [spec.label for spec in specs])
+        self.assertEqual(first, specs[0].path)
+        self.assertEqual(second, specs[1].path)
 
     def test_prompt_batch_child_request_syncs_trello_graph_scope_to_item(self) -> None:
         base = CreateJobRequest(
@@ -3152,6 +3170,40 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ensure_shared_browser.assert_awaited_once()
         build_client.assert_awaited_once()
         close_shared_browser.assert_not_called()
+
+    async def test_with_client_switches_to_next_profile_on_flow_agent_quota(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Main", path=self.temp_root / "main-profile"),
+            FlowBrowserProfile(index=1, label="Backup", path=self.temp_root / "backup-profile"),
+        ]
+        browsers = [SimpleNamespace(name="browser-1"), SimpleNamespace(name="browser-2")]
+        clients = [SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]
+        calls: list[str] = []
+
+        async def use_client(client: Any) -> str:
+            calls.append(client.name)
+            if client.name == "client-1":
+                raise FlowAgentQuotaError("You've reached your Tools Agent quota limit. Come back tomorrow.")
+            return client.name
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(side_effect=browsers),
+        ) as ensure_shared_browser, patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(side_effect=clients),
+        ) as build_client:
+            result = await self.service._with_client(use_client)
+
+        self.assertEqual("client-2", result)
+        self.assertEqual(["client-1", "client-2"], calls)
+        self.assertEqual(2, ensure_shared_browser.await_count)
+        self.assertEqual(2, build_client.await_count)
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
 
     async def test_open_login_flow_page_opens_new_tab_and_brings_it_to_front(self) -> None:
         page = SimpleNamespace(

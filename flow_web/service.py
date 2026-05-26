@@ -18,6 +18,7 @@ import time
 import unicodedata
 import uuid
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
@@ -82,6 +83,21 @@ from .store import StateStore
 
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class FlowBrowserProfile:
+    index: int
+    label: str
+    path: Path
+
+    @property
+    def key(self) -> str:
+        return str(self.path.resolve()).lower()
+
+
+class FlowAgentQuotaError(RuntimeError):
+    """Raised when the current Google Flow Agent browser profile hits its quota."""
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -259,6 +275,9 @@ class FlowWebService:
         self._telegram_approval_sync_lock = asyncio.Lock()
         self._last_telegram_approval_sync_error = ""
         self._shared_browser: Any | None = None
+        self._shared_browser_profile_key = ""
+        self._active_flow_profile_index = 0
+        self._flow_profile_quota_blocked_until: Dict[str, float] = {}
 
     async def close(self) -> None:
         async with self._browser_session_lock:
@@ -374,6 +393,8 @@ class FlowWebService:
         gemini_model = self._sanitize_gemini_model(config.gemini_model or self.GEMINI_DEFAULT_MODEL)
         playwright_browsers_path = str(config.playwright_browsers_path or "").strip()
         runtime_playwright_path = playwright_browsers_path or os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        flow_profiles = self._flow_profile_specs()
+        active_flow_profile = self._current_flow_profile()
 
         gemini_source = "env" if (gemini_api_key and not state_gemini_api_key) else ("state" if gemini_api_key else "")
         telegram_source = (
@@ -398,6 +419,17 @@ class FlowWebService:
             "runtime": {
                 "playwright_browsers_path": runtime_playwright_path,
                 "playwright_browsers_path_set": bool(runtime_playwright_path),
+                "flow_profiles": [
+                    {
+                        "label": profile.label,
+                        "path": str(profile.path),
+                        "active": profile.key == active_flow_profile.key,
+                        "quota_blocked": self._flow_profile_is_quota_blocked(profile),
+                    }
+                    for profile in flow_profiles
+                ],
+                "flow_profile_count": len(flow_profiles),
+                "active_flow_profile_label": active_flow_profile.label,
             },
             "updated_at": config.updated_at,
         }
@@ -921,22 +953,25 @@ class FlowWebService:
 
     def get_auth_status(self) -> AuthStatus:
         _, is_authenticated, _, _, _ = self._flow_modules()
+        active_profile = self._current_flow_profile()
+        default_profile = self._resolve_flow_profile_path("default")
         authenticated = False
-        try:
-            authenticated = bool(is_authenticated())
-        except Exception:
-            authenticated = False
+        if active_profile.key == FlowBrowserProfile(index=0, label="default", path=default_profile).key:
+            try:
+                authenticated = bool(is_authenticated())
+            except Exception:
+                authenticated = False
         if not authenticated:
-            authenticated = self._flow_profile_has_auth_cookies()
+            authenticated = self._flow_profile_has_auth_cookies(active_profile.path)
         return AuthStatus(authenticated=authenticated)
 
-    def _flow_profile_has_auth_cookies(self) -> bool:
+    def _flow_profile_has_auth_cookies(self, profile_dir: Path | None = None) -> bool:
         try:
             from flow._storage import PROFILE_DIR
         except Exception:
             return False
 
-        profile_dir = Path(PROFILE_DIR)
+        profile_dir = Path(profile_dir or PROFILE_DIR)
         candidates = [
             profile_dir / "Default" / "Cookies",
             profile_dir / "Default" / "Network" / "Cookies",
@@ -966,9 +1001,9 @@ class FlowWebService:
                 detail="Phiên này đang dùng Chrome ngoài qua CDP. Hãy đăng xuất trực tiếp trong trình duyệt Chrome đó.",
             )
 
-        from flow._storage import PROFILE_DIR, ensure_dirs
+        from flow._storage import ensure_dirs
 
-        profile_dir = Path(PROFILE_DIR)
+        profile_dir = self._current_flow_profile().path
         cookies_path = profile_dir / "Default" / "Cookies"
         had_session = cookies_path.exists() and cookies_path.stat().st_size > 0
 
@@ -10804,24 +10839,50 @@ exit 1
 
         if self._should_keep_flow_browser_open(config):
             async with self._browser_session_lock:
-                try:
-                    browser = await self._ensure_shared_browser()
-                    client = await self._build_client_from_shared_browser(
-                        browser,
-                        project_id=config.project_id,
-                        workflow_id=resolved_workflow_id,
-                        timeout_s=effective_timeout_s,
-                    )
-                    return await fn(client)
-                except HTTPException:
-                    raise
-                except Exception as exc:
-                    if self._is_browser_closed_error(exc):
-                        await self._close_shared_browser()
+                profiles = self._flow_profile_specs()
+                attempts = max(1, len(profiles))
+                last_quota_error: Exception | None = None
+                for _ in range(attempts):
+                    profile = self._current_flow_profile()
+                    if self._flow_profile_is_quota_blocked(profile):
+                        raise HTTPException(
+                            status_code=429,
+                            detail=(
+                                "Tat ca Chrome profile Flow da het quota Agent trong phien nay. "
+                                "Hay dang nhap them profile khac, cho quota reset, hoac restart app neu muon bo danh dau tam thoi."
+                            ),
+                        )
+                    try:
+                        browser = await self._ensure_shared_browser(profile)
+                        client = await self._build_client_from_shared_browser(
+                            browser,
+                            project_id=config.project_id,
+                            workflow_id=resolved_workflow_id,
+                            timeout_s=effective_timeout_s,
+                        )
+                        return await fn(client)
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        if self._is_flow_agent_quota_error(exc):
+                            last_quota_error = exc
+                            await self._mark_flow_profile_quota_limited(profile, exc)
+                            next_profile = self._next_available_flow_profile(profile)
+                            if next_profile is not None:
+                                self._active_flow_profile_index = next_profile.index
+                                continue
+                        if self._is_browser_closed_error(exc):
+                            await self._close_shared_browser()
+                        raise HTTPException(
+                            status_code=self._flow_error_status(exc),
+                            detail=self._flow_error_detail(exc),
+                        ) from exc
+
+                if last_quota_error is not None:
                     raise HTTPException(
-                        status_code=self._flow_error_status(exc),
-                        detail=self._flow_error_detail(exc),
-                    ) from exc
+                        status_code=429,
+                        detail=self._flow_error_detail(last_quota_error),
+                    ) from last_quota_error
 
         try:
             client = await FlowClient.create(
@@ -10851,9 +10912,203 @@ exit 1
     def _should_keep_flow_browser_open(self, config: AppConfig) -> bool:
         return not config.headless and not config.cdp_url
 
+    def _split_flow_profile_env(self, raw: str) -> List[str]:
+        normalized = str(raw or "").replace("\r", "\n").replace("|", "\n")
+        parts: List[str] = []
+        for segment in normalized.split("\n"):
+            for item in segment.split(";"):
+                value = item.strip()
+                if value:
+                    parts.append(value)
+        return parts
+
+    def _resolve_flow_profile_path(self, value: str) -> Path:
+        raw = str(value or "").strip().strip('"').strip("'")
+        if not raw or raw.lower() in {"default", "flow-default", "flow_py_default"}:
+            try:
+                from flow._storage import PROFILE_DIR
+            except Exception:
+                return PROJECT_ROOT / ".flow-browser-profile"
+            return Path(PROFILE_DIR)
+
+        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path
+
+    def _flow_profile_specs(self) -> List[FlowBrowserProfile]:
+        raw_profiles = (
+            os.getenv("FLOW_CHROME_PROFILE_DIRS", "").strip()
+            or os.getenv("FLOW_PROFILE_DIRS", "").strip()
+            or os.getenv("GOOGLE_FLOW_PROFILE_DIRS", "").strip()
+        )
+        entries = self._split_flow_profile_env(raw_profiles)
+        specs: List[FlowBrowserProfile] = []
+
+        if entries:
+            for index, entry in enumerate(entries):
+                label = f"Flow profile {index + 1}"
+                value = entry
+                if "=" in entry:
+                    maybe_label, maybe_value = entry.split("=", 1)
+                    if maybe_label.strip() and maybe_value.strip():
+                        label = maybe_label.strip()
+                        value = maybe_value.strip()
+                specs.append(FlowBrowserProfile(index=index, label=label, path=self._resolve_flow_profile_path(value)))
+        else:
+            specs.append(FlowBrowserProfile(index=0, label="Flow profile 1", path=self._resolve_flow_profile_path("default")))
+            raw_count = os.getenv("FLOW_CHROME_PROFILE_COUNT", "").strip()
+            try:
+                profile_count = max(1, min(20, int(raw_count))) if raw_count else 1
+            except ValueError:
+                profile_count = 1
+            for index in range(1, profile_count):
+                specs.append(
+                    FlowBrowserProfile(
+                        index=index,
+                        label=f"Flow profile {index + 1}",
+                        path=PROJECT_ROOT / "data" / "flow-profiles" / f"profile-{index + 1}",
+                    )
+                )
+
+        deduped: List[FlowBrowserProfile] = []
+        seen: set[str] = set()
+        for spec in specs:
+            key = spec.key
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(FlowBrowserProfile(index=len(deduped), label=spec.label, path=spec.path))
+        return deduped or [FlowBrowserProfile(index=0, label="Flow profile 1", path=self._resolve_flow_profile_path("default"))]
+
+    def _flow_profile_block_seconds(self) -> float:
+        raw = os.getenv("FLOW_CHROME_PROFILE_QUOTA_BLOCK_S", "").strip()
+        if not raw:
+            raw = os.getenv("FLOW_PROFILE_QUOTA_BLOCK_S", "").strip()
+        try:
+            return max(60.0, float(raw)) if raw else 24.0 * 60.0 * 60.0
+        except ValueError:
+            return 24.0 * 60.0 * 60.0
+
+    def _flow_profile_is_quota_blocked(self, profile: FlowBrowserProfile) -> bool:
+        blocked_until = float(self._flow_profile_quota_blocked_until.get(profile.key, 0.0) or 0.0)
+        if blocked_until <= 0:
+            return False
+        if blocked_until > time.monotonic():
+            return True
+        self._flow_profile_quota_blocked_until.pop(profile.key, None)
+        return False
+
+    def _current_flow_profile(self) -> FlowBrowserProfile:
+        profiles = self._flow_profile_specs()
+        if self._active_flow_profile_index >= len(profiles):
+            self._active_flow_profile_index = 0
+        start = max(0, self._active_flow_profile_index)
+        for offset in range(len(profiles)):
+            candidate = profiles[(start + offset) % len(profiles)]
+            if not self._flow_profile_is_quota_blocked(candidate):
+                self._active_flow_profile_index = candidate.index
+                return candidate
+        return profiles[start % len(profiles)]
+
+    def _next_available_flow_profile(self, current: FlowBrowserProfile) -> FlowBrowserProfile | None:
+        profiles = self._flow_profile_specs()
+        if len(profiles) <= 1:
+            return None
+        start = (current.index + 1) % len(profiles)
+        for offset in range(len(profiles) - 1):
+            candidate = profiles[(start + offset) % len(profiles)]
+            if candidate.key == current.key:
+                continue
+            if self._flow_profile_is_quota_blocked(candidate):
+                continue
+            return candidate
+        return None
+
+    def _is_flow_agent_quota_error(self, exc: Exception) -> bool:
+        if isinstance(exc, FlowAgentQuotaError):
+            return True
+        detail = self._strip_accents(str(exc or "")).lower()
+        return (
+            "tools agent quota" in detail
+            or "flow agent quota" in detail
+            or ("agent" in detail and "quota limit" in detail)
+            or ("come back tomorrow" in detail and "quota" in detail)
+            or ("daily quota" in detail and "agent" in detail)
+        )
+
+    async def _mark_flow_profile_quota_limited(self, profile: FlowBrowserProfile, exc: Exception) -> None:
+        self._flow_profile_quota_blocked_until[profile.key] = time.monotonic() + self._flow_profile_block_seconds()
+        if self._shared_browser_profile_key == profile.key:
+            await self._close_shared_browser()
+
+    async def _raise_flow_agent_quota_if_visible(self, page: Any, *, job_id: str = "") -> None:
+        message = await self._visible_flow_agent_quota_message(page)
+        if not message:
+            return
+        if job_id:
+            await self.store.append_log(
+                job_id,
+                f"Flow Agent profile hiện tại đã hết quota: {message[:220]}. App sẽ chuyển sang Chrome profile khác nếu có.",
+            )
+        raise FlowAgentQuotaError(message)
+
+    async def _visible_flow_agent_quota_message(self, page: Any) -> str:
+        try:
+            text = await page.evaluate(
+                """
+                () => {
+                  const bodyText = document.body ? document.body.innerText || "" : "";
+                  const nodes = [...document.querySelectorAll('[role="alert"], [role="status"], div, span, p')];
+                  const visibleTexts = nodes
+                    .map((node) => {
+                      const style = window.getComputedStyle(node);
+                      const rect = node.getBoundingClientRect();
+                      if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) {
+                        return '';
+                      }
+                      return node.innerText || node.textContent || '';
+                    })
+                    .filter(Boolean)
+                    .join('\\n');
+                  return `${visibleTexts}\\n${bodyText}`;
+                }
+                """
+            )
+        except Exception:
+            return ""
+
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        lowered = self._strip_accents(raw).lower()
+        quota_signals = (
+            "tools agent quota",
+            "flow agent quota",
+            "quota limit",
+            "come back tomorrow",
+            "daily quota",
+            "agent queries",
+            "han muc",
+        )
+        if not any(signal in lowered for signal in quota_signals):
+            return ""
+        if "agent" not in lowered and "tools" not in lowered and "tac nhan" not in lowered:
+            return ""
+
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        preferred = []
+        for line in lines:
+            normalized = self._strip_accents(line).lower()
+            if any(signal in normalized for signal in quota_signals):
+                preferred.append(line)
+        message = " ".join(preferred[:3] or lines[:3]).strip()
+        return message[:500] or "Google Flow Agent reported a quota limit."
+
     async def _close_shared_browser(self) -> None:
         browser = self._shared_browser
         self._shared_browser = None
+        self._shared_browser_profile_key = ""
         if browser is None:
             return
         try:
@@ -10861,9 +11116,11 @@ exit 1
         except Exception:
             pass
 
-    async def _shared_browser_is_usable(self) -> bool:
+    async def _shared_browser_is_usable(self, profile: FlowBrowserProfile | None = None) -> bool:
         browser = self._shared_browser
         if browser is None or getattr(browser, "_ctx", None) is None:
+            return False
+        if profile is not None and self._shared_browser_profile_key != profile.key:
             return False
         try:
             page = await browser.page()
@@ -10874,19 +11131,25 @@ exit 1
         except Exception:
             return False
 
-    async def _ensure_shared_browser(self) -> Any:
-        if await self._shared_browser_is_usable():
+    async def _ensure_shared_browser(self, profile: FlowBrowserProfile | None = None) -> Any:
+        selected_profile = profile or self._current_flow_profile()
+        if await self._shared_browser_is_usable(selected_profile):
             return self._shared_browser
         await self._close_shared_browser()
         self._ensure_playwright_browsers_available()
         BrowserManager, _, _, _, _ = self._flow_modules()
-        browser = BrowserManager(headless=False)
+        try:
+            selected_profile.path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        browser = BrowserManager(headless=False, profile_dir=selected_profile.path)
         await browser.start()
         config = self.store.snapshot().config
         project_id = self._normalize_project_id(config.project_id or config.project_url)
         target_url = self._project_url(project_id) if project_id else "https://labs.google/fx/tools/flow"
         await self._close_placeholder_flow_tabs(browser, target_url)
         self._shared_browser = browser
+        self._shared_browser_profile_key = selected_profile.key
         return browser
 
     async def _build_client_from_shared_browser(
@@ -15486,6 +15749,8 @@ exit 1
             )
 
         if flow_agent_enabled:
+            await asyncio.sleep(1.5)
+            await self._raise_flow_agent_quota_if_visible(page, job_id=job_id)
             panel_ok, panel_detail, needs_prompt = await self._ensure_flow_agent_panel_submitted(page, prompt, submit_if_needed=False)
             if job_id:
                 await self.store.append_log(
@@ -15530,6 +15795,7 @@ exit 1
                 if job_id:
                     await self.store.append_log(job_id, f"Fallback UI Flow timeout/recaptcha: {str(exc)[:300]}")
                 if flow_agent_enabled:
+                    await self._raise_flow_agent_quota_if_visible(page, job_id=job_id)
                     try:
                         if flow_agent_auto_approve:
                             approved, approve_detail = await self._approve_flow_agent_generation(page, timeout_s=8.0)

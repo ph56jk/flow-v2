@@ -72,6 +72,19 @@ def humanize_flow_error(message: str) -> str:
         result = "Cửa sổ Chromium dùng cho Google Flow đã bị đóng giữa chừng."
         return "".join(prefixes) + result
 
+    if (
+        "tools agent quota" in lowered
+        or "flow agent quota" in lowered
+        or ("agent" in lowered and "quota limit" in lowered)
+        or ("come back tomorrow" in lowered and "quota" in lowered)
+        or ("daily quota" in lowered and "agent" in lowered)
+    ):
+        result = (
+            "Google Flow Agent/Tools Agent da het quota cho profile hien tai. "
+            "App se thu chuyen sang Chrome profile khac neu da cau hinh; neu khong con profile nao, hay cho quota reset hoac dung tai khoan khac da dang nhap hop le."
+        )
+        return "".join(prefixes) + result
+
     if "audio generation failed" in lowered or "return silent videos" in lowered:
         result = (
             "Google Flow đã dựng tới bước âm thanh nhưng phần tạo audio bị lỗi. "
@@ -118,6 +131,30 @@ def classify_job_error(message: str, *, job_type: str = "") -> JobErrorSnapshot:
                     id="refresh-all",
                     label="Làm mới trạng thái",
                     description="Tải lại /api/state để xem app đã nhận thêm chi tiết lỗi hay chưa.",
+                ),
+            ],
+        )
+
+    if (
+        _has_any(lowered, "tools agent quota", "flow agent quota", "quota limit", "come back tomorrow", "daily quota")
+        and _has_any(lowered, "agent", "tools")
+    ):
+        return JobErrorSnapshot(
+            category="flow_agent_quota",
+            label="Het quota Agent",
+            title="Google Flow Agent da het quota tren profile hien tai",
+            message=humanized,
+            is_known=True,
+            actions=[
+                JobRecoveryAction(
+                    id="focus-login",
+                    label="Mo profile Flow",
+                    description="Mo Chrome profile Flow khac de dang nhap tai khoan con quota.",
+                ),
+                JobRecoveryAction(
+                    id="view-jobs",
+                    label="Theo doi auto",
+                    description="Kiem tra job tiep theo xem app da chuyen sang profile khac hay chua.",
                 ),
             ],
         )

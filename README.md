@@ -217,6 +217,12 @@ Tạo file `.env.local` với nội dung:
 # TRELLO_CARD_ID=trello_card_id_or_short_link
 # TRELLO_LIST_ID=trello_list_id
 # TRELLO_UPLOAD_MODE=file
+
+# Multi-account Flow Agent fallback. Each path is one separate Chrome profile.
+# Use ; to separate profiles on Windows. The token "default" keeps the normal
+# flow-py profile as the first account.
+# FLOW_CHROME_PROFILE_DIRS=default;data\flow-profiles\account-2;data\flow-profiles\account-3
+# FLOW_CHROME_PROFILE_QUOTA_BLOCK_S=86400
 ```
 
 App sẽ tự nạp file này khi khởi động nếu có, nhưng không bắt buộc. Nếu không tạo Prompt AI sẽ dùng kho skill nội bộ.
