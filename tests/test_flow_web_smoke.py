@@ -171,7 +171,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("ready-list", child.trello_list_id)
         self.assertEqual(["ready-att"], child.trello_attachment_ids)
         self.assertEqual("square", child.aspect)
-        self.assertEqual(8, child.count)
+        self.assertEqual(12, child.count)
         self.assertTrue(child.flow_agent_enabled)
         self.assertTrue(child.flow_agent_auto_approve)
         graph = child.automation_graph.model_dump(mode="json")
@@ -182,7 +182,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             self.assertEqual(["ready-att"], module["settings"]["trelloAttachmentIds"])
         flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
         self.assertEqual("square", flow_module["settings"]["imageAspect"])
-        self.assertEqual(8, flow_module["settings"]["imageCount"])
+        self.assertEqual(12, flow_module["settings"]["imageCount"])
         self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
         self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
 
@@ -353,7 +353,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("baby pillowcase or cushion shape", items[0]["design_analysis"])
         self.assertIn("Hands embroidering pillowcase", items[0]["shot_labels"])
 
-    def test_auto_trello_explicit_partial_card_generates_fresh_eight_image_set(self) -> None:
+    def test_auto_trello_partial_card_generates_missing_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
@@ -371,13 +371,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
-        self.assertEqual(8, items[0]["flow_agent_image_count"])
+        self.assertEqual(9, items[0]["flow_agent_image_count"])
         self.assertEqual(3, items[0]["flow_agent_existing_output_count"])
         self.assertEqual(["source-att"], items[0]["trello_attachment_ids"])
-        self.assertIn("already has 3 Flow output", items[0]["prompt"])
-        self.assertIn("fresh full 8-image set", items[0]["prompt"])
+        self.assertIn("already has 3/12 Flow output", items[0]["prompt"])
+        self.assertIn("Continue the same set by creating exactly 9 new missing image", items[0]["prompt"])
 
-    def test_auto_trello_fresh_ready_card_generates_full_eight_image_set(self) -> None:
+    def test_auto_trello_fresh_ready_card_generates_full_twelve_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
@@ -395,10 +395,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
-        self.assertEqual(8, items[0]["flow_agent_image_count"])
+        self.assertEqual(12, items[0]["flow_agent_image_count"])
         self.assertEqual(0, items[0]["flow_agent_existing_output_count"])
         self.assertEqual(["source-att"], items[0]["trello_attachment_ids"])
-        self.assertIn("generate exactly 8", items[0]["prompt"])
+        self.assertIn("generate exactly 12", items[0]["prompt"])
+        self.assertIn("clean clear white neutral daylight", items[0]["prompt"])
+        self.assertIn("no yellow/orange/golden/tungsten", items[0]["prompt"])
         self.assertEqual(
             [
                 "Embroidery craft proof",
@@ -409,11 +411,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "Collection variation scene",
                 "Hands embroidering pillowcase",
                 "Personalized detail vignette",
+                "Pastel fabric colorway lineup",
+                "Crib colorway trio",
+                "Pastel swatch flat lay",
+                "Color option display",
             ],
             items[0]["shot_labels"],
         )
 
-    def test_auto_trello_eight_output_card_generates_fresh_full_set_when_explicit(self) -> None:
+    def test_auto_trello_eight_output_card_generates_only_four_colorway_images(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
@@ -431,20 +437,17 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
-        self.assertEqual(8, items[0]["flow_agent_image_count"])
+        self.assertEqual(4, items[0]["flow_agent_image_count"])
         self.assertEqual(8, items[0]["flow_agent_existing_output_count"])
-        self.assertIn("Auto was started again", items[0]["prompt"])
-        self.assertIn("fresh full 8-image set", items[0]["prompt"])
+        self.assertNotIn("Auto was started again", items[0]["prompt"])
+        self.assertIn("already has 8/12 Flow output", items[0]["prompt"])
+        self.assertIn("Continue the same set by creating exactly 4 new missing image", items[0]["prompt"])
         self.assertEqual(
             [
-                "Embroidery craft proof",
-                "Nursery hero arrangement",
-                "Lifestyle baby room scene",
-                "Gift box presentation",
-                "Flat lay motif story",
-                "Collection variation scene",
-                "Hands embroidering pillowcase",
-                "Personalized detail vignette",
+                "Pastel fabric colorway lineup",
+                "Crib colorway trio",
+                "Pastel swatch flat lay",
+                "Color option display",
             ],
             items[0]["shot_labels"],
         )
@@ -550,7 +553,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(0, result["failed"])
         self.assertEqual("abc123", result["card_id"])
 
-    def test_trello_archive_moves_card_to_content_review_after_eight_outputs(self) -> None:
+    def test_trello_archive_moves_card_to_content_review_after_twelve_outputs(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
                 TrelloConfigUpdateRequest(
@@ -570,7 +573,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         artifacts = [
             JobArtifact(label=f"Anh {index + 1}", media_name=f"media-{index}", url=f"https://example.com/cat-{index}.jpg", mime_type="image/jpeg")
-            for index in range(8)
+            for index in range(12)
         ]
         job = JobRecord(type="image", status="running", title="test")
         asyncio.run(self.store.add_job(job))
@@ -580,12 +583,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "_trello_attach_url",
             side_effect=[
                 {"id": f"att-{index}", "name": f"flow-test-{index}.jpg", "url": f"https://trello.example/att-{index}"}
-                for index in range(8)
+                for index in range(12)
             ],
         ) as attach_url, patch.object(
             self.service,
             "_trello_card_flow_output_count",
-            return_value=8,
+            return_value=12,
         ) as output_count, patch.object(
             self.service,
             "_trello_content_review_list_id",
@@ -597,11 +600,11 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ) as move_card:
             result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
 
-        self.assertEqual(8, attach_url.call_count)
+        self.assertEqual(12, attach_url.call_count)
         output_count.assert_called_once_with("key", "token", "abc123")
         review_list.assert_called_once_with("key", "token", "board123", "Content Review")
         move_card.assert_called_once_with("key", "token", "abc123", "review-list")
-        self.assertEqual(8, result["sent"])
+        self.assertEqual(12, result["sent"])
         self.assertTrue(result["content_review"]["moved"])
         self.assertEqual("review-list", result["content_review"]["list_id"])
 
@@ -1160,7 +1163,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual([], cards)
         get_json.assert_not_called()
 
-    def test_trello_image_card_scan_skips_cards_with_any_flow_outputs(self) -> None:
+    def test_trello_image_card_scan_skips_complete_cards_and_keeps_partial_outputs(self) -> None:
         cards_payload = [
             {"id": "done-card", "name": "Done", "idList": "ready-list"},
             {"id": "partial-card", "name": "Partial", "idList": "ready-list"},
@@ -1176,6 +1179,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {"id": "flow-output-6", "name": "flow-abc12345-6.jpg", "mimeType": "image/jpeg"},
             {"id": "flow-output-7", "name": "flow-abc12345-7.jpg", "mimeType": "image/jpeg"},
             {"id": "flow-output-8", "name": "flow-abc12345-8.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-9", "name": "flow-abc12345-9.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-10", "name": "flow-abc12345-10.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-11", "name": "flow-abc12345-11.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-output-12", "name": "flow-abc12345-12.jpg", "mimeType": "image/jpeg"},
         ]
         partial_attachments = [
             {"id": "partial-source", "name": "partial.png", "mimeType": "image/png"},
@@ -1190,10 +1197,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual(["fresh-card"], [card["id"] for card in cards])
-        self.assertEqual("fresh-source", cards[0]["_image_attachments"][0]["id"])
-        self.assertEqual(["fresh-source"], cards[0]["_selected_attachment_ids"])
-        self.assertEqual(0, cards[0]["_flow_output_count"])
+        self.assertEqual(["partial-card", "fresh-card"], [card["id"] for card in cards])
+        self.assertEqual("partial-source", cards[0]["_image_attachments"][0]["id"])
+        self.assertEqual(["partial-source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual(1, cards[0]["_flow_output_count"])
+        self.assertEqual("fresh-source", cards[1]["_image_attachments"][0]["id"])
+        self.assertEqual(["fresh-source"], cards[1]["_selected_attachment_ids"])
+        self.assertEqual(0, cards[1]["_flow_output_count"])
 
     def test_trello_image_card_scan_uses_single_generated_image_name_as_source(self) -> None:
         cards_payload = [{"id": "generated-card", "name": "Generated source", "idList": "ready-list"}]
@@ -1224,7 +1234,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         with patch.object(self.service, "_trello_get_json", side_effect=[cards_payload, attachments]):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual([], [card["id"] for card in cards])
+        self.assertEqual(["card-1"], [card["id"] for card in cards])
+        self.assertEqual("new-source", cards[0]["_image_attachments"][0]["id"])
+        self.assertEqual(["new-source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual(1, cards[0]["_flow_output_count"])
 
     def test_auto_trello_default_scope_includes_ready_and_ideas_lists(self) -> None:
         request = CreateJobRequest(
@@ -1304,6 +1317,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {"id": "done-output-6", "name": "done_pillow_6.png", "mimeType": "image/png"},
             {"id": "done-output-7", "name": "done_pillow_7.png", "mimeType": "image/png"},
             {"id": "done-output-8", "name": "done_pillow_8.png", "mimeType": "image/png"},
+            {"id": "done-output-9", "name": "done_pillow_9.png", "mimeType": "image/png"},
+            {"id": "done-output-10", "name": "done_pillow_10.png", "mimeType": "image/png"},
+            {"id": "done-output-11", "name": "done_pillow_11.png", "mimeType": "image/png"},
+            {"id": "done-output-12", "name": "done_pillow_12.png", "mimeType": "image/png"},
         ]
 
         with patch.object(
@@ -1313,9 +1330,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual([], [card["id"] for card in cards])
+        self.assertEqual(["partial-card"], [card["id"] for card in cards])
+        self.assertEqual(2, cards[0]["_flow_output_count"])
 
-    def test_trello_single_numbered_output_with_source_is_not_reused_as_source(self) -> None:
+    def test_trello_single_numbered_output_with_source_can_continue_missing_set(self) -> None:
         cards_payload = [{"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"}]
         attachments = [
             {"id": "source", "name": "baby_pillowcase.png", "mimeType": "image/png", "date": "2026-05-21T10:00:00.000Z"},
@@ -1325,7 +1343,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         with patch.object(self.service, "_trello_get_json", side_effect=[cards_payload, attachments]):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual([], [card["id"] for card in cards])
+        self.assertEqual(["partial-card"], [card["id"] for card in cards])
+        self.assertEqual(["source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual(1, cards[0]["_flow_output_count"])
 
     def test_trello_image_card_scan_skips_when_only_generated_series_remains(self) -> None:
         cards_payload = [{"id": "output-only-card", "name": "baby_pillowcase", "idList": "ready-list"}]
@@ -1361,6 +1381,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {"id": "flow-6", "name": "flow-done-6.jpg", "mimeType": "image/jpeg"},
             {"id": "flow-7", "name": "flow-done-7.jpg", "mimeType": "image/jpeg"},
             {"id": "flow-8", "name": "flow-done-8.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-9", "name": "flow-done-9.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-10", "name": "flow-done-10.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-11", "name": "flow-done-11.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-12", "name": "flow-done-12.jpg", "mimeType": "image/jpeg"},
         ]
         first_batch_attachments = [
             {"id": "first-source", "name": "source.png", "mimeType": "image/png"},
@@ -1384,8 +1408,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             summary = self.service._auto_trello_ready_for_ai_summary(request)
 
         self.assertIn("Ready for AI co 4 card", summary)
-        self.assertIn("2 card da co anh output nen Auto se bo qua", summary)
-        self.assertIn("1 card chua co output va se tao 8 anh trong 1 lan", summary)
+        self.assertIn("1 card da du 12 anh output nen Auto se bo qua", summary)
+        self.assertIn("2 card chua du output va se tao tiep den du 12 anh", summary)
         self.assertIn("1 card chua co anh nguon", summary)
 
     def test_reset_ready_trello_outputs_deletes_only_generated_images(self) -> None:
@@ -1439,6 +1463,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {"id": "flow-6", "name": "flow-done-6.jpg", "mimeType": "image/jpeg"},
             {"id": "flow-7", "name": "flow-done-7.jpg", "mimeType": "image/jpeg"},
             {"id": "flow-8", "name": "flow-done-8.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-9", "name": "flow-done-9.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-10", "name": "flow-done-10.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-11", "name": "flow-done-11.jpg", "mimeType": "image/jpeg"},
+            {"id": "flow-12", "name": "flow-done-12.jpg", "mimeType": "image/jpeg"},
         ]
         new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
         empty_attachments: list[dict] = []
@@ -1458,14 +1486,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["complete"])
         self.assertEqual(1, result["eligible"])
         self.assertEqual(1, result["without_source"])
-        self.assertEqual(8, result["target_output_count"])
+        self.assertEqual(12, result["target_output_count"])
         card_statuses = {card["id"]: card["status"] for card in result["cards"]}
         self.assertEqual("complete", card_statuses["done-card"])
         self.assertEqual("eligible", card_statuses["new-card"])
         self.assertEqual("no_source", card_statuses["empty-card"])
         missing_counts = {card["id"]: card["missing_count"] for card in result["cards"]}
         self.assertEqual(0, missing_counts["done-card"])
-        self.assertEqual(8, missing_counts["new-card"])
+        self.assertEqual(12, missing_counts["new-card"])
 
     def test_ready_trello_status_uses_board_card_attachments_when_available(self) -> None:
         request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
@@ -1485,6 +1513,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                     {"id": "flow-6", "name": "flow-done-6.jpg", "mimeType": "image/jpeg"},
                     {"id": "flow-7", "name": "flow-done-7.jpg", "mimeType": "image/jpeg"},
                     {"id": "flow-8", "name": "flow-done-8.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-9", "name": "flow-done-9.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-10", "name": "flow-done-10.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-11", "name": "flow-done-11.jpg", "mimeType": "image/jpeg"},
+                    {"id": "flow-12", "name": "flow-done-12.jpg", "mimeType": "image/jpeg"},
                 ],
             },
             {
@@ -2120,7 +2152,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("áo trẻ em", result["product_filter"])
         self.assertIn("Trello", result["summary"])
         self.assertIn("Google Flow Agent", result["flow_prompt"])
-        self.assertIn("generate exactly 8", result["flow_prompt"])
+        self.assertIn("generate exactly 12", result["flow_prompt"])
         self.assertIn("selected Trello attachment", result["flow_prompt"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertIn("apply_product_filter", action_names)
@@ -2192,7 +2224,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "title": "Flow AI Gemini",
             "summary": "Gemini đã lập kế hoạch operator.",
             "product_filter": "gấu bông",
-            "flow_prompt": "Use Google Flow Agent as the prompt writer and image-generation operator. Use the selected Trello attachment as the exact teddy bear product reference, analyze the product first, then write internal prompts and generate exactly 8 commercial product images with coherent teddy bear styling, soft daylight, clean composition, realistic fabric texture, and no extra text or watermark.",
+            "flow_prompt": "Use Google Flow Agent as the prompt writer and image-generation operator. Use the selected Trello attachment as the exact teddy bear product reference, analyze the product first, then write internal prompts and generate exactly 12 commercial product images with coherent teddy bear styling, clean white daylight, clean composition, realistic fabric texture, pastel fabric colorway variants, and no extra text or watermark.",
             "steps": [{"label": "Tìm ảnh", "detail": "Dùng card Ready for AI.", "status": "sẵn sàng"}],
             "safety_notes": ["Không chạy nếu chưa thấy card đúng."],
         }
@@ -2208,7 +2240,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("Flow AI Gemini", result["title"])
         self.assertEqual("gấu bông", result["product_filter"])
         self.assertIn("Google Flow Agent", result["flow_prompt"])
-        self.assertIn("generate exactly 8", result["flow_prompt"])
+        self.assertIn("generate exactly 12", result["flow_prompt"])
         self.assertIn("apply_flow_ai_prompt", [action.get("action") for action in result["suggested_actions"]])
 
     def test_flow_module_setting_can_disable_flow_agent(self) -> None:
@@ -4960,7 +4992,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("", base.trello_card_id)
         self.assertEqual([], base.trello_attachment_ids)
         self.assertEqual("square", base.aspect)
-        self.assertEqual(8, base.count)
+        self.assertEqual(12, base.count)
         self.assertTrue(base.flow_agent_enabled)
         self.assertTrue(base.flow_agent_auto_approve)
         graph = base.automation_graph.model_dump(mode="json")
@@ -4972,7 +5004,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             self.assertEqual([], module["settings"]["trelloAttachmentIds"])
         flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
         self.assertEqual("square", flow_module["settings"]["imageAspect"])
-        self.assertEqual(8, flow_module["settings"]["imageCount"])
+        self.assertEqual(12, flow_module["settings"]["imageCount"])
         self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
         self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
 
@@ -5076,7 +5108,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
         self.assertTrue(saved.input["items"][0]["generated_by_flow_agent"])
         self.assertFalse(saved.input["items"][0]["generated_by_ai"])
-        self.assertEqual(8, saved.input["items"][0]["flow_agent_image_count"])
+        self.assertEqual(12, saved.input["items"][0]["flow_agent_image_count"])
         self.assertEqual(
             [
                 "Craft detail proof",
@@ -5087,16 +5119,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "Gift ready scene",
                 "Hands sewing doll detail",
                 "Handheld scale detail",
+                "Pastel fabric colorway lineup",
+                "Soft room colorway trio",
+                "Pastel swatch flat lay",
+                "Color option display",
             ],
             saved.input["items"][0]["shot_labels"],
         )
         self.assertEqual("card-bear", seen[0][1])
         self.assertEqual("square", seen[0][2])
-        self.assertEqual(8, seen[0][3])
+        self.assertEqual(12, seen[0][3])
         self.assertTrue(seen[0][4])
         self.assertTrue(seen[0][5])
         self.assertIn("Google Flow Agent", seen[0][0])
-        self.assertIn("generate exactly 8", seen[0][0])
+        self.assertIn("generate exactly 12", seen[0][0])
+        self.assertIn("clean clear white neutral daylight", seen[0][0])
         self.assertIn("selected Trello attachment", seen[0][0])
         self.assertIn("sticker", seen[0][0])
         self.assertIn("price tag", seen[0][0])
@@ -5270,14 +5307,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "Gift artisan scene",
                 "Hands embroidering apron",
                 "Prep table detail",
+                "Pastel fabric colorway lineup",
+                "Soft room colorway trio",
+                "Pastel swatch flat lay",
+                "Color option display",
             ],
             saved.input["items"][0]["shot_labels"],
         )
         self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
-        self.assertEqual(8, saved.input["items"][0]["flow_agent_image_count"])
+        self.assertEqual(12, saved.input["items"][0]["flow_agent_image_count"])
         self.assertIn("hand-embroidered", seen_prompts[0])
         self.assertIn("Extreme macro close-up", seen_prompts[0])
-        self.assertIn("generate exactly 8", seen_prompts[0])
+        self.assertIn("generate exactly 12", seen_prompts[0])
+        self.assertIn("clean clear white neutral daylight", seen_prompts[0])
         self.assertTrue(all("Before creating images, carefully analyze" in prompt for prompt in seen_prompts))
         self.assertIn("apron silhouette", saved.input["items"][0]["design_analysis"])
 
@@ -5363,6 +5405,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "Collection variation scene",
                 "Hands embroidering pillowcase",
                 "Personalized detail vignette",
+                "Pastel fabric colorway lineup",
+                "Crib colorway trio",
+                "Pastel swatch flat lay",
+                "Color option display",
             ],
             saved.input["items"][0]["shot_labels"],
         )
@@ -5461,11 +5507,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "Gift ready scene",
                 "Hands sewing doll detail",
                 "Handheld scale detail",
+                "Pastel fabric colorway lineup",
+                "Soft room colorway trio",
+                "Pastel swatch flat lay",
+                "Color option display",
             ],
             saved.input["items"][0]["shot_labels"],
         )
         self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
-        self.assertEqual(8, saved.input["items"][0]["flow_agent_image_count"])
+        self.assertEqual(12, saved.input["items"][0]["flow_agent_image_count"])
         combined = "\n".join([*seen_prompts, saved.input["items"][0]["design_analysis"]]).lower()
         self.assertIn("doll", combined)
         self.assertNotIn("apron silhouette", combined)
@@ -5913,6 +5963,48 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("price tag", prompt)
         self.assertIn("barcode", prompt)
         self.assertNotIn("name tag", prompt)
+
+    async def test_generate_images_via_ui_splits_flow_agent_twelve_images_into_x8_and_x4(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="tao bo anh san pham",
+            count=12,
+            flow_agent_enabled=True,
+            flow_agent_auto_approve=True,
+            reference_image_paths=["/tmp/source.jpg"],
+        )
+        first_batch = [SimpleNamespace(media_name=f"img-a-{index}") for index in range(8)]
+        second_batch = [SimpleNamespace(media_name=f"img-b-{index}") for index in range(4)]
+        fake_client = SimpleNamespace()
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="source-workflow"),
+        ), patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(side_effect=[first_batch, second_batch]),
+        ) as single_ref, patch.object(
+            self.service,
+            "_sleep_between_flow_agent_batches",
+            new=AsyncMock(),
+        ) as pause:
+            result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"], job_id=job.id)
+
+        self.assertEqual([*first_batch, *second_batch], result)
+        self.assertEqual([8, 4], [call.kwargs["count"] for call in single_ref.await_args_list])
+        first_prompt = single_ref.await_args_list[0].args[1]
+        second_prompt = single_ref.await_args_list[1].args[1]
+        self.assertIn("images 1-8 of a 12-image product set", first_prompt)
+        self.assertIn("using the x8 image setting", first_prompt)
+        self.assertIn("images 9-12 of a 12-image product set", second_prompt)
+        self.assertIn("using the x4 image setting", second_prompt)
+        self.assertIn("pastel fabric colorway lineup image", second_prompt)
+        self.assertIn("no yellow, orange, golden-hour", second_prompt)
+        pause.assert_awaited_once_with(job.id, 2, 2)
 
     async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
         events: list[str] = []

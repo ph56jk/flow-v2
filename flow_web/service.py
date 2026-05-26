@@ -122,8 +122,9 @@ class FlowWebService:
     USER_ASSISTANT_CONTEXT_LIMIT = 1200
     USER_ASSISTANT_ANSWER_LIMIT = 1400
     AI_PROMPT_SUITE_SIZE = 6
-    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 8
-    FLOW_AGENT_TARGET_OUTPUT_COUNT = 8
+    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12
+    FLOW_AGENT_TARGET_OUTPUT_COUNT = 12
+    FLOW_AGENT_MAX_IMAGES_PER_RUN = 8
     FLOW_AGENT_BATCH_PAUSE_MIN_S = 60
     FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
@@ -1950,7 +1951,7 @@ class FlowWebService:
             title = (
                 str(request.title or "").strip()
                 or (
-                    f"Auto Trello Flow Agent: tạo 8 ảnh cho {len(items)} card"
+                    f"Auto Trello Flow Agent: tạo {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh cho {len(items)} card"
                     if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
                     else f"Auto Trello Flow Agent: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
                     if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
@@ -2538,6 +2539,9 @@ class FlowWebService:
             min_s, max_s = max_s, min_s
         return min_s, max_s
 
+    def _flow_agent_max_images_per_run(self) -> int:
+        return max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(self.FLOW_AGENT_MAX_IMAGES_PER_RUN or 1)))
+
     async def _sleep_between_flow_agent_batches(self, batch_id: str, next_index: int, total: int) -> None:
         min_s, max_s = self._flow_agent_batch_pause_range_s()
         if max_s <= 0:
@@ -2707,13 +2711,14 @@ class FlowWebService:
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
             output_count = len(outputs)
+            target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
             status = "no_source"
-            if sources and output_count:
+            if sources and output_count >= target_output_count:
                 complete += 1
                 status = "complete"
             elif sources:
                 eligible += 1
-                status = "eligible"
+                status = "partial" if output_count else "eligible"
             else:
                 no_source += 1
             card_summaries.append(
@@ -2725,7 +2730,7 @@ class FlowWebService:
                     "status": status,
                     "source_count": len(sources),
                     "output_count": output_count,
-                    "missing_count": 0 if output_count else max(0, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - output_count) if sources else 0,
+                    "missing_count": max(0, target_output_count - output_count) if sources else 0,
                 }
             )
         return {
@@ -2934,7 +2939,7 @@ class FlowWebService:
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(images)
             output_count = len(outputs)
-            if sources and output_count:
+            if sources and output_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
                 complete += 1
             elif sources:
                 eligible += 1
@@ -2944,13 +2949,13 @@ class FlowWebService:
 
         parts = [f"{scope_label} co {len(cards)} card"]
         if complete:
-            parts.append(f"{complete} card da co anh output nen Auto se bo qua")
+            parts.append(f"{complete} card da du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh output nen Auto se bo qua")
         if no_output:
-            parts.append(f"{no_output} card chua co output va se tao 8 anh trong 1 lan")
+            parts.append(f"{no_output} card chua du output va se tao tiep den du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         if no_source:
             parts.append(f"{no_source} card chua co anh nguon hop le")
         if not eligible and complete:
-            parts.append("Auto dang cho card moi hoac card duoc reset de tao lai du 8 anh")
+            parts.append(f"Auto dang cho card moi hoac card duoc reset de tao lai du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         return "; ".join(parts) + "."
 
     async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
@@ -3333,7 +3338,7 @@ class FlowWebService:
             f"Then write your own internal image prompts and generate exactly {target} commercial product images{product_text}.",
             "Use the selected Trello attachment as the exact source product reference; preserve product identity, shape, design, colors, and material texture.",
             "Only change scene, styling, lighting, composition, model/background, and merchandising context.",
-            "The image set should include: 1 detail/craft proof close-up, 1 full product hero, 1 lifestyle use scene, and 1 flat lay or gift-ready merchandising shot.",
+            "The image set should include: detail/craft proof close-up, full product hero, lifestyle use scene, flat lay/gift-ready merchandising, hands sewing/embroidering, and four pastel fabric colorway variation shots when the product is fabric-based.",
             "If the product appears hand embroidered, one image must clearly prove it with visible thread texture and raised stitches.",
             self._flow_agent_reference_prompt_style_guide(target),
             "Do not rely on Google Sheet prompts; do not ask the local app AI to write the final prompt.",
@@ -3351,7 +3356,9 @@ class FlowWebService:
             "For every shot, specify the subject count, exact product placement, background, props, lighting direction, camera angle, and which source details must stay unchanged. "
             "Keep all source motifs, embroidery/print placement, names, colors, fabric texture, proportions, and handmade irregularities consistent. "
             "For handmade or embroidered products, include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
-            "Use soft bright natural light, airy clean styling, warm nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography. "
+            "Use clean clear white neutral daylight for every image: soft bright studio or nursery light, accurate white balance, crisp whites, and no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
+            "Use airy clean styling, white nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography. "
+            "For fabric products, include pastel colorway variety when the shot plan allows: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow fabric options while preserving the source motif and embroidery style. "
             + self._flow_agent_no_tag_label_rule()
         )
 
@@ -3474,7 +3481,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy automation Flow",
-                    "detail": f"Quét {self._trello_source_scope_label()}, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo 8 ảnh trong một job, rồi upload về đúng card Trello để duyệt.",
+                    "detail": f"Quét {self._trello_source_scope_label()}, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh, rồi upload về đúng card Trello để duyệt.",
                     "action": "run_auto_trello",
                     "payload": {"limit": 1, "test_mode": True} if "test" in self._normalize_skill_token(instruction) else {},
                     "requires_confirmation": True,
@@ -3504,7 +3511,7 @@ class FlowWebService:
             "title": "Flow AI Operator",
             "summary": (
                 "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, chuẩn bị lệnh cho Tác nhân Google Flow, "
-                "để Flow Agent tự viết prompt/tạo 8 ảnh trong một job rồi upload ngay về đúng card Trello để duyệt."
+                f"để Flow Agent tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh rồi upload ngay về đúng card Trello để duyệt."
             ),
             "intent": "trello_sheet_flow_telegram_automation",
             "product_filter": product_filter,
@@ -3525,7 +3532,7 @@ class FlowWebService:
             [
                 "Bạn là Flow AI Operator trong app Flow v2.",
                 "Nhiệm vụ: biến yêu cầu người dùng thành kế hoạch automation có thể thao tác Google Flow.",
-                f"Quy trình bắt buộc: Trello {self._trello_source_scope_label()} attachment -> app chọn đúng card/ảnh -> ưu tiên nút Tác nhân/Agent trong Google Flow -> Flow Agent tự viết prompt và tạo/chỉnh 8 ảnh trong một job bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
+                f"Quy trình bắt buộc: Trello {self._trello_source_scope_label()} attachment -> app chọn đúng card/ảnh -> ưu tiên nút Tác nhân/Agent trong Google Flow -> Flow Agent tự viết prompt và tạo/chỉnh đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
                 "Bạn không được yêu cầu secret trong chat và không in API key/token/cookie.",
                 "Trả về duy nhất JSON object, không markdown.",
                 "Schema JSON:",
@@ -3764,7 +3771,7 @@ class FlowWebService:
         gemini = context.get("gemini", {})
         jobs = context.get("jobs", {})
         lines = [
-            f"Quy trình chuẩn: Trello {self._trello_source_scope_label()} card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo 8 ảnh trong một job -> upload lại đúng card Trello để duyệt trực tiếp.",
+            f"Quy trình chuẩn: Trello {self._trello_source_scope_label()} card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh -> upload lại đúng card Trello để duyệt trực tiếp.",
             f"Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list {self._trello_source_scope_label()}; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
             f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}; Auto AI Trello dùng Tác nhân Flow nên không bắt buộc workflow mặc định ({'workflow chỉnh sửa đã chọn' if flow.get('workflow_set') else 'workflow chỉnh sửa đang để trống'}).",
             f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
@@ -4066,7 +4073,7 @@ class FlowWebService:
                     "detail": (
                         "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Trello."
                         if test_run
-                        else f"App sẽ quét card {self._trello_source_scope_label()} có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo 8 ảnh trong một job rồi upload về đúng card Trello."
+                        else f"App sẽ quét card {self._trello_source_scope_label()} có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh rồi upload về đúng card Trello."
                     ),
                     "action": "run_auto_trello",
                     "payload": payload,
@@ -4476,7 +4483,7 @@ class FlowWebService:
         prompt_text = "\n".join(
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
-                "Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo 8 ảnh trong một job, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
+                f"Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
                 "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, chọn đúng card/ảnh và đưa các nút thao tác thật; prompt ảnh cuối do Tác nhân trong Google Flow viết.",
                 f"Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list {self._trello_source_scope_label()}. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
                 "Không được yêu cầu người dùng chọn workflow mặc định để chạy Auto AI Trello; workflow mặc định chỉ hữu ích cho luồng chỉnh/sửa ảnh cũ, còn Auto AI Trello chạy bằng project Flow + Tác nhân Flow + ảnh Trello.",
@@ -8787,7 +8794,7 @@ exit 1
         if signals.get("is_embroidery"):
             product_bits.append("hand-embroidered thread texture, stitch direction, raised thread, motif placement, and handmade craft cues")
         if signals.get("is_baking"):
-            product_bits.append("warm bakery/kitchen context, baking tools, flour, pastry props, and clean food-safe styling")
+            product_bits.append("bright neutral bakery/kitchen context, baking tools, flour, pastry props, and clean food-safe styling")
         if not product_bits:
             product_bits.append("product type, base color, material texture, print/embroidery details, silhouette, scale, and hero features")
 
@@ -8801,6 +8808,79 @@ exit 1
             + ". Keep those design features consistent across the whole image set."
             + source_hint
         )
+
+    def _flow_operator_colorway_variant_shots(self, product_label: str = "product") -> List[Dict[str, str]]:
+        label = str(product_label or "product").strip().lower()
+        palette = "ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow"
+        if label in {"pillowcase", "pillow", "cushion"}:
+            return [
+                {
+                    "label": "Pastel fabric colorway lineup",
+                    "brief": (
+                        "White-daylight nursery shelf or crib display with three to four pillow/cushion colorways side by side, inspired by the reference examples: "
+                        f"{palette}. Keep the same personalized embroidery style, motif scale, stitch texture, and pillow shape while varying only the fabric base colors."
+                    ),
+                    "must_include": "multiple pastel fabric colors, white neutral daylight, same pillow embroidery style, no tag or label",
+                },
+                {
+                    "label": "Crib colorway trio",
+                    "brief": (
+                        "Clean white crib or nursery-bed scene showing a coordinated trio of pillow/cushion color options, such as ivory, blush pink, and mint or pale blue. "
+                        "The motif and name style must feel like the same handmade product family, with crisp whites and no yellow cast."
+                    ),
+                    "must_include": "crib or nursery bed, three pastel fabric variants, source motif/name style preserved, clean white light",
+                },
+                {
+                    "label": "Pastel swatch flat lay",
+                    "brief": (
+                        "Overhead merchandising flat lay with the pillow/cushion plus folded fabric swatches and matching embroidery threads in pastel color options. "
+                        "Show fabric weave and soft handmade texture clearly in neutral white daylight."
+                    ),
+                    "must_include": "fabric swatches, pastel palette, embroidery thread, pillow texture, no tags",
+                },
+                {
+                    "label": "Color option display",
+                    "brief": (
+                        "Ecommerce color-option display with four separate pillow/cushion variants arranged naturally, not as a grid or collage, using pastel fabric colors from the reference examples. "
+                        "Keep each option realistic, softly stuffed, and consistent with the source product's motif and embroidery quality."
+                    ),
+                    "must_include": "four color options, pastel fabric variety, exact handmade style, white balanced light",
+                },
+            ]
+        return [
+            {
+                "label": "Pastel fabric colorway lineup",
+                "brief": (
+                    f"Clean white-daylight product lineup showing coordinated {label} fabric colorways in {palette}. "
+                    "Keep the exact source product category, motif, print or embroidery style, proportions, and handmade texture; vary only fabric base colors when plausible."
+                ),
+                "must_include": "pastel fabric variety, source product identity, white neutral daylight, no tag or label",
+            },
+            {
+                "label": "Soft room colorway trio",
+                "brief": (
+                    f"Bright white nursery/home/studio scene with three coordinated {label} color options in soft pastel fabric colors. "
+                    "The design must look like one product family and must avoid yellow or warm color grading."
+                ),
+                "must_include": "three pastel variants, white balanced room light, source design preserved",
+            },
+            {
+                "label": "Pastel swatch flat lay",
+                "brief": (
+                    f"Overhead flat lay with the {label} beside folded pastel fabric swatches, matching thread, and restrained craft props. "
+                    "Show fabric texture and material options without adding tags, labels, price cards, or text overlays."
+                ),
+                "must_include": "fabric swatches, pastel palette, material texture, no tags",
+            },
+            {
+                "label": "Color option display",
+                "brief": (
+                    f"Ecommerce merchandising display with four natural {label} color options arranged as real products, not a collage. "
+                    "Preserve the source motif/design quality while varying fabric colors like ivory, pale blue, mint, blush, and butter yellow."
+                ),
+                "must_include": "four color options, product family consistency, clean white daylight",
+            },
+        ]
 
     def _flow_operator_shot_suite_for_trello_card(
         self,
@@ -8828,8 +8908,8 @@ exit 1
                 },
                 {
                     "label": "Lifestyle baking action",
-                    "brief": "Lifestyle image in a warm bakery or home kitchen, model wearing the apron while decorating pastries or preparing dough, natural movement and believable cooking context.",
-                    "must_include": "apron in use, baking props, warm kitchen light, embroidery still visible",
+                    "brief": "Lifestyle image in a bright neutral bakery or white home kitchen, model wearing the apron while decorating pastries or preparing dough, natural movement and believable cooking context.",
+                    "must_include": "apron in use, baking props, clean white daylight, embroidery still visible",
                 },
                 {
                     "label": "Back tie fit",
@@ -8856,6 +8936,7 @@ exit 1
                     "brief": "Close commercial scene on a kitchen prep table with flour, rolling pin, or pastry tools while the apron remains the main product and embroidery stays visible.",
                     "must_include": "kitchen prep context, embroidery visible, premium product styling",
                 },
+                *self._flow_operator_colorway_variant_shots("apron"),
             ]
 
         if signals.get("is_doll") or signals.get("is_plush"):
@@ -8878,7 +8959,7 @@ exit 1
                 },
                 {
                     "label": "Lifestyle nursery scene",
-                    "brief": "Warm lifestyle product photo in a nursery, playroom, child's bedroom, or gift setting where the doll/plush feels natural and premium.",
+                    "brief": "Bright clean lifestyle product photo in a nursery, playroom, child's bedroom, or gift setting where the doll/plush feels natural and premium.",
                     "must_include": "doll/plush in use, soft child-friendly styling, realistic natural light",
                 },
                 {
@@ -8906,6 +8987,7 @@ exit 1
                     "brief": "Gentle close lifestyle shot with hands holding or presenting the doll/plush to show size, softness, fabric pile, seams, and tactile handmade quality.",
                     "must_include": "hands for scale, tactile detail, source product unchanged",
                 },
+                *self._flow_operator_colorway_variant_shots("doll/plush"),
             ]
 
         if signals.get("is_pillowcase"):
@@ -8925,7 +9007,7 @@ exit 1
                 },
                 {
                     "label": "Lifestyle baby room scene",
-                    "brief": "Warm lifestyle scene in a baby room or play corner, optionally with a parent or baby safely interacting near the pillow while the embroidered design remains visible and unchanged.",
+                    "brief": "Bright clean lifestyle scene in a baby room or play corner, optionally with a parent or baby safely interacting near the pillow while the embroidered design remains visible and unchanged.",
                     "must_include": "pillow in use context, gentle baby-safe props, embroidery still visible",
                 },
                 {
@@ -8953,6 +9035,7 @@ exit 1
                     "brief": "Commercial close vignette focused on the name, motif, or personalized embroidery with matching soft props while preserving every stitch and fabric color from the source.",
                     "must_include": "personalized embroidery detail, matching props, exact stitching and fabric color",
                 },
+                *self._flow_operator_colorway_variant_shots("pillowcase"),
             ]
 
         if signals.get("is_child_shirt") or signals.get("is_shirt"):
@@ -8997,6 +9080,7 @@ exit 1
                     "brief": "Clean ecommerce merchandising scene with the shirt folded or stacked with simple matching accessories while the main design remains visible and premium.",
                     "must_include": "folded shirt, design visible, premium merchandising styling",
                 },
+                *self._flow_operator_colorway_variant_shots("shirt"),
             ]
 
         return [
@@ -9040,6 +9124,7 @@ exit 1
                 "brief": "Clean commercial display with tasteful props, scale cues, and premium styling that keeps the exact source product as the clear main subject.",
                 "must_include": "commercial display, scale cues, exact source product identity",
             },
+            *self._flow_operator_colorway_variant_shots("product"),
         ]
 
     def _flow_operator_prompt_for_trello_card(
@@ -9062,7 +9147,7 @@ exit 1
         target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
         target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
         existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
-        rerun_full_set = existing_flow_count > 0 and target_count >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+        rerun_full_set = existing_flow_count >= target_output_count and target_count >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
         all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
         shot_start = 0 if rerun_full_set else existing_flow_count
         shots = all_shots[shot_start : shot_start + target_count]
@@ -9081,8 +9166,8 @@ exit 1
             )
         elif existing_flow_count:
             resume_note = (
-                f"This Trello card already has {existing_flow_count} Flow output image(s), but the user explicitly started it again. "
-                f"Create a fresh full {target_count}-image set from the Ready for AI source image; do not reuse old outputs."
+                f"This Trello card already has {existing_flow_count}/{target_output_count} Flow output image(s). "
+                f"Continue the same set by creating exactly {target_count} new missing image(s), starting after the existing outputs; do not remake, reuse, or reinterpret the old outputs."
             )
         else:
             resume_note = ""
@@ -9094,6 +9179,7 @@ exit 1
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
+            "Lighting and color rule for every output: clean clear white neutral daylight, accurate whites, crisp bright product color, no yellow/orange/golden/tungsten/sepia/beige cast, and no warm color grading.",
             (
                 "Product-specific notes from the Trello card description: "
                 f"{card_description_note}"
@@ -9141,8 +9227,8 @@ exit 1
             card_url = str(card.get("url") or "").strip()
             selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
             existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
-            rerun_full_set = existing_flow_count > 0
-            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+            rerun_full_set = existing_flow_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT if rerun_full_set else max(1, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - existing_flow_count)
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
             shot_start = 0 if rerun_full_set else existing_flow_count
@@ -9414,7 +9500,7 @@ exit 1
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
             source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
-            if flow_outputs:
+            if len(flow_outputs) >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
                 continue
             if source_attachments:
                 card["_image_attachments"] = source_attachments
@@ -14791,6 +14877,89 @@ exit 1
             if flow_agent_enabled and not source_workflow_id:
                 raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
+            if flow_agent_enabled and target_count > self._flow_agent_max_images_per_run():
+                max_per_run = self._flow_agent_max_images_per_run()
+                run_counts: List[int] = []
+                remaining = target_count
+                while remaining > 0:
+                    run_count = max(1, min(max_per_run, remaining))
+                    run_counts.append(run_count)
+                    remaining -= run_count
+
+                generated: List[Any] = []
+                for run_index, run_count in enumerate(run_counts):
+                    prompt = self._flow_agent_multi_image_prompt(
+                        request.prompt,
+                        run_count,
+                        shot_offset=len(generated),
+                        full_total=target_count,
+                    )
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            f"Flow Agent tao luot {run_index + 1}/{len(run_counts)}: {run_count}/{target_count} anh bang setting x{run_count}.",
+                        )
+
+                    tries = 3
+                    last_exc: Exception | None = None
+                    batch_generated: List[Any] = []
+                    for attempt in range(tries):
+                        try:
+                            batch_generated = await self._generate_single_reference_image_via_ui(
+                                client,
+                                prompt,
+                                model=request.model,
+                                workflow_id=source_workflow_id,
+                                reference_media_name=reference_media_names[0],
+                                reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                                count=run_count,
+                                timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+                                flow_agent_enabled=True,
+                                flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
+                                job_id=job_id,
+                            )
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            normalized_detail = str(exc or "").lower()
+                            retryable = any(
+                                marker in normalized_detail
+                                for marker in (
+                                    "invalid argument",
+                                    "recaptcha",
+                                    "403",
+                                    "timeout",
+                                    "thoi gian cho",
+                                    "chua tra ve anh",
+                                )
+                            )
+                            if not retryable or attempt >= tries - 1:
+                                raise
+                            if job_id:
+                                await self.store.append_log(
+                                    job_id,
+                                    f"Flow Agent bao ban/reCAPTCHA khi tao x{run_count}; app nghi roi thu lai 1 lan.",
+                                )
+                            await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
+
+                    if not batch_generated and last_exc is not None:
+                        raise last_exc
+                    if len(batch_generated) < run_count:
+                        raise RuntimeError(
+                            f"Flow Agent chi tao duoc {len(batch_generated)}/{run_count} anh trong luot x{run_count}. "
+                            "App da dung truoc khi upload len Trello de tranh bo anh thieu."
+                        )
+                    generated.extend(batch_generated[:run_count])
+                    if len(generated) < target_count:
+                        if job_id:
+                            await self._sleep_between_flow_agent_batches(job_id, run_index + 2, len(run_counts))
+                        else:
+                            min_s, max_s = self._flow_agent_batch_pause_range_s()
+                            if max_s > 0:
+                                await asyncio.sleep(float(random.randint(min_s, max_s)))
+
+                return generated[:target_count]
+
             prompt = request.prompt
             if flow_agent_enabled:
                 prompt = self._flow_agent_multi_image_prompt(request.prompt, target_count)
@@ -14926,27 +15095,79 @@ exit 1
                 "label": "commercial merchandising display image",
                 "brief": (
                     "Make a clean ecommerce merchandising display with tasteful props, scale cues, and premium styling. "
-                    "Keep the exact source product as the clear main subject and make this composition visibly different from the other seven images."
+                    "Keep the exact source product as the clear main subject and make this composition visibly different from the other images."
                 ),
                 "must_not": "Do not repeat a previous background, camera angle, or prop layout.",
             },
+            {
+                "label": "pastel fabric colorway lineup image",
+                "brief": (
+                    "Make a clean white-daylight lineup of coordinated fabric colorways inspired by the supplied examples: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow. "
+                    "Show real product variants side by side when plausible, preserving the source motif, embroidery/print style, fabric texture, and product shape."
+                ),
+                "must_not": "Do not make a collage, grid, label card, price tag, or unrelated color palette board.",
+            },
+            {
+                "label": "white nursery color variation image",
+                "brief": (
+                    "Make a bright white nursery, shelf, crib, or clean home scene with several soft pastel fabric variants displayed naturally. "
+                    "Use crisp white balanced daylight only, no yellow cast, and keep the product family visually consistent."
+                ),
+                "must_not": "Do not use warm golden light, beige color grading, dark shadows, or a repeated hero composition.",
+            },
+            {
+                "label": "pastel swatch material flat lay image",
+                "brief": (
+                    "Make an overhead material-options flat lay with the product plus folded pastel fabric swatches and matching thread or craft tools. "
+                    "Show fabric weave, thread texture, and color choices clearly in neutral white studio light."
+                ),
+                "must_not": "Do not add tags, labels, barcodes, handwritten notes, or extra text overlays.",
+            },
+            {
+                "label": "four color option ecommerce image",
+                "brief": (
+                    "Make a polished ecommerce display with four natural product color options arranged as real objects, not a contact sheet. "
+                    "Use pastel fabric variety like the examples while preserving the source design quality and handmade construction."
+                ),
+                "must_not": "Do not create a multi-panel grid, do not change the product category, and do not add any tag or sale badge.",
+            },
         ]
 
-    def _flow_agent_multi_image_prompt(self, prompt: str, total: int) -> str:
+    def _flow_agent_multi_image_prompt(self, prompt: str, total: int, *, shot_offset: int = 0, full_total: int | None = None) -> str:
         total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(total or 1)))
-        shot_specs = self._flow_agent_shot_specs()[:total]
+        full_total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(full_total or total)))
+        shot_offset = max(0, min(full_total - 1, int(shot_offset or 0)))
+        all_shot_specs = self._flow_agent_shot_specs()
+        shot_specs = all_shot_specs[shot_offset : shot_offset + total]
+        if len(shot_specs) < total and all_shot_specs:
+            shot_specs = [*shot_specs, *all_shot_specs[: total - len(shot_specs)]]
         shot_lines = " ".join(
-            f"{index}. {shot['label']}: {shot['brief']} Negative direction: {shot['must_not']}"
+            f"{shot_offset + index}. {shot['label']}: {shot['brief']} Negative direction: {shot['must_not']}"
             for index, shot in enumerate(shot_specs, start=1)
         )
         base = str(prompt or "").strip()
+        has_base_shot_plan = "Required shot plan:" in base
+        shot_plan_text = (
+            "Follow the Required shot plan already written in the base brief exactly; do not replace it with generic shot ideas. "
+            if has_base_shot_plan
+            else f"CURRENT SHOT PLAN: {shot_lines} "
+        )
+        if full_total > total or shot_offset:
+            run_scope = (
+                f"This is images {shot_offset + 1}-{min(full_total, shot_offset + total)} of a {full_total}-image product set. "
+                f"Override any earlier full-set count in the base brief for this UI pass: create exactly {total} outputs now, not {full_total}. "
+                "The app will handle the other images in separate Flow passes."
+            )
+        else:
+            run_scope = "This run must produce the full image set."
         correction = (
             f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
+            f"{run_scope} "
             "Each output must be its own separate 1:1 image file, not panels inside one canvas. "
-            "The local app will not call Flow Agent four separate times, so this one run must produce the full set. "
-            f"CURRENT SHOT PLAN: {shot_lines} "
+            f"{shot_plan_text}"
             "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
             "If two ideas look like the same product-on-table view, change one before generating. "
+            "Lighting for every output must be clean clear white neutral daylight with accurate whites; no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
             f"{self._flow_agent_no_tag_label_rule()} "
             "Use the attached Trello source product image as the reference for every output. "
