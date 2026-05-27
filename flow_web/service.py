@@ -9707,6 +9707,17 @@ exit 1
         card_description_note = self._flow_operator_trello_card_description_note(card)
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         signals = self._flow_operator_card_product_signals(request, card)
+        card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+        source_attachment_ids = [
+            str(item or "").strip()
+            for item in (
+                card.get("_selected_attachment_ids")
+                or getattr(request, "trello_source_attachment_ids", None)
+                or getattr(request, "trello_attachment_ids", None)
+                or []
+            )
+            if str(item or "").strip()
+        ]
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
         target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
@@ -9738,15 +9749,21 @@ exit 1
             resume_note = ""
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
+            self._flow_agent_fresh_context_rule(),
             design_analysis,
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
             (
+                f"Current source lock: Trello card id {card_id}"
+                + (f", selected attachment id(s) {', '.join(source_attachment_ids)}" if source_attachment_ids else "")
+                + ". Do not use any other card, attachment, Flow project image, or previous Flow Agent task as the source."
+            ) if card_id or source_attachment_ids else "",
+            (
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
-                "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as bear/sheep/flower. "
+                "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
                 "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
-                "If the source is a square pillow with a sheep embroidery, every main product must remain that same square pillow with the same sheep embroidery placement; it must not become baby shirts, hanging banners, blankets, hoops, or fabric samples with the motif copied onto them."
+                "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
             (
                 "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
@@ -9780,6 +9797,13 @@ exit 1
         if card_url:
             brief_parts.append(f"Source card: {card_url}.")
         return " ".join(part for part in brief_parts if part)
+
+    def _flow_agent_fresh_context_rule(self) -> str:
+        return (
+            "Fresh-task isolation: treat this message as a new isolated task. Ignore every previous Flow Agent chat message, "
+            "approval brief, side-panel title, project memory, old card, prior output set, gallery thumbnail, and example from older runs. "
+            "Do not carry over any product category, product name, motif, colorway, scene, or shot idea unless it is visible in the currently attached Trello source image or written on the current Trello card."
+        )
 
     def _trello_ai_prompt_items_for_image_cards(
         self,
@@ -16090,12 +16114,13 @@ exit 1
         correction = (
             f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
             f"{run_scope} "
+            f"{self._flow_agent_fresh_context_rule()} "
             "These generated outputs are in addition to the attached Trello source/reference image; never count the source image as one of the generated outputs. "
             "Each output must be its own separate 1:1 square image file, not landscape, not portrait, not panels inside one canvas. "
             "The product must sit inside a square 1:1 frame with no side-by-side contact sheet, no wide cinematic crop, and no UI/gallery screenshot look. "
             f"{shot_plan_text}"
             "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
-            "The source image beats the filename/card title: do not infer a shirt from 'tao_hinh...', do not infer a plush from a bear/sheep motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
+            "The source image beats the filename/card title: do not infer apparel from 'tao_hinh...', do not infer a plush from an animal motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
             "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
             "Do not reinterpret, upgrade, or transform the source into another product type: a pillow stays the same pillow shape, a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
             "Do not create derivative merchandise using the source embroidery, such as putting a pillow embroidery onto baby shirts, blankets, banners, hoops, totes, framed prints, or fabric swatches. "
