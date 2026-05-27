@@ -5433,7 +5433,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             batch = await self.service.enqueue_prompt_batch(request)
             await self.service._tasks[batch.id]
 
-        image_cards.assert_called_once_with("key", "token", "board123", "ready-list")
+        self.assertEqual(
+            [("key", "token", "board123", "ready-list")] * 3,
+            [call.args for call in image_cards.call_args_list],
+        )
         self.assertEqual([("bear prompt", "card-bear"), ("hoop prompt", "card-hoop")], seen)
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
@@ -5522,6 +5525,100 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(45, saved.result["total"])
         self.assertEqual(45, saved.result["completed"])
         self.assertEqual([f"card-{index}" for index in range(45)], seen_cards)
+
+    async def test_auto_trello_flow_agent_rescans_ready_before_each_card(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = PromptBatchRequest(
+            job=CreateJobRequest(
+                type="image",
+                prompt="",
+                count=1,
+                trello_board_id="https://trello.com/b/board123/demo-board",
+                automation_graph={
+                    "modules": [
+                        {
+                            "id": "trello-source-1",
+                            "type": "trello_source",
+                            "title": "Trello Image Source",
+                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                        },
+                        {"id": "flow-1", "type": "flow", "title": "Google Flow"},
+                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    ]
+                },
+            ),
+            limit=2,
+            auto_trello=True,
+            items=[],
+        )
+        stale_card = {
+            "id": "stale-card",
+            "name": "Moved product",
+            "shortLink": "stale",
+            "url": "https://trello.com/c/stale",
+            "idList": "ready-list",
+            "_image_attachments": [{"id": "stale-att", "name": "stale.jpg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["stale-att"],
+        }
+        live_card = {
+            "id": "live-card",
+            "name": "Live product",
+            "shortLink": "live",
+            "url": "https://trello.com/c/live",
+            "idList": "ready-list",
+            "_image_attachments": [{"id": "live-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["live-att"],
+        }
+        scans = [[stale_card, live_card], [live_card], []]
+        seen: list[tuple[str, list[str]]] = []
+
+        def fake_image_cards(*_args: object) -> list[dict[str, Any]]:
+            return scans.pop(0) if scans else []
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen.append((child_request.trello_card_id, list(child_request.trello_source_attachment_ids)))
+            await self.store.patch_job(job_id, status="completed", result={"count": child_request.count, "mode": "image"})
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
+            self.service,
+            "get_auth_status",
+            return_value=AuthStatus(authenticated=True),
+        ), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            side_effect=fake_image_cards,
+        ) as image_cards, patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ):
+            batch = await self.service.enqueue_prompt_batch(request)
+            await self.service._tasks[batch.id]
+
+        self.assertGreaterEqual(image_cards.call_count, 3)
+        self.assertEqual([("live-card", ["live-att"])], seen)
+        saved = self.store.get_job(batch.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(1, saved.result["total"])
+        self.assertEqual(1, saved.result["completed"])
+        self.assertEqual(0, saved.result["failed"])
+        self.assertEqual(["live-card"], saved.result["seen_card_ids"])
+        child_job = self.store.get_job(saved.result["child_job_ids"][0])
+        self.assertEqual("live-card", child_job.input["trello_card_id"])
+        self.assertEqual("live-card", child_job.input["trello_source_card_id"])
+        self.assertEqual(["live-att"], child_job.input["trello_source_attachment_ids"])
 
     async def test_continuous_auto_trello_waits_until_user_stops(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

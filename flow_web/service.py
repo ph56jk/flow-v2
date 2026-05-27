@@ -2506,12 +2506,113 @@ class FlowWebService:
             result=result,
         )
 
+    def _prompt_batch_auto_trello_mode(self, batch_id: str) -> bool:
+        job = self.store.get_job(batch_id)
+        if job is None:
+            return False
+        job_input = job.input if isinstance(job.input, dict) else {}
+        job_result = job.result if isinstance(job.result, dict) else {}
+        trello_source_hint = job_result.get("trello_source_hint") or job_input.get("trello_source_hint") or {}
+        return str(trello_source_hint.get("mode") or "").strip() == "auto_trello"
+
+    def _auto_trello_live_scan_request(self, request: CreateJobRequest, *, preserve_card: bool = False) -> CreateJobRequest:
+        payload = _model_dump(request)
+        self._force_auto_trello_flow_agent_policy(payload)
+        if preserve_card:
+            card_id = self._normalize_trello_card_id(str(payload.get("trello_source_card_id") or payload.get("trello_card_id") or ""))
+            attachment_ids = self._normalize_trello_attachment_ids(
+                payload.get("trello_source_attachment_ids") or payload.get("trello_attachment_ids") or []
+            )
+            if card_id:
+                payload["trello_card_id"] = card_id
+                payload["trello_source_card_id"] = card_id
+            if attachment_ids:
+                payload["trello_attachment_ids"] = attachment_ids
+                payload["trello_source_attachment_ids"] = attachment_ids
+            self._sync_trello_scope_into_automation_graph(
+                payload,
+                board_id=str(payload.get("trello_board_id") or "").strip(),
+                list_id=str(payload.get("trello_list_id") or "").strip(),
+                card_id=card_id,
+                attachment_ids=attachment_ids,
+            )
+        else:
+            payload["trello_card_id"] = ""
+            payload["trello_attachment_ids"] = []
+            payload["trello_source_card_id"] = ""
+            payload["trello_source_attachment_ids"] = []
+            self._sync_trello_scope_into_automation_graph(
+                payload,
+                board_id=str(payload.get("trello_board_id") or "").strip(),
+                list_id=str(payload.get("trello_list_id") or "").strip(),
+                card_id="",
+                attachment_ids=[],
+                clear_card=True,
+            )
+        return CreateJobRequest(**payload)
+
+    def _auto_trello_live_seed_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+        if all(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items):
+            return []
+        return items
+
+    async def _next_live_auto_trello_prompt_item(
+        self,
+        batch_id: str,
+        base_request: CreateJobRequest,
+        seed_items: List[Dict[str, Any]],
+        attempted_card_ids: set[str],
+    ) -> tuple[CreateJobRequest, Dict[str, Any], Dict[str, Any]]:
+        preserve_card = bool(self._normalize_trello_card_id(base_request.trello_card_id))
+        scan_request = self._auto_trello_live_scan_request(base_request, preserve_card=preserve_card)
+        live_seed_items = self._auto_trello_live_seed_items(seed_items)
+        scan_limit = 0 if len(attempted_card_ids) >= self.MAX_PROMPT_BATCH_ITEMS else max(1, len(attempted_card_ids) + 1)
+        try:
+            scan_request, live_items, discovery = await self._expand_prompt_batch_with_trello_images(
+                scan_request,
+                live_seed_items,
+                scan_limit,
+            )
+        except HTTPException as exc:
+            detail = self._flow_error_detail(exc)
+            if self._auto_trello_waitable_empty_error(detail):
+                await self.store.append_log(
+                    batch_id,
+                    f"Không còn card hợp lệ trong {self._trello_source_scope_label()} khi quét lại trước card tiếp theo: {detail}",
+                )
+                return scan_request, {}, {}
+            raise
+
+        for item in live_items:
+            card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
+            if card_id and card_id in attempted_card_ids:
+                continue
+            return scan_request, item, discovery
+
+        if live_items:
+            await self.store.append_log(
+                batch_id,
+                f"Tất cả card còn thấy trong {self._trello_source_scope_label()} đã được thử trong batch này; không lặp lại card cũ.",
+            )
+        else:
+            await self.store.append_log(
+                batch_id,
+                f"Không còn card hợp lệ trong {self._trello_source_scope_label()} khi quét lại trước card tiếp theo.",
+            )
+        return scan_request, {}, discovery
+
     async def _run_prompt_batch(self, batch_id: str, base_request: CreateJobRequest, items: List[Dict[str, Any]]) -> None:
         total = len(items)
         child_job_ids: List[str] = []
         completed = 0
         failed = 0
-        uses_flow_agent = any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+        uses_flow_agent = self._flow_agent_enabled_for_request(base_request) or any(
+            item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items
+        )
+        live_auto_trello = self._prompt_batch_auto_trello_mode(batch_id) and uses_flow_agent
+        attempted_card_ids: set[str] = set()
         await self.store.patch_job(batch_id, status="running")
         await self.store.append_log(
             batch_id,
@@ -2519,13 +2620,44 @@ class FlowWebService:
             if uses_flow_agent
             else f"Bắt đầu vòng lặp {total} prompt active từ sheet.",
         )
+        if live_auto_trello:
+            await self.store.append_log(
+                batch_id,
+                f"Auto Trello sẽ quét lại {self._trello_source_scope_label()} trước mỗi card, khóa card_id và ảnh nguồn từ Trello trước khi gửi Flow Agent.",
+            )
 
         try:
             for index, item in enumerate(items):
                 if self._prompt_batch_stop_requested(batch_id):
                     await self.store.append_log(batch_id, "Đã nhận lệnh dừng, không gửi thêm card mới trong batch này.")
                     break
-                child_request = self._prompt_batch_child_request(base_request, item, index, total)
+                child_base_request = base_request
+                live_discovery: Dict[str, Any] = {}
+                if live_auto_trello:
+                    child_base_request, live_item, live_discovery = await self._next_live_auto_trello_prompt_item(
+                        batch_id,
+                        base_request,
+                        items,
+                        attempted_card_ids,
+                    )
+                    if not live_item:
+                        total = completed + failed
+                        await self._patch_prompt_batch_result(
+                            batch_id,
+                            total=total,
+                            child_job_ids=child_job_ids,
+                            completed=completed,
+                            failed=failed,
+                            current_index=0,
+                            current_child_job_id="",
+                            extra={"seen_card_ids": sorted(attempted_card_ids)} if attempted_card_ids else None,
+                        )
+                        break
+                    item = live_item
+                child_request = self._prompt_batch_child_request(child_base_request, item, index, total)
+                item_card_id = self._normalize_trello_card_id(child_request.trello_card_id)
+                if live_auto_trello and item_card_id:
+                    attempted_card_ids.add(item_card_id)
                 self._validate_job_request(child_request)
                 child_job = JobRecord(
                     type="image",
@@ -2543,6 +2675,10 @@ class FlowWebService:
                     failed=failed,
                     current_index=index + 1,
                     current_child_job_id=child_job.id,
+                    extra={
+                        **({"trello_source_hint": live_discovery} if live_discovery else {}),
+                        **({"seen_card_ids": sorted(attempted_card_ids)} if attempted_card_ids else {}),
+                    },
                 )
                 await self.store.set_progress_hint(
                     batch_id,
@@ -2588,12 +2724,19 @@ class FlowWebService:
                     failed=failed,
                     current_index=index + 1,
                     current_child_job_id="",
+                    extra={"seen_card_ids": sorted(attempted_card_ids)} if attempted_card_ids else None,
                 )
                 if uses_flow_agent and index < total - 1 and not self._prompt_batch_stop_requested(batch_id):
                     await self._sleep_between_flow_agent_batches(batch_id, index + 2, total)
 
-            final_status = "failed" if failed == total else "completed"
-            error = f"{failed}/{total} card bị lỗi trong batch." if failed == total and uses_flow_agent else f"{failed}/{total} prompt bị lỗi trong batch." if failed == total else ""
+            final_status = "failed" if total > 0 and failed == total else "completed"
+            error = (
+                f"{failed}/{total} card bị lỗi trong batch."
+                if total > 0 and failed == total and uses_flow_agent
+                else f"{failed}/{total} prompt bị lỗi trong batch."
+                if total > 0 and failed == total
+                else ""
+            )
             await self.store.patch_job(batch_id, status=final_status, error=error)
             await self.store.append_log(
                 batch_id,
@@ -3435,20 +3578,16 @@ class FlowWebService:
     def _flow_agent_reference_prompt_style_guide(self, target_count: int) -> str:
         target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
         return (
-            "Use the learned product-prompt style: write like a meticulous ecommerce art director. "
-            "Before generating, state a compact design analysis of the reference product, then create a numbered shot brief. "
-            f"Request exactly {target} separate standalone 1:1 images, generated one by one; never make a collage, contact sheet, grid, or multiple small frames inside one image. "
-            "For every shot, specify the subject count, exact product placement, background, props, lighting direction, camera angle, and which source details must stay unchanged. "
-            "The visible source image is more authoritative than the filename, card title, or old prompt text; never infer product category from generic filenames or motif words. "
-            "Keep the exact source product object type, silhouette, edge construction, proportions, motif, embroidery/print placement, readable text/name, colors, fabric texture, and handmade irregularities consistent. "
-            "Only if the source image visibly contains an embroidered/personalized name and the Trello description explicitly requests alternate personalized names may a multi-product shot vary the name text; otherwise keep readable text/name exactly as the source or absent if absent. "
-            "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, clear stitch direction, tactile fibers, crisp embroidered edges, natural thread shadows, and no flat printed, painted, digital, vinyl, or sticker-like texture. "
-            "For handmade or embroidered products, include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
-            "Use clean clear white neutral daylight for every image: soft bright studio or nursery light, accurate white balance, crisp whites, and no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
-            "Use airy clean styling, white nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography. "
-            "For fabric products, include pastel colorway variety only when the same exact source product form can be preserved: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow fabric options while preserving the same physical product shape, construction, motif, embroidery placement, and scale. "
-            "Never transfer the source motif/name/design onto another product type such as a shirt, pillow, cushion, blanket, banner, hoop, tote, plush, dress, or framed print unless the source itself is exactly that product type. "
-            "If the source has no embroidered name, keep all variants nameless and never add sample names, loose labels, tag cards, or text overlays. "
+            "Use the learned product-prompt style: give a compact design analysis, then a numbered shot brief. "
+            f"Request exactly {target} separate standalone 1:1 images; never make a collage, contact sheet, grid, or multi-frame canvas. "
+            "For each shot, state the product placement, background, props, lighting, camera angle, and the source details that must stay unchanged. "
+            "The attached source image is the authority: keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
+            "Only if the source image visibly contains an embroidered/personalized name and the Trello description explicitly requests alternate personalized names may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
+            "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, tactile fibers, clear stitch direction, crisp edges, and natural thread shadows; never make it flat printed, painted, digital, vinyl, or sticker-like. "
+            "Include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
+            "Use clean clear white neutral daylight in every image with accurate whites and no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
+            "Use pastel fabric colorway variety only when the exact same source product form, construction, motif placement, and scale can be preserved; if not, skip colorways and vary only scene/angle/styling. "
+            "Do not transfer the source motif/name/design onto another product type. If the source has no embroidered name, keep all variants nameless. "
             + self._flow_agent_no_tag_label_rule()
         )
 

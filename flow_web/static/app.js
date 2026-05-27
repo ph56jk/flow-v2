@@ -23,8 +23,8 @@ const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
 const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
 const DEFAULT_TRELLO_SOURCE_SCOPE_LABEL = "Ready for AI";
 const FLOW_AI_SOURCE_TYPE = "flow_ai";
-const FLOW_AGENT_DEFAULT_IMAGE_COUNT = 8;
-const FLOW_AGENT_TARGET_OUTPUT_COUNT = 8;
+const FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12;
+const FLOW_AGENT_TARGET_OUTPUT_COUNT = 12;
 const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "review_hold", "log", "telegram"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
@@ -474,7 +474,7 @@ function defaultAutomationConfig() {
     prompt: "",
     appEyebrow: "Flow v2",
     appTitle: "Flow v2",
-    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 8 ảnh trong một job rồi đẩy về đúng card Trello.",
+    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 12 ảnh trong một job rồi đẩy về đúng card Trello.",
     accentColor: "#7c2ee6",
     canvasZoom: 1,
     modules,
@@ -2993,7 +2993,7 @@ function userAssistantContextSummary() {
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
   const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
   return [
-    `Quy trình chuẩn: Trello ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 8 ảnh trong một job -> upload lại đúng card Trello để duyệt trực tiếp`,
+    `Quy trình chuẩn: Trello ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 12 ảnh trong một job -> upload lại đúng card Trello để duyệt trực tiếp`,
     `Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`,
     `Màn hình đang ở chế độ ${state.mode}`,
     `Module bật: ${enabledModules || "chưa có"}`,
@@ -4793,7 +4793,7 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
           ? `Đã bật Auto AI Trello liên tục. App sẽ chờ card mới trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi bạn bấm Dừng auto.`
           : runUntilReadyEmpty
           ? `Đã xếp hàng auto Trello. App sẽ quét toàn bộ card có ảnh trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi hết danh sách hiện tại.`
-          : `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 8 ảnh trong một job rồi đẩy về đúng card để duyệt trên Trello.`
+          : `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 12 ảnh trong một job rồi đẩy về đúng card để duyệt trên Trello.`
         : batchItems.length > 1
         ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi đẩy về đúng card Trello để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, app sẽ lưu về Trello nếu cục Trello đang bật.",
