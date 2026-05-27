@@ -15158,6 +15158,7 @@ exit 1
 
         reference_roles = self._normalize_reference_image_roles(reference_image_paths, request.reference_image_roles or [])
         total = len(reference_image_paths)
+        allow_local_flow_agent_fallback = self._request_requires_flow_agent_ui(request) and self._flow_agent_enabled_for_request(request)
         await self.store.append_log(job_id, f"Đang chuẩn bị {total} ảnh tham chiếu để ghép/chỉnh ảnh.")
         uploaded_items: List[Dict[str, str]] = []
         for index, image_path in enumerate(reference_image_paths):
@@ -15169,7 +15170,20 @@ exit 1
                 f"Em đang tải ảnh {role_label} {index + 1}/{total} lên Flow trước khi chỉnh ảnh.",
             )
             await self.store.append_log(job_id, f"Đang tải ảnh {role_label} {index + 1}/{total}: {Path(image_path).name}")
-            media_name = await self._upload_project_image_robust(client, image_path)
+            try:
+                media_name = await self._upload_project_image_robust(client, image_path)
+            except Exception as exc:
+                if not allow_local_flow_agent_fallback:
+                    raise
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Flow project upload failed for {Path(image_path).name}; "
+                        "will attach the local source file directly inside Flow Agent instead. "
+                        f"Detail: {humanize_flow_error(str(exc))[:180]}"
+                    ),
+                )
+                continue
             if media_name:
                 uploaded_items.append({"role": role, "media_name": media_name})
 
@@ -15590,7 +15604,8 @@ exit 1
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
-        if reference_media_names and self._request_requires_flow_agent_ui(request):
+        local_reference_paths = self._normalize_local_upload_paths(request.reference_image_paths or [])
+        if (reference_media_names or local_reference_paths) and self._request_requires_flow_agent_ui(request):
             await self.store.append_log(
                 job_id,
                 "Auto AI Trello dùng Tác nhân Flow: app sẽ chạy qua giao diện Flow Agent, không gửi API prompt thường.",
@@ -15647,7 +15662,12 @@ exit 1
         *,
         job_id: str = "",
     ) -> List[Any]:
-        if reference_media_names:
+        reference_media_names = self._normalize_reference_media_names(reference_media_names or [])
+        requested_reference_path = str((request.reference_image_paths or [""])[0] if request.reference_image_paths else "").strip()
+        local_reference_paths = self._normalize_local_upload_paths(request.reference_image_paths or [])
+        local_reference_path = local_reference_paths[0] if local_reference_paths else (requested_reference_path if reference_media_names else "")
+        flow_agent_enabled = self._flow_agent_enabled_for_request(request)
+        if reference_media_names or (flow_agent_enabled and local_reference_path):
             if len(reference_media_names) > 1:
                 raise RuntimeError(
                     "Flow API dang chan nhanh ghep nhieu anh, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
@@ -15655,11 +15675,11 @@ exit 1
             target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1)))
             flow_agent_enabled = self._flow_agent_enabled_for_request(request)
             source_workflow_id = str(request.workflow_id or "").strip()
-            if flow_agent_enabled:
+            if flow_agent_enabled and reference_media_names:
                 media_workflow_id = await self._find_workflow_id_for_media(client, reference_media_names[0])
                 if media_workflow_id:
                     source_workflow_id = media_workflow_id
-            if flow_agent_enabled and not source_workflow_id:
+            if flow_agent_enabled and not source_workflow_id and reference_media_names:
                 raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
             require_project_media_baseline = self._trello_source_validation_required(request)
@@ -15696,8 +15716,8 @@ exit 1
                                 prompt,
                                 model=request.model,
                                 workflow_id=source_workflow_id,
-                                reference_media_name=reference_media_names[0],
-                                reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                                reference_media_name=reference_media_names[0] if reference_media_names else "",
+                                reference_image_path=local_reference_path,
                                 aspect=request.aspect,
                                 count=run_count,
                                 timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
@@ -15767,8 +15787,8 @@ exit 1
                         prompt,
                         model=request.model,
                         workflow_id=source_workflow_id,
-                        reference_media_name=reference_media_names[0],
-                        reference_image_path=(request.reference_image_paths or [""])[0] if request.reference_image_paths else "",
+                        reference_media_name=reference_media_names[0] if reference_media_names else "",
+                        reference_image_path=local_reference_path,
                         aspect=request.aspect,
                         count=target_count,
                         timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
@@ -15998,8 +16018,9 @@ exit 1
         from flow._models import AspectRatio
         from flow._ui_interceptor import UIInterceptor
 
+        safe_reference_image_path = str(reference_image_path or "").strip()
         resolved_workflow_id = str(workflow_id or "").strip() or await self._find_workflow_id_for_media(client, reference_media_name)
-        if not resolved_workflow_id:
+        if not resolved_workflow_id and not (flow_agent_enabled and safe_reference_image_path):
             raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
         ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
@@ -16109,7 +16130,7 @@ exit 1
 
         attached_agent_source = False
         attached_local_source = False
-        if flow_agent_enabled:
+        if flow_agent_enabled and str(reference_media_name or "").strip():
             dragged_source, drag_detail = await self._select_flow_edit_target_image(
                 page,
                 reference_media_name,
@@ -16127,9 +16148,14 @@ exit 1
                         else f"Fallback UI Flow: chưa kéo được ảnh nguồn vào khung Tác nhân ({drag_detail[:120]})."
                     ),
                 )
+        elif flow_agent_enabled and job_id:
+            await self.store.append_log(
+                job_id,
+                "Fallback UI Flow: no project media id for the Trello source; using local file attach in Flow Agent.",
+            )
 
-        if flow_agent_enabled and not attached_agent_source and str(reference_image_path or "").strip():
-            attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, reference_image_path)
+        if flow_agent_enabled and not attached_agent_source and safe_reference_image_path:
+            attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, safe_reference_image_path)
             attached_agent_source = attached_local_source
             if job_id:
                 await self.store.append_log(

@@ -6506,6 +6506,39 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         generate_once.assert_not_awaited()
         generate_via_ui.assert_awaited_once_with(fake_client, request, ["source-media"], job_id=job.id)
 
+    async def test_generate_images_with_retry_uses_flow_agent_ui_for_local_trello_source(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        source = self.uploads_dir / "trello-source.jpg"
+        source.write_bytes(b"source")
+        request = CreateJobRequest(
+            type="image",
+            prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
+            count=4,
+            trello_card_id="card-123",
+            flow_agent_enabled=True,
+            reference_image_paths=[str(source)],
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+        fake_client = SimpleNamespace()
+        fake_image = SimpleNamespace(media_name="img-1")
+
+        with patch.object(self.service, "_generate_images_once", AsyncMock()) as generate_once, patch.object(
+            self.service,
+            "_generate_images_via_ui",
+            AsyncMock(return_value=[fake_image]),
+        ) as generate_via_ui:
+            result = await self.service._generate_images_with_retry(fake_client, job.id, request, [])
+
+        self.assertEqual([fake_image], result)
+        generate_once.assert_not_awaited()
+        generate_via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
+
     async def test_generate_images_via_ui_uses_single_reference_fallback(self) -> None:
         request = CreateJobRequest(type="image", prompt="them kinh", count=1, aspect="portrait", flow_agent_enabled=False)
         fake_image = SimpleNamespace(media_name="img-1")
@@ -6544,6 +6577,38 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_enabled"])
         self.assertFalse(single_ref.await_args.kwargs["flow_agent_auto_approve"])
         self.assertEqual("/tmp/source.jpg", single_ref.await_args.kwargs["reference_image_path"])
+
+    async def test_generate_images_via_ui_uses_local_source_when_reference_media_missing(self) -> None:
+        source = self.uploads_dir / "trello-source.jpg"
+        source.write_bytes(b"source")
+        request = CreateJobRequest(
+            type="image",
+            prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
+            count=4,
+            flow_agent_enabled=True,
+            flow_agent_auto_approve=True,
+            reference_image_paths=[str(source)],
+        )
+        fake_images = [SimpleNamespace(media_name=f"img-{index}") for index in range(4)]
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value=""),
+        ) as find_workflow, patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(return_value=fake_images),
+        ) as single_ref:
+            result = await self.service._generate_images_via_ui(fake_client, request, [])
+
+        self.assertEqual(fake_images, result)
+        find_workflow.assert_not_awaited()
+        single_ref.assert_awaited_once()
+        self.assertEqual("", single_ref.await_args.kwargs["reference_media_name"])
+        self.assertEqual("", single_ref.await_args.kwargs["workflow_id"])
+        self.assertEqual(str(source.resolve()), single_ref.await_args.kwargs["reference_image_path"])
 
     async def test_generate_images_via_ui_uses_flow_agent_x8_single_pass(self) -> None:
         request = CreateJobRequest(
@@ -7121,6 +7186,59 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(["ref-model", "ref-logo"], result)
         upload_project_image.assert_any_await(fake_client, str(reference_a.resolve()))
         upload_project_image.assert_any_await(fake_client, str(reference_b.resolve()))
+
+    async def test_resolve_image_reference_media_allows_flow_agent_local_fallback_when_upload_fails(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        source = self.uploads_dir / "trello-source.jpg"
+        source.write_bytes(b"source")
+        job = JobRecord(type="image", status="queued", title="test")
+        await self.store.add_job(job)
+
+        request = CreateJobRequest(
+            type="image",
+            prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
+            count=4,
+            trello_card_id="card-123",
+            flow_agent_enabled=True,
+            reference_image_paths=[str(source)],
+        )
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_upload_project_image_robust",
+            AsyncMock(side_effect=RuntimeError("Failed to upload")),
+        ) as upload_project_image:
+            result = await self.service._resolve_image_reference_media(fake_client, job.id, request)
+
+        self.assertEqual([], result)
+        upload_project_image.assert_awaited_once_with(fake_client, str(source.resolve()))
+        saved = self.store.get_job(job.id)
+        self.assertTrue(any("local source file directly inside Flow Agent" in item.message for item in saved.logs))
+
+    async def test_resolve_image_reference_media_still_fails_without_flow_agent_fallback(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        source = self.uploads_dir / "plain-source.jpg"
+        source.write_bytes(b"source")
+        job = JobRecord(type="image", status="queued", title="test")
+        await self.store.add_job(job)
+
+        request = CreateJobRequest(
+            type="image",
+            prompt="normal image edit",
+            count=1,
+            flow_agent_enabled=False,
+            reference_image_paths=[str(source)],
+        )
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_upload_project_image_robust",
+            AsyncMock(side_effect=RuntimeError("Failed to upload")),
+        ):
+            with self.assertRaises(RuntimeError):
+                await self.service._resolve_image_reference_media(fake_client, job.id, request)
 
 
 if __name__ == "__main__":
