@@ -7125,6 +7125,85 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("Tác nhân", detail)
         self.assertEqual([("click", 160, 720)], events)
 
+    async def test_ensure_fresh_flow_agent_panel_resets_old_context(self) -> None:
+        events: list[str] = []
+
+        class FakePage:
+            context_checks = 0
+
+            async def evaluate(self, script: str) -> dict:
+                if "has_prior_context" in script:
+                    self.context_checks += 1
+                    events.append(f"context-{self.context_checks}")
+                    return {
+                        "visible": True,
+                        "has_prior_context": self.context_checks == 1,
+                        "detail": "old Flow Agent conversation text is visible" if self.context_checks == 1 else "agent panel looks fresh",
+                    }
+                if "agent panel not found for reset" in script:
+                    events.append("menu")
+                    return {"ok": True, "detail": "agent menu button"}
+                events.append("new-chat")
+                return {"ok": True, "detail": "New chat"}
+
+        ok, detail = await self.service._ensure_fresh_flow_agent_panel(FakePage())
+
+        self.assertTrue(ok)
+        self.assertIn("reset old Agent context", detail)
+        self.assertEqual(["context-1", "menu", "new-chat", "context-2"], events)
+
+    async def test_ensure_fresh_flow_agent_panel_blocks_when_old_context_cannot_reset(self) -> None:
+        events: list[str] = []
+
+        class FakePage:
+            async def evaluate(self, script: str) -> dict:
+                if "has_prior_context" in script:
+                    events.append("context")
+                    return {"visible": True, "has_prior_context": True, "detail": "old Flow Agent conversation text is visible"}
+                events.append("reset")
+                return {"ok": False, "detail": "no new chat/session item"}
+
+        ok, detail = await self.service._ensure_fresh_flow_agent_panel(FakePage())
+
+        self.assertFalse(ok)
+        self.assertIn("old context visible", detail)
+        self.assertEqual(["context", "reset"], events)
+
+    async def test_acquire_isolated_flow_agent_page_opens_new_project_tab(self) -> None:
+        events: list[str] = []
+
+        class FakePage:
+            url = "about:blank"
+
+            async def goto(self, url: str, *_args: object, **_kwargs: object) -> None:
+                events.append(f"goto:{url}")
+                self.url = url
+
+            async def bring_to_front(self) -> None:
+                events.append("front")
+
+        class FakeContext:
+            async def new_page(self) -> FakePage:
+                events.append("new_page")
+                return FakePage()
+
+        class FakeBrowser:
+            context = FakeContext()
+            _page = None
+
+            async def page(self) -> FakePage:
+                events.append("existing_page")
+                return FakePage()
+
+        browser = FakeBrowser()
+        client = SimpleNamespace(_bm=browser)
+
+        page, detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
+
+        self.assertIs(page, browser._page)
+        self.assertEqual("new isolated project tab", detail)
+        self.assertEqual(["new_page", "goto:https://labs.google/fx/tools/flow/project/pid", "front"], events)
+
     async def test_approve_flow_agent_generation_clicks_remember_and_approve(self) -> None:
         events: list[tuple[str, float, float]] = []
 

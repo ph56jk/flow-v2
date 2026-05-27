@@ -16175,8 +16175,13 @@ exit 1
             if aspect_value == "square"
             else AspectRatio.LANDSCAPE
         )
-        page = await client._bm.page()
         project_url = self._project_url(client.project_id)
+        if flow_agent_enabled:
+            page, page_detail = await self._acquire_isolated_flow_agent_page(client, project_url)
+            if job_id:
+                await self.store.append_log(job_id, f"Fallback UI Flow: dung tab Flow Agent moi ({page_detail[:120]}).")
+        else:
+            page = await client._bm.page()
         edit_url = f"{project_url}/edit/{quote(resolved_workflow_id, safe='')}" if resolved_workflow_id else project_url
         target_url = project_url if flow_agent_enabled else edit_url
         if job_id:
@@ -16250,6 +16255,16 @@ exit 1
                 raise RuntimeError(
                     "Auto AI Trello cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. "
                     "App đã dừng để tránh chỉ gửi prompt mà không có ảnh nguồn."
+                )
+
+            fresh_panel, fresh_panel_detail = await self._ensure_fresh_flow_agent_panel(page)
+            if job_id and fresh_panel_detail:
+                await self.store.append_log(job_id, f"Fallback UI Flow: kiem tra phien Agent ({fresh_panel_detail[:160]}).")
+            if not fresh_panel:
+                raise RuntimeError(
+                    "Tac nhan Flow dang mo lai hoi thoai cu hoac ngu canh project cu. "
+                    "App da dung truoc khi gui prompt de tranh Flow lay sai san pham. "
+                    f"Chi tiet: {fresh_panel_detail}"
                 )
 
             filled, fill_detail = await self._fill_flow_agent_panel_instruction(page, prompt)
@@ -16573,6 +16588,215 @@ exit 1
                 "auto ai trello",
             )
         )
+
+    async def _acquire_isolated_flow_agent_page(self, client: Any, project_url: str) -> tuple[Any, str]:
+        target_url = str(project_url or "").strip()
+        browser = getattr(client, "_bm", None)
+        context = getattr(browser, "context", None)
+        if context is not None:
+            try:
+                page = await context.new_page()
+                try:
+                    browser._page = page
+                except Exception:
+                    pass
+                if target_url:
+                    await self._ensure_valid_flow_project_page(page, target_url)
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
+                return page, "new isolated project tab"
+            except Exception as exc:
+                detail = humanize_flow_error(str(exc))
+                try:
+                    page = await browser.page()
+                    return page, f"fallback existing tab after new tab failed: {detail[:80]}"
+                except Exception:
+                    raise
+
+        page = await browser.page()
+        return page, "browser manager page"
+
+    async def _ensure_fresh_flow_agent_panel(self, page: Any) -> tuple[bool, str]:
+        state = await self._flow_agent_panel_context_state(page)
+        if not state.get("has_prior_context"):
+            return True, str(state.get("detail") or "agent panel has no prior context")
+
+        reset_ok, reset_detail = await self._reset_flow_agent_panel_context(page)
+        if not reset_ok:
+            return False, f"old context visible; reset unavailable: {reset_detail}"
+
+        await asyncio.sleep(1.0)
+        state_after = await self._flow_agent_panel_context_state(page)
+        if state_after.get("has_prior_context"):
+            return False, f"old context still visible after reset: {state_after.get('detail') or reset_detail}"
+        return True, f"reset old Agent context: {reset_detail}"
+
+    async def _flow_agent_panel_context_state(self, page: Any) -> Dict[str, Any]:
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 180 || rect.height < 120) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                    el.getAttribute('placeholder') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const text = labelFor(el);
+                      const rightPanel = rect.left >= window.innerWidth * 0.45 || rect.right >= window.innerWidth * 0.78;
+                      const agentish = /Bạn\\s*muốn\\s*tạo\\s*gì|Ban\\s*muon\\s*tao\\s*gi|What\\s+do\\s+you|Flow\\s+Agent|Tác\\s*nhân|Tac\\s*nhan|Credit\\s+Spend\\s+Approval|Shot\\s+Brief|Design\\s+Analysis|generated\\s+the\\s+final/i.test(text);
+                      const score = (rightPanel ? 1000 : 0) + (agentish ? 800 : 0) + rect.height / 10;
+                      return { el, rect, text, score };
+                    })
+                    .filter((item) => item.score >= 900)
+                    .sort((a, b) => b.score - a.score);
+                  const panel = panels[0];
+                  if (!panel) return { visible: false, has_prior_context: false, detail: 'agent panel not detected' };
+                  const text = panel.text || '';
+                  const hasPrior = /I['’]?ve\\s+generated|generated\\s+the\\s+final|Design\\s+Analysis|Shot\\s+Brief|Credit\\s+Spend\\s+Approval|source\\s+product\\s+image\\s+as\\s+the\\s+reference|Sheep\\s+pillow|Pillow\\s+with\\s+sheep|Teddy\\s+Swims/i.test(text);
+                  return {
+                    visible: true,
+                    has_prior_context: hasPrior,
+                    detail: hasPrior ? 'old Flow Agent conversation text is visible' : 'agent panel looks fresh',
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return {"visible": False, "has_prior_context": False, "detail": f"agent context check skipped: {humanize_flow_error(str(exc))[:120]}"}
+        return result if isinstance(result, dict) else {"visible": False, "has_prior_context": False, "detail": "agent context check unavailable"}
+
+    async def _reset_flow_agent_panel_context(self, page: Any) -> tuple[bool, str]:
+        try:
+            menu_result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 18 || rect.height < 18) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && !el.disabled
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                    el.getAttribute('class') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                    .filter((el) => {
+                      if (!visible(el)) return false;
+                      const rect = el.getBoundingClientRect();
+                      return rect.width >= 280 && rect.height >= window.innerHeight * 0.45 && rect.left >= window.innerWidth * 0.35;
+                    })
+                    .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+                  const panel = panels[0];
+                  if (!panel) return { ok: false, detail: 'agent panel not found for reset' };
+                  const panelRect = panel.getBoundingClientRect();
+                  const buttons = [...panel.querySelectorAll('button, [role="button"], [aria-label], [title], svg, mat-icon')]
+                    .filter(visible)
+                    .map((el) => {
+                      const control = el.closest('button, [role="button"], [tabindex]') || el;
+                      const rect = control.getBoundingClientRect();
+                      const label = `${labelFor(el)} ${labelFor(control)}`.replace(/\\s+/g, ' ').trim();
+                      const topLeft = rect.top <= panelRect.top + 96 && rect.left <= panelRect.left + 96;
+                      const menuish = /menu|hamburger|drawer|history|chat|conversation|more|list/i.test(label);
+                      const compact = rect.width <= 80 && rect.height <= 80;
+                      const score = (topLeft ? 1200 : 0) + (menuish ? 800 : 0) + (compact ? 250 : -500) - (label.length > 160 ? 700 : 0);
+                      return { el: control, rect, label, score };
+                    })
+                    .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
+                    .filter((item) => item.score >= 900)
+                    .sort((a, b) => b.score - a.score);
+                  const target = buttons[0];
+                  if (!target) return { ok: false, detail: 'no agent menu button' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  target.el.click();
+                  return { ok: true, detail: target.label || 'agent menu button' };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        if not isinstance(menu_result, dict) or not menu_result.get("ok"):
+            return False, str((menu_result or {}).get("detail") or "agent menu not opened") if isinstance(menu_result, dict) else "agent menu not opened"
+
+        await asyncio.sleep(0.5)
+        try:
+            item_result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 36 || rect.height < 22) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && !el.disabled
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const candidates = [...document.querySelectorAll('[role="menu"] button, [role="menu"] [role="menuitem"], dialog button, aside button, button, [role="button"]')]
+                    .filter(visible)
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const label = labelFor(el);
+                      const rightHalf = rect.left >= window.innerWidth * 0.35 || rect.right >= window.innerWidth * 0.65;
+                      const newish = /new\\s*(chat|conversation|session|task)|start\\s*new|fresh\\s*(chat|task)|reset\\s*(chat|conversation)|clear\\s*(chat|conversation)|cuộc\\s+trò\\s+chuyện\\s+mới|cuoc\\s+tro\\s+chuyen\\s+moi|phiên\\s+mới|phien\\s+moi|tạo\\s+mới|tao\\s+moi|mới$/i.test(label);
+                      const dangerous = /new\\s*project|dự\\s*án\\s*mới|du\\s*an\\s*moi|delete|xóa|xoa|trash|remove/i.test(label);
+                      const score = (rightHalf ? 800 : 0) + (newish ? 1500 : 0) - (dangerous ? 2000 : 0) - (label.length > 120 ? 500 : 0);
+                      return { el, rect, label, score };
+                    })
+                    .filter((item) => item.score >= 1500)
+                    .sort((a, b) => b.score - a.score);
+                  const target = candidates[0];
+                  if (!target) return { ok: false, detail: 'no new chat/session item' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  target.el.click();
+                  return { ok: true, detail: target.label || 'new chat item' };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        if isinstance(item_result, dict) and item_result.get("ok"):
+            return True, str(item_result.get("detail") or menu_result.get("detail") or "new Agent session")
+        return False, str((item_result or {}).get("detail") or "new Agent session item not found") if isinstance(item_result, dict) else "new Agent session item not found"
 
     async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
         locator_patterns = [
