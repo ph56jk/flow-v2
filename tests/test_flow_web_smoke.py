@@ -417,6 +417,29 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             item["shot_labels"],
         )
 
+    def test_auto_trello_generic_tao_filename_does_not_infer_shirt(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        card = {
+            "id": "card-generic",
+            "shortLink": "generic",
+            "idList": "ready",
+            "name": "tạo_hình_ảnh_một_chiếc_202605161423 (1).jpeg",
+            "url": "https://trello.example/c/generic",
+            "_image_attachments": [{"id": "att-generic", "name": "tạo_hình_ảnh_một_chiếc_202605161423 (1).jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-generic"],
+        }
+
+        signals = self.service._flow_operator_card_product_signals(request, card)
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertFalse(signals["is_shirt"])
+        self.assertEqual(1, len(items))
+        self.assertNotIn("shirt silhouette", items[0]["design_analysis"])
+        self.assertNotIn("Hands sewing shirt detail", items[0]["shot_labels"])
+        self.assertIn("without inferring a category from a generic filename", items[0]["design_analysis"])
+        self.assertIn("do not infer product type from generic names", items[0]["prompt"])
+        self.assertIn("If the source is a square pillow with a sheep embroidery", items[0]["prompt"])
+
     def test_auto_trello_partial_card_generates_missing_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
@@ -3423,6 +3446,81 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(2, build_client.await_count)
         self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
+
+    async def test_with_client_stops_after_last_profile_quota_without_wrapping_to_first(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Acc1", path=self.temp_root / "acc1-profile"),
+            FlowBrowserProfile(index=1, label="Acc2", path=self.temp_root / "acc2-profile"),
+        ]
+        browsers = [SimpleNamespace(name="browser-1"), SimpleNamespace(name="browser-2")]
+        clients = [SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]
+        calls: list[str] = []
+
+        async def use_client(client: Any) -> str:
+            calls.append(client.name)
+            raise FlowAgentQuotaError("You've reached your Tools Agent quota limit. Come back tomorrow.")
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(side_effect=browsers),
+        ) as ensure_shared_browser, patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(side_effect=clients),
+        ) as build_client:
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service._with_client(use_client)
+
+        self.assertEqual(429, ctx.exception.status_code)
+        self.assertIn("Tat ca Chrome profile Flow da het quota", str(ctx.exception.detail))
+        self.assertEqual(["client-1", "client-2"], calls)
+        self.assertEqual(2, ensure_shared_browser.await_count)
+        self.assertEqual(2, build_client.await_count)
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[1]))
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(),
+        ) as ensure_again:
+            with self.assertRaises(HTTPException) as second_ctx:
+                await self.service._with_client(lambda client: asyncio.sleep(0, result=client.name))
+
+        self.assertEqual(429, second_ctx.exception.status_code)
+        ensure_again.assert_not_awaited()
+
+    async def test_with_client_persists_quota_block_across_service_instances(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Acc1", path=self.temp_root / "acc1-profile"),
+            FlowBrowserProfile(index=1, label="Acc2", path=self.temp_root / "acc2-profile"),
+        ]
+
+        await self.service._mark_flow_profile_quota_limited(
+            profiles[0],
+            FlowAgentQuotaError("You've reached your Tools Agent quota limit. Come back tomorrow."),
+        )
+        reloaded_service = FlowWebService(self.store)
+        fake_browser = SimpleNamespace()
+        fake_client = SimpleNamespace(name="client-2")
+
+        with patch.object(reloaded_service, "_flow_profile_specs", return_value=profiles), patch.object(
+            reloaded_service,
+            "_ensure_shared_browser",
+            AsyncMock(return_value=fake_browser),
+        ) as ensure_shared_browser, patch.object(
+            reloaded_service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=fake_client),
+        ):
+            result = await reloaded_service._with_client(lambda client: asyncio.sleep(0, result=client.name))
+
+        self.assertEqual("client-2", result)
+        ensure_shared_browser.assert_awaited_once()
+        self.assertEqual(profiles[1], ensure_shared_browser.await_args.args[0])
 
     async def test_with_client_uses_profile_specific_project_id(self) -> None:
         await self.store.replace_config(AppConfig(project_id="default-project", headless=False, generation_timeout_s=300))

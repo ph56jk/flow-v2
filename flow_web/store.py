@@ -71,6 +71,23 @@ class StateStore:
             await self._save_locked()
         return self._state.integration_config
 
+    async def replace_flow_profile_quota_blocks(self, blocks: Dict[str, float]) -> Dict[str, float]:
+        async with self._lock:
+            normalized: Dict[str, float] = {}
+            for key, value in (blocks or {}).items():
+                safe_key = str(key or "").strip().lower()
+                if not safe_key:
+                    continue
+                try:
+                    blocked_until = float(value or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if blocked_until > 0:
+                    normalized[safe_key] = blocked_until
+            self._state.flow_profile_quota_blocked_until = normalized
+            await self._save_locked()
+        return self._state.flow_profile_quota_blocked_until
+
     async def list_jobs(self) -> List[JobRecord]:
         return list(self._state.jobs)
 

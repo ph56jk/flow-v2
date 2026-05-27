@@ -279,7 +279,9 @@ class FlowWebService:
         self._shared_browser: Any | None = None
         self._shared_browser_profile_key = ""
         self._active_flow_profile_index = 0
-        self._flow_profile_quota_blocked_until: Dict[str, float] = {}
+        self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
+            self.store.snapshot().flow_profile_quota_blocked_until
+        )
 
     async def close(self) -> None:
         async with self._browser_session_lock:
@@ -3397,13 +3399,16 @@ class FlowWebService:
             "Before generating, state a compact design analysis of the reference product, then create a numbered shot brief. "
             f"Request exactly {target} separate standalone 1:1 images, generated one by one; never make a collage, contact sheet, grid, or multiple small frames inside one image. "
             "For every shot, specify the subject count, exact product placement, background, props, lighting direction, camera angle, and which source details must stay unchanged. "
-            "Keep all source motifs, embroidery/print placement, names, colors, fabric texture, proportions, and handmade irregularities consistent unless a shot brief explicitly asks for personalized name variants and the source image visibly contains an embroidered/personalized name; then vary only the name text while preserving lettering style, stitch quality, motif placement, and product identity. "
+            "The visible source image is more authoritative than the filename, card title, or old prompt text; never infer product category from generic filenames or motif words. "
+            "Keep the exact source product object type, silhouette, edge construction, proportions, motif, embroidery/print placement, readable text/name, colors, fabric texture, and handmade irregularities consistent. "
+            "Only if the source image visibly contains an embroidered/personalized name and the Trello description explicitly requests alternate personalized names may a multi-product shot vary the name text; otherwise keep readable text/name exactly as the source or absent if absent. "
             "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, clear stitch direction, tactile fibers, crisp embroidered edges, natural thread shadows, and no flat printed, painted, digital, vinyl, or sticker-like texture. "
             "For handmade or embroidered products, include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
             "Use clean clear white neutral daylight for every image: soft bright studio or nursery light, accurate white balance, crisp whites, and no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             "Use airy clean styling, white nursery/home/kitchen/gift-ready contexts when appropriate, premium Etsy-style commercial photography. "
-            "For fabric products, include pastel colorway variety when the shot plan allows: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow fabric options while preserving the source motif and embroidery style. "
-            "Only if the source image visibly contains an embroidered/personalized name may multi-product, colorway, or hoop variant shots include embroidered names; then use a different plausible name for each product option. If the source has no embroidered name, keep all variants nameless and never add sample names, loose labels, tag cards, or text overlays. "
+            "For fabric products, include pastel colorway variety only when the same exact source product form can be preserved: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow fabric options while preserving the same physical product shape, construction, motif, embroidery placement, and scale. "
+            "Never transfer the source motif/name/design onto another product type such as a shirt, pillow, cushion, blanket, banner, hoop, tote, plush, dress, or framed print unless the source itself is exactly that product type. "
+            "If the source has no embroidered name, keep all variants nameless and never add sample names, loose labels, tag cards, or text overlays. "
             + self._flow_agent_no_tag_label_rule()
         )
 
@@ -7652,6 +7657,8 @@ exit 1
                 "Reject any output whose main product category, silhouette, construction, motif/design, embroidered/printed text, personalized name, material identity, or source product family does not match the source.",
                 "Reject if the output appears to come from another Trello card or another product, even if it is visually high quality.",
                 "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
+                "Reject if the main product changes form: for example source pillow to shirt/banner/blanket/hoop, source banner to pillow/shirt, source hoop to pillow/banner, or source apparel to pillow/banner.",
+                "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
                 "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
                 "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
                 f"Source card/product title: {request.prompt_product or request.title or ''}",
@@ -8933,8 +8940,14 @@ exit 1
             "normalized": normalized,
             "compact": compact,
             "is_apron": any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact,
-            "is_doll": any(term in normalized for term in ("bup_be", "bupbe", "doll", "baby_doll", "babydoll", "bda")),
-            "is_plush": any(term in normalized for term in ("gau_bong", "gaubong", "plush", "stuffed", "stuffed_animal", "teddy", "bear", "gau")),
+            "is_doll": (
+                any(term in normalized for term in ("bup_be", "bupbe", "baby_doll", "babydoll"))
+                or bool({"doll", "bda"} & tokens)
+            ),
+            "is_plush": (
+                any(term in normalized for term in ("gau_bong", "gaubong", "stuffed_animal"))
+                or bool({"plush", "stuffed", "teddy", "bear", "gau"} & tokens)
+            ),
             "is_hoop": (
                 any(term in normalized for term in ("hoop", "embroidery_hoop", "wedding_hoop", "embroidery_frame", "khung_theu", "vong_theu"))
                 or any(term in compact for term in ("embroideryhoop", "weddinghoop", "khungtheu", "vongtheu", "hoopswithphotos"))
@@ -8976,11 +8989,11 @@ exit 1
             ),
             "is_pillowcase": any(
                 term in normalized
-                for term in ("goi", "vo_goi", "vỏ_gối", "pillow", "pillowcase", "cushion", "baby_pillow")
-            ) or "vogoi" in compact,
+                for term in ("vo_goi", "vỏ_gối", "pillow", "pillowcase", "cushion", "baby_pillow")
+            ) or "vogoi" in compact or "goi" in tokens,
             "is_child_shirt": is_child_shirt,
-            "is_shirt": any(term in normalized for term in ("ao", "shirt", "tshirt", "tee")),
-            "is_embroidery": any(term in normalized for term in ("theu", "embroider", "embroidery", "handmade", "hand_made", "stitched", "stitch")),
+            "is_shirt": any(term in normalized for term in ("shirt", "tshirt")) or bool({"ao", "tee"} & tokens),
+            "is_embroidery": any(term in normalized for term in ("embroider", "embroidery", "handmade", "hand_made", "stitched", "stitch")) or "theu" in tokens,
             "is_baking": any(term in normalized for term in ("baking", "bakery", "kitchen", "nau_an", "lam_banh")),
         }
 
@@ -9041,7 +9054,9 @@ exit 1
         if signals.get("is_baking"):
             product_bits.append("bright neutral bakery/kitchen context, baking tools, flour, pastry props, and clean food-safe styling")
         if not product_bits:
-            product_bits.append("product type, base color, material texture, print/embroidery details, silhouette, scale, and hero features")
+            product_bits.append(
+                "the visible source object's exact product type, physical silhouette, outline, construction, base color, material texture, print/embroidery details, scale, and hero features without inferring a category from a generic filename"
+            )
 
         visible_sources = ", ".join(part for part in [card_name, attachment_names] if part)
         source_hint = f" Visible Trello clues: {visible_sources}." if visible_sources else ""
@@ -9101,7 +9116,8 @@ exit 1
                 "label": "Pastel fabric colorway lineup",
                 "brief": (
                     f"Clean white-daylight product lineup showing coordinated {label} fabric colorways in {palette}. "
-                    "Keep the exact source product category, motif, print or embroidery style, proportions, and handmade texture; vary fabric base colors when plausible. "
+                    "Keep the exact source product category, physical object type, silhouette, construction, motif, print or embroidery style, proportions, and handmade texture; vary fabric base colors only on that same object form when plausible. "
+                    "Never move the source motif/design onto a shirt, pillow, banner, hoop, blanket, tote, or any other product form unless the source image is exactly that form. "
                     "Only if the source image visibly contains an embroidered/personalized name, use a different plausible name on each fabric color option; otherwise keep all variants nameless."
                 ),
                 "must_include": "pastel fabric variety, different personalized names only if source has an embroidered name, source product identity, white neutral daylight, no tag or label",
@@ -9110,7 +9126,8 @@ exit 1
                 "label": "Soft room colorway trio",
                 "brief": (
                     f"Bright white nursery/home/studio scene with three coordinated {label} color options in soft pastel fabric colors. "
-                    "The design must look like one product family and must avoid yellow or warm color grading. "
+                    "The design must look like one product family with the same physical object shape as the source and must avoid yellow or warm color grading. "
+                    "Do not reinterpret the source embroidery as apparel, a pillow, a pennant, a hoop, or any other product category. "
                     "Only if the source image visibly has an embroidered/personalized name, make each name different while preserving lettering and stitch style; otherwise do not add names."
                 ),
                 "must_include": "three pastel variants, different names only if source has an embroidered name, white balanced room light, source design preserved",
@@ -9128,7 +9145,8 @@ exit 1
                 "label": "Color option display",
                 "brief": (
                     f"Ecommerce merchandising display with four natural {label} color options arranged as real products, not a collage. "
-                    "Preserve the source motif/design quality while varying fabric colors like ivory, pale blue, mint, blush, and butter yellow. "
+                    "Preserve the same exact product object, silhouette, construction, motif/design quality, and embroidery placement while varying fabric colors like ivory, pale blue, mint, blush, and butter yellow. "
+                    "Do not create derivative products or apply the motif to another product form. "
                     "Only if the source image visibly has an embroidered/personalized name, each fabric color option must have a different embroidered name; otherwise do not add names."
                 ),
                 "must_include": "four color options, different embroidered names only if source has a name, product family consistency, clean white daylight",
@@ -9615,9 +9633,11 @@ exit 1
             f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
             (
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
+                "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as bear/sheep/flower. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
                 "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
-                "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary."
+                "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
+                "If the source is a square pillow with a sheep embroidery, every main product must remain that same square pillow with the same sheep embroidery placement; it must not become baby shirts, hanging banners, blankets, hoops, or fabric samples with the motif copied onto them."
             ),
             (
                 "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
@@ -9642,7 +9662,7 @@ exit 1
             self._flow_agent_reference_prompt_style_guide(target_count),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a doll or plush, it must remain a doll or plush, not an apron, shirt, mug, or unrelated object.",
+            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is apparel, it must remain the same apparel form.",
             "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas.",
             "Do not use Google Sheet prompts; do not ask the local app AI to write the final prompt.",
         ]
@@ -11158,13 +11178,7 @@ exit 1
                 for _ in range(attempts):
                     profile = self._current_flow_profile()
                     if self._flow_profile_is_quota_blocked(profile):
-                        raise HTTPException(
-                            status_code=429,
-                            detail=(
-                                "Tat ca Chrome profile Flow da het quota Agent trong phien nay. "
-                                "Hay dang nhap them profile khac, cho quota reset, hoac restart app neu muon bo danh dau tam thoi."
-                            ),
-                        )
+                        raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail())
                     profile_project_id = self._flow_profile_project_id(profile, config.project_id)
                     if not profile_project_id:
                         raise HTTPException(status_code=400, detail="Mã project là bắt buộc.")
@@ -11187,6 +11201,7 @@ exit 1
                             if next_profile is not None:
                                 self._active_flow_profile_index = next_profile.index
                                 continue
+                            raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail()) from exc
                         if self._is_browser_closed_error(exc):
                             await self._close_shared_browser()
                         raise HTTPException(
@@ -11361,11 +11376,39 @@ exit 1
         except ValueError:
             return 24.0 * 60.0 * 60.0
 
+    def _valid_flow_profile_quota_blocks(self, blocks: Dict[str, float] | None) -> Dict[str, float]:
+        now = time.time()
+        valid: Dict[str, float] = {}
+        for key, value in (blocks or {}).items():
+            safe_key = str(key or "").strip().lower()
+            if not safe_key:
+                continue
+            try:
+                blocked_until = float(value or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if blocked_until > now:
+                valid[safe_key] = blocked_until
+        return valid
+
+    def _flow_profiles_all_quota_blocked_detail(self) -> str:
+        profiles = self._flow_profile_specs()
+        blocked_labels = [
+            profile.label
+            for profile in profiles
+            if self._flow_profile_is_quota_blocked(profile)
+        ]
+        label_text = ", ".join(blocked_labels) if blocked_labels else "tat ca profile"
+        return (
+            f"Tat ca Chrome profile Flow da het quota Agent ({label_text}). "
+            "App da dung thay vi quay lai profile da het quota. Hay dang nhap them profile khac hoac cho quota reset."
+        )
+
     def _flow_profile_is_quota_blocked(self, profile: FlowBrowserProfile) -> bool:
         blocked_until = float(self._flow_profile_quota_blocked_until.get(profile.key, 0.0) or 0.0)
         if blocked_until <= 0:
             return False
-        if blocked_until > time.monotonic():
+        if blocked_until > time.time():
             return True
         self._flow_profile_quota_blocked_until.pop(profile.key, None)
         return False
@@ -11409,7 +11452,9 @@ exit 1
         )
 
     async def _mark_flow_profile_quota_limited(self, profile: FlowBrowserProfile, exc: Exception) -> None:
-        self._flow_profile_quota_blocked_until[profile.key] = time.monotonic() + self._flow_profile_block_seconds()
+        self._flow_profile_quota_blocked_until = self._valid_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
+        self._flow_profile_quota_blocked_until[profile.key] = time.time() + self._flow_profile_block_seconds()
+        await self.store.replace_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
         if self._shared_browser_profile_key == profile.key:
             await self._close_shared_browser()
 
@@ -15848,17 +15893,17 @@ exit 1
                 "label": "pastel fabric colorway lineup image",
                 "brief": (
                     "Make a clean white-daylight lineup of coordinated fabric colorways inspired by the supplied examples: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow. "
-                    "Show real product variants side by side when plausible, preserving the source motif, embroidery/print style, fabric texture, and product shape."
+                    "Show real product variants side by side only as the same physical product form as the source, preserving the source silhouette, construction, motif, embroidery/print style, fabric texture, and product shape."
                 ),
-                "must_not": "Do not make a collage, grid, label card, price tag, or unrelated color palette board.",
+                "must_not": "Do not make a collage, grid, label card, price tag, unrelated color palette board, or derivative product such as shirts from a pillow source.",
             },
             {
                 "label": "white nursery color variation image",
                 "brief": (
                     "Make a bright white nursery, shelf, crib, or clean home scene with several soft pastel fabric variants displayed naturally. "
-                    "Use crisp white balanced daylight only, no yellow cast, and keep the product family visually consistent."
+                    "Use crisp white balanced daylight only, no yellow cast, and keep the exact source product object type and construction visually consistent."
                 ),
-                "must_not": "Do not use warm golden light, beige color grading, dark shadows, or a repeated hero composition.",
+                "must_not": "Do not use warm golden light, beige color grading, dark shadows, a repeated hero composition, or source embroidery copied onto another product type.",
             },
             {
                 "label": "pastel swatch material flat lay image",
@@ -15872,9 +15917,9 @@ exit 1
                 "label": "four color option ecommerce image",
                 "brief": (
                     "Make a polished ecommerce display with four natural product color options arranged as real objects, not a contact sheet. "
-                    "Use pastel fabric variety like the examples while preserving the source design quality and handmade construction."
+                    "Use pastel fabric variety like the examples while preserving the exact source product form, source design quality, and handmade construction."
                 ),
-                "must_not": "Do not create a multi-panel grid, do not change the product category, and do not add any tag or sale badge.",
+                "must_not": "Do not create a multi-panel grid, do not change the product category, do not move the motif onto apparel/pillow/banner/hoop unless source is that type, and do not add any tag or sale badge.",
             },
         ]
 
@@ -15913,8 +15958,10 @@ exit 1
             "The product must sit inside a square 1:1 frame with no side-by-side contact sheet, no wide cinematic crop, and no UI/gallery screenshot look. "
             f"{shot_plan_text}"
             "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
+            "The source image beats the filename/card title: do not infer a shirt from 'tao_hinh...', do not infer a plush from a bear/sheep motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
             "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
-            "Do not reinterpret, upgrade, or transform the source into another product type: a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
+            "Do not reinterpret, upgrade, or transform the source into another product type: a pillow stays the same pillow shape, a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
+            "Do not create derivative merchandise using the source embroidery, such as putting a pillow embroidery onto baby shirts, blankets, banners, hoops, totes, framed prints, or fabric swatches. "
             "If a planned scene would require changing the product shape or design, keep the product unchanged and only change the surrounding styling, props, camera angle, or background. "
             "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
             "If two ideas look like the same product-on-table view, change one before generating. "
@@ -15922,7 +15969,7 @@ exit 1
             "Every stitched or embroidered area in every output must look like real hand embroidery: raised thread, visible stitch direction, tactile fibers, crisp embroidered edges, and natural thread shadows; never make embroidery look flat printed, painted, digital, vinyl, or sticker-like. "
             "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
             "Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. "
-            "For non-hoop fabric colorways, only if the source image visibly contains an embroidered or personalized name may each fabric color option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
+            "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Trello description explicitly asks for alternate names and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
             f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
             f"{self._flow_agent_no_tag_label_rule()} "
             "Do not add any readable name, initials, year, EST date, quote, slogan, label, or decorative text unless that readable text is visibly embroidered/printed on the source product image; for allowed name variants, keep the same product shape and motif exactly. "

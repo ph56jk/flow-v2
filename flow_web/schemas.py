@@ -249,6 +249,7 @@ class StateSnapshot(BaseModel):
     config: AppConfig = Field(default_factory=AppConfig)
     trello_config: TrelloConfig = Field(default_factory=TrelloConfig)
     integration_config: IntegrationConfig = Field(default_factory=IntegrationConfig)
+    flow_profile_quota_blocked_until: Dict[str, float] = Field(default_factory=dict)
     jobs: List[JobRecord] = Field(default_factory=list)
     skills: List[SkillRecord] = Field(default_factory=list)
 
