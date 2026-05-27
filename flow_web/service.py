@@ -279,6 +279,7 @@ class FlowWebService:
         self._shared_browser: Any | None = None
         self._shared_browser_profile_key = ""
         self._active_flow_profile_index = 0
+        self._trello_source_downloads: Dict[str, Dict[str, Any]] = {}
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
         )
@@ -2061,6 +2062,12 @@ class FlowWebService:
                     "trello_card_id": str(item.trello_card_id or "").strip(),
                     "trello_list_id": str(item.trello_list_id or "").strip(),
                     "trello_attachment_ids": self._normalize_trello_attachment_ids(item.trello_attachment_ids),
+                    "trello_source_card_id": self._normalize_trello_card_id(
+                        str(item.trello_source_card_id or item.trello_card_id or "").strip()
+                    ),
+                    "trello_source_attachment_ids": self._normalize_trello_attachment_ids(
+                        item.trello_source_attachment_ids or item.trello_attachment_ids
+                    ),
                 }
             )
             if len(normalized) >= limit:
@@ -2209,6 +2216,8 @@ class FlowWebService:
         payload["trello_list_id"] = str(discovery.get("list_id") or "")
         payload["trello_card_id"] = ""
         payload["trello_attachment_ids"] = []
+        payload["trello_source_card_id"] = ""
+        payload["trello_source_attachment_ids"] = []
         self._sync_trello_scope_into_automation_graph(
             payload,
             board_id=payload["trello_board_id"],
@@ -2230,6 +2239,8 @@ class FlowWebService:
         payload["prompt_notes"] = ""
         payload["trello_card_id"] = ""
         payload["trello_attachment_ids"] = []
+        payload["trello_source_card_id"] = ""
+        payload["trello_source_attachment_ids"] = []
         self._sync_trello_scope_into_automation_graph(
             payload,
             board_id=str(payload.get("trello_board_id") or "").strip(),
@@ -2343,12 +2354,31 @@ class FlowWebService:
         rows = ",".join(str(item.get("row") or "") for item in items)
         prompt_keys = ",".join(str(item.get("product_key") or item.get("product") or "") for item in items)
         item_card_ids = ",".join(str(item.get("trello_card_id") or "") for item in items)
+        source_card_ids = ",".join(str(item.get("trello_source_card_id") or "") for item in items)
         attachment_ids = ",".join(self._normalize_trello_attachment_ids(request.trello_attachment_ids))
+        source_attachment_ids = ",".join(self._normalize_trello_attachment_ids(request.trello_source_attachment_ids))
         item_attachment_ids = ",".join(
             ",".join(self._normalize_trello_attachment_ids(item.get("trello_attachment_ids")))
             for item in items
         )
-        return "|".join([card_id, list_id, attachment_ids, rows, prompt_keys, item_card_ids, item_attachment_ids]).strip("|")
+        item_source_attachment_ids = ",".join(
+            ",".join(self._normalize_trello_attachment_ids(item.get("trello_source_attachment_ids")))
+            for item in items
+        )
+        return "|".join(
+            [
+                card_id,
+                list_id,
+                attachment_ids,
+                source_attachment_ids,
+                rows,
+                prompt_keys,
+                item_card_ids,
+                source_card_ids,
+                item_attachment_ids,
+                item_source_attachment_ids,
+            ]
+        ).strip("|")
 
     def _active_prompt_batch_by_key(self, batch_key: str) -> JobRecord | None:
         if not batch_key:
@@ -2406,6 +2436,16 @@ class FlowWebService:
             payload["trello_list_id"] = str(item.get("trello_list_id") or "").strip()
         if item.get("trello_attachment_ids"):
             payload["trello_attachment_ids"] = self._normalize_trello_attachment_ids(item.get("trello_attachment_ids"))
+        source_card_id = self._normalize_trello_card_id(
+            str(item.get("trello_source_card_id") or item.get("trello_card_id") or "").strip()
+        )
+        source_attachment_ids = self._normalize_trello_attachment_ids(
+            item.get("trello_source_attachment_ids") or item.get("trello_attachment_ids") or []
+        )
+        if source_card_id:
+            payload["trello_source_card_id"] = source_card_id
+        if source_attachment_ids:
+            payload["trello_source_attachment_ids"] = source_attachment_ids
         if item.get("trello_card_id") or item.get("trello_list_id"):
             self._sync_trello_scope_into_automation_graph(
                 payload,
@@ -6506,6 +6546,8 @@ exit 1
                 module.get("type") == "trello_source" or not str(payload.get("trello_card_id") or "").strip()
             ):
                 payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
+                if module.get("type") == "trello_source":
+                    payload["trello_source_card_id"] = self._normalize_trello_card_id(payload["trello_card_id"])
             if settings.get("trelloList"):
                 payload["trello_list_id"] = str(settings.get("trelloList") or "").strip()
             attachment_ids = self._normalize_trello_attachment_ids(
@@ -6513,6 +6555,8 @@ exit 1
             )
             if attachment_ids:
                 payload["trello_attachment_ids"] = attachment_ids
+                if module.get("type") == "trello_source":
+                    payload["trello_source_attachment_ids"] = attachment_ids
         return CreateJobRequest(**payload)
 
     def _trello_direct_review_enabled(self, request: CreateJobRequest, graph: Dict[str, Any]) -> bool:
@@ -6968,7 +7012,9 @@ exit 1
             or os.getenv("TRELLO_BOARD_ID", "")
         )
         card_id = self._normalize_trello_card_id(
-            module_request.trello_card_id
+            module_request.trello_source_card_id
+            or request.trello_source_card_id
+            or module_request.trello_card_id
             or request.trello_card_id
             or trello_config.card_id
             or os.getenv("TRELLO_CARD_ID", "")
@@ -6991,7 +7037,10 @@ exit 1
             limit = 1
         limit = max(1, min(4, limit))
         selected_attachment_ids = self._normalize_trello_attachment_ids(
-            module_request.trello_attachment_ids or request.trello_attachment_ids
+            module_request.trello_source_attachment_ids
+            or request.trello_source_attachment_ids
+            or module_request.trello_attachment_ids
+            or request.trello_attachment_ids
         )
         if selected_attachment_ids:
             limit = min(4, max(limit, len(selected_attachment_ids)))
@@ -7065,6 +7114,12 @@ exit 1
         if not paths:
             raise RuntimeError("Card Trello này chưa có attachment ảnh nào để làm ảnh tham chiếu.")
 
+        source_download = dict(self._trello_source_downloads.get(job_id) or {})
+        locked_source_card_id = self._normalize_trello_card_id(str(source_download.get("card_id") or card_id or ""))
+        locked_source_attachment_ids = self._normalize_trello_attachment_ids(
+            source_download.get("attachment_ids") or selected_attachment_ids
+        )
+
         payload = _model_dump(request)
         existing_paths = [str(item).strip() for item in payload.get("reference_image_paths", []) if str(item).strip()]
         existing_roles = [str(item).strip() for item in payload.get("reference_image_roles", []) if str(item).strip()]
@@ -7083,14 +7138,16 @@ exit 1
             payload["trello_board_id"] = board_id
         if list_id:
             payload["trello_list_id"] = list_id
-        payload["trello_card_id"] = card_id
-        payload["trello_attachment_ids"] = selected_attachment_ids
+        payload["trello_card_id"] = locked_source_card_id or card_id
+        payload["trello_attachment_ids"] = locked_source_attachment_ids
+        payload["trello_source_card_id"] = locked_source_card_id or card_id
+        payload["trello_source_attachment_ids"] = locked_source_attachment_ids
         self._sync_trello_scope_into_automation_graph(
             payload,
             board_id=board_id,
             list_id=list_id,
-            card_id=card_id,
-            attachment_ids=selected_attachment_ids,
+            card_id=payload["trello_card_id"],
+            attachment_ids=locked_source_attachment_ids,
         )
 
         await self._set_automation_module_status(
@@ -7100,9 +7157,11 @@ exit 1
             "completed",
             output={
                 "board_id": board_id,
-                "card_id": card_id,
+                "card_id": payload["trello_card_id"],
+                "source_card_id": payload["trello_source_card_id"],
                 "list_id": list_id,
-                "attachment_ids": selected_attachment_ids,
+                "attachment_ids": locked_source_attachment_ids,
+                "source_attachment_ids": locked_source_attachment_ids,
                 "reference_image_count": len(selected_paths),
                 "reference_image_names": [Path(path).name for path in selected_paths],
             },
@@ -7757,7 +7816,20 @@ exit 1
 
         trello_config = self.store.snapshot().trello_config
         request_card_id = self._normalize_trello_card_id(request.trello_card_id)
-        selected_source_attachment_ids = self._normalize_trello_attachment_ids(request.trello_attachment_ids)
+        locked_source_card_id = self._normalize_trello_card_id(request.trello_source_card_id)
+        if locked_source_card_id:
+            if request_card_id and request_card_id != locked_source_card_id:
+                await self.store.append_log(
+                    job_id,
+                    (
+                        "Trello Archive detected a stale target card and will use the locked Trello source card "
+                        f"{locked_source_card_id} instead of {request_card_id}."
+                    ),
+                )
+            request_card_id = locked_source_card_id
+        selected_source_attachment_ids = self._normalize_trello_attachment_ids(
+            request.trello_source_attachment_ids or request.trello_attachment_ids
+        )
         graph = self._automation_graph_payload(request)
         has_trello_source = any(
             module.get("enabled") and module.get("type") == "trello_source"
@@ -7962,6 +8034,8 @@ exit 1
             "sent": stored,
             "failed": failed,
             "card_id": card_id,
+            "source_card_id": locked_source_card_id or request_card_id,
+            "source_attachment_ids": selected_source_attachment_ids,
             "card_url": card_url,
             "created_card": created_card,
             "attachments": attachments,
@@ -8310,6 +8384,19 @@ exit 1
                     "Card Trello này chỉ còn ảnh output cũ của Flow, không có ảnh nguồn mới để làm reference."
                 )
         image_attachments = image_attachments[: max(1, min(4, int(limit or 4)))]
+        self._trello_source_downloads[str(job_id or "")] = {
+            "card_id": self._normalize_trello_card_id(card_id),
+            "attachment_ids": [
+                self._normalize_trello_id(str(item.get("id") or ""))
+                for item in image_attachments
+                if str(item.get("id") or "").strip()
+            ],
+            "attachment_names": [
+                str(item.get("name") or "").strip()
+                for item in image_attachments
+                if str(item.get("name") or "").strip()
+            ],
+        }
         paths: List[str] = []
         for index, attachment in enumerate(image_attachments):
             data, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
@@ -8571,6 +8658,25 @@ exit 1
         card["_image_attachments"] = selected
         card["_selected_attachment_ids"] = [self._normalize_trello_id(str(item.get("id") or "")) for item in selected if str(item.get("id") or "").strip()]
         return True
+
+    def _trello_locked_source_attachment_ids_for_card(
+        self,
+        card: Dict[str, Any],
+        fallback_attachment_ids: Any = None,
+    ) -> List[str]:
+        selected = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or [])
+        if selected:
+            return selected
+        image_ids = self._normalize_trello_attachment_ids(
+            [
+                str(item.get("id") or "")
+                for item in (card.get("_image_attachments") or [])[:1]
+                if isinstance(item, dict)
+            ]
+        )
+        if image_ids:
+            return image_ids
+        return self._normalize_trello_attachment_ids(fallback_attachment_ids or [])
 
     def _default_trello_source_list_name(self) -> str:
         return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
@@ -8862,12 +8968,15 @@ exit 1
                 if item_key in used_pairs:
                     continue
                 used_pairs.add(item_key)
+                selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card)
                 expanded.append(
                     {
                         **item,
                         "trello_card_id": card_id,
                         "trello_list_id": card_list_id,
-                        "trello_attachment_ids": self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or []),
+                        "trello_attachment_ids": selected_attachment_ids,
+                        "trello_source_card_id": card_id,
+                        "trello_source_attachment_ids": selected_attachment_ids,
                         "trello_card_name": hint["card_name"],
                         "trello_card_url": hint["card_url"],
                     }
@@ -9697,7 +9806,7 @@ exit 1
             card_list_id = self._normalize_trello_id(str(card.get("idList") or request.trello_list_id or ""))
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
-            selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
+            selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
             existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
             rerun_full_set = existing_flow_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT
             image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT if rerun_full_set else max(1, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - existing_flow_count)
@@ -9734,6 +9843,8 @@ exit 1
                     "trello_card_id": card_id,
                     "trello_list_id": card_list_id,
                     "trello_attachment_ids": selected_attachment_ids,
+                    "trello_source_card_id": card_id,
+                    "trello_source_attachment_ids": selected_attachment_ids,
                     "trello_card_name": card_name,
                     "trello_card_url": card_url,
                     "trello_match_mode": "flow_agent",
@@ -9815,7 +9926,7 @@ exit 1
             if not card_id:
                 continue
             card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
-            selected_attachment_ids = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or request.trello_attachment_ids)
+            selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
             item = self._best_prompt_item_for_trello_keyword_card(card, items, used_pairs, query)
             if not item:
                 card_name = str(card.get("name") or card.get("url") or card_id).strip()
@@ -9830,6 +9941,8 @@ exit 1
                     "trello_card_id": card_id,
                     "trello_list_id": card_list_id,
                     "trello_attachment_ids": selected_attachment_ids,
+                    "trello_source_card_id": card_id,
+                    "trello_source_attachment_ids": selected_attachment_ids,
                     "trello_card_name": str(card.get("name") or "").strip(),
                     "trello_card_url": str(card.get("url") or "").strip(),
                     "trello_match_mode": "keyword",
@@ -14018,6 +14131,10 @@ exit 1
         ]
         payload["media_id"] = str(payload.get("media_id", "")).strip()
         payload["workflow_id"] = str(payload.get("workflow_id", "")).strip() or config.active_workflow_id
+        payload["trello_source_card_id"] = self._normalize_trello_card_id(str(payload.get("trello_source_card_id") or ""))
+        payload["trello_source_attachment_ids"] = self._normalize_trello_attachment_ids(
+            payload.get("trello_source_attachment_ids") or []
+        )
         payload["motion"] = str(payload.get("motion", "")).strip()
         payload["position"] = str(payload.get("position", "")).strip()
         payload["resolution"] = str(payload.get("resolution", "1080p")).strip() or "1080p"
