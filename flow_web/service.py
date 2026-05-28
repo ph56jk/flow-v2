@@ -16060,25 +16060,22 @@ exit 1
                         except Exception as exc:
                             last_exc = exc
                             normalized_detail = str(exc or "").lower()
-                            retryable = any(
-                                marker in normalized_detail
-                                for marker in (
-                                    "invalid argument",
-                                    "recaptcha",
-                                    "403",
-                                    "timeout",
-                                    "thoi gian cho",
-                                    "chua tra ve anh",
-                                )
-                            )
+                            retryable = self._is_retryable_flow_agent_ui_error(normalized_detail)
                             if not retryable or attempt >= tries - 1:
                                 raise
                             if job_id:
+                                if self._is_stale_flow_agent_context_error(normalized_detail):
+                                    retry_note = (
+                                        f"Flow Agent còn hội thoại/ngữ cảnh cũ khi tạo x{run_count}; "
+                                        "app đã đóng tab Agent cũ và thử lại trên tab sạch."
+                                    )
+                                else:
+                                    retry_note = f"Flow Agent báo bận/reCAPTCHA khi tạo x{run_count}; app nghỉ rồi thử lại 1 lần."
                                 await self.store.append_log(
                                     job_id,
-                                    f"Flow Agent bao ban/reCAPTCHA khi tao x{run_count}; app nghi roi thu lai 1 lan.",
+                                    retry_note,
                                 )
-                            await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
+                            await asyncio.sleep(self._flow_agent_ui_retry_delay_s(normalized_detail))
 
                     if not batch_generated and last_exc is not None:
                         raise last_exc
@@ -16132,25 +16129,22 @@ exit 1
                     last_exc = exc
                     detail = str(exc or "")
                     normalized_detail = detail.lower()
-                    retryable = any(
-                        marker in normalized_detail
-                        for marker in (
-                            "invalid argument",
-                            "recaptcha",
-                            "403",
-                            "timeout",
-                            "thoi gian cho",
-                            "chua tra ve anh",
-                        )
-                    )
+                    retryable = self._is_retryable_flow_agent_ui_error(normalized_detail)
                     if not flow_agent_enabled or not retryable or attempt >= tries - 1:
                         raise
                     if job_id:
+                        if self._is_stale_flow_agent_context_error(normalized_detail):
+                            retry_note = (
+                                f"Flow Agent còn hội thoại/ngữ cảnh cũ khi tạo x{target_count}; "
+                                "app đã đóng tab Agent cũ và thử lại trên tab sạch."
+                            )
+                        else:
+                            retry_note = f"Flow Agent báo bận/reCAPTCHA khi tạo x{target_count}; app nghỉ rồi thử lại 1 lần đủ bộ."
                         await self.store.append_log(
                             job_id,
-                            f"Flow Agent báo bận/reCAPTCHA khi tạo x{target_count}; app nghỉ rồi thử lại 1 lần đủ bộ.",
+                            retry_note,
                         )
-                    await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
+                    await asyncio.sleep(self._flow_agent_ui_retry_delay_s(normalized_detail))
 
             if not generated and last_exc is not None:
                 raise last_exc
@@ -16167,6 +16161,43 @@ exit 1
             count=max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1))),
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
         )
+
+    def _is_stale_flow_agent_context_error(self, detail: str) -> bool:
+        normalized = str(detail or "").lower()
+        return any(
+            marker in normalized
+            for marker in (
+                "old context",
+                "hoi thoai cu",
+                "ngữ cảnh cũ",
+                "ngu canh project cu",
+                "context project cu",
+                "old flow agent conversation",
+                "tac nhan flow dang mo lai",
+                "agent context",
+            )
+        )
+
+    def _is_retryable_flow_agent_ui_error(self, detail: str) -> bool:
+        normalized = str(detail or "").lower()
+        return self._is_stale_flow_agent_context_error(normalized) or any(
+            marker in normalized
+            for marker in (
+                "invalid argument",
+                "recaptcha",
+                "403",
+                "timeout",
+                "timed out",
+                "thoi gian cho",
+                "chua tra ve anh",
+            )
+        )
+
+    def _flow_agent_ui_retry_delay_s(self, detail: str) -> float:
+        normalized = str(detail or "").lower()
+        if self._is_stale_flow_agent_context_error(normalized):
+            return 4.0
+        return 45.0 if ("recaptcha" in normalized or "403" in normalized) else 25.0
 
     def _flow_agent_shot_specs(self) -> List[Dict[str, str]]:
         return [
@@ -16450,10 +16481,16 @@ exit 1
             if job_id and fresh_panel_detail:
                 await self.store.append_log(job_id, f"Fallback UI Flow: kiem tra phien Agent ({fresh_panel_detail[:160]}).")
             if not fresh_panel:
+                discard_detail = await self._discard_cached_flow_agent_page(client, page)
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        f"Fallback UI Flow: đóng tab Agent chưa sạch trước khi thử lại ({discard_detail[:160]}).",
+                    )
                 raise RuntimeError(
                     "Tac nhan Flow dang mo lai hoi thoai cu hoac ngu canh project cu. "
                     "App da dung truoc khi gui prompt de tranh Flow lay sai san pham. "
-                    f"Chi tiet: {fresh_panel_detail}"
+                    f"Chi tiet: {fresh_panel_detail}; {discard_detail}"
                 )
 
             filled, fill_detail = await self._fill_flow_agent_panel_instruction(page, prompt)
@@ -16862,6 +16899,40 @@ exit 1
 
         page = await browser.page()
         return page, "browser manager page"
+
+    async def _discard_cached_flow_agent_page(self, client: Any, page: Any) -> str:
+        browser = getattr(client, "_bm", None)
+        if browser is None or page is None:
+            return "no cached Flow Agent tab to close"
+        try:
+            cached_page = getattr(browser, "_flow_agent_page", None)
+        except Exception:
+            cached_page = None
+        if cached_page is not page:
+            return "current tab is not cached Flow Agent tab"
+
+        try:
+            browser._flow_agent_page = None
+        except Exception:
+            pass
+        try:
+            if getattr(browser, "_page", None) is page:
+                browser._page = None
+        except Exception:
+            pass
+
+        try:
+            is_closed = bool(page.is_closed()) if hasattr(page, "is_closed") else False
+        except Exception:
+            is_closed = False
+        if is_closed:
+            return "cached Flow Agent tab was already closed"
+
+        try:
+            await page.close()
+            return "closed stale cached Flow Agent tab"
+        except Exception as exc:
+            return f"could not close stale cached Flow Agent tab: {humanize_flow_error(str(exc))[:120]}"
 
     async def _ensure_fresh_flow_agent_panel(self, page: Any) -> tuple[bool, str]:
         state = await self._flow_agent_panel_context_state(page)

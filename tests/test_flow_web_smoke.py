@@ -7005,6 +7005,42 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("barcode", prompt)
         self.assertNotIn("name tag", prompt)
 
+    async def test_generate_images_via_ui_retries_stale_agent_context_once(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="tao bo anh san pham",
+            count=4,
+            flow_agent_enabled=True,
+            flow_agent_auto_approve=True,
+            reference_image_paths=["/tmp/source.jpg"],
+            workflow_id="source-workflow",
+        )
+        fake_images = [SimpleNamespace(media_name=f"img-{index}") for index in range(4)]
+        fake_client = SimpleNamespace()
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        stale_error = RuntimeError(
+            "Tac nhan Flow dang mo lai hoi thoai cu hoac ngu canh project cu. "
+            "Chi tiet: old context still visible after reset"
+        )
+
+        with patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="source-workflow"),
+        ), patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(side_effect=[stale_error, fake_images]),
+        ) as single_ref, patch("flow_web.service.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"], job_id=job.id)
+
+        self.assertEqual(fake_images, result)
+        self.assertEqual(2, single_ref.await_count)
+        sleep_mock.assert_any_await(4.0)
+        updated = self.store.get_job(job.id)
+        self.assertTrue(any("hội thoại/ngữ cảnh cũ" in entry.message for entry in (updated.logs if updated else [])))
+
     async def test_generate_images_via_ui_splits_flow_agent_twelve_images_into_x8_and_x4(self) -> None:
         request = CreateJobRequest(
             type="image",
@@ -7252,6 +7288,85 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertLess(events.index("verify"), events.index("send"))
         self.assertLess(events.index("drag"), events.index("send"))
         self.assertLess(events.index("send"), events.index("approve"))
+
+    async def test_single_reference_ui_discards_cached_agent_tab_when_context_stale(self) -> None:
+        events: list[str] = []
+
+        class FakePage:
+            url = "https://labs.google/fx/tools/flow/project/pid"
+            closed = False
+
+            async def goto(self, *_args: object, **_kwargs: object) -> None:
+                events.append("goto")
+
+            def is_closed(self) -> bool:
+                return self.closed
+
+            async def close(self) -> None:
+                self.closed = True
+                events.append("close")
+
+        class FakeFlowUI:
+            async def open_settings_panel(self, _page: FakePage) -> None:
+                events.append("settings")
+
+            async def select_image_model(self, _page: FakePage, _model: str) -> None:
+                events.append("model")
+
+            async def set_aspect_ratio(self, _page: FakePage, _ratio: object) -> None:
+                events.append("aspect")
+
+            async def set_count(self, _page: FakePage, _count: int) -> None:
+                events.append("count")
+
+        class FakeInterceptor:
+            def attach(self, _page: FakePage) -> None:
+                events.append("interceptor")
+
+            def clear(self) -> None:
+                events.append("clear")
+
+        page = FakePage()
+        fake_browser = SimpleNamespace(_flow_agent_page=page, _page=page)
+        fake_client = SimpleNamespace(project_id="pid", _bm=fake_browser, _ui=FakeFlowUI())
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch("flow._ui_interceptor.UIInterceptor", return_value=FakeInterceptor()), patch.object(
+            self.service,
+            "_acquire_isolated_flow_agent_page",
+            AsyncMock(return_value=(page, "reused isolated project tab")),
+        ), patch.object(
+            self.service,
+            "_enable_flow_agent_mode",
+            AsyncMock(return_value=(True, "Tác nhân")),
+        ), patch.object(
+            self.service,
+            "_open_flow_agent_panel",
+            AsyncMock(return_value=(True, "agent panel visible")),
+        ), patch.object(
+            self.service,
+            "_ensure_fresh_flow_agent_panel",
+            AsyncMock(return_value=(False, "old context still visible after reset")),
+        ), patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, "hoi thoai cu"):
+                await self.service._generate_single_reference_image_via_ui(
+                    fake_client,
+                    "tao 4 anh san pham tu anh goc",
+                    model="NARWHAL",
+                    reference_media_name="source-media",
+                    reference_image_path="/tmp/source.jpg",
+                    workflow_id="wf-source",
+                    count=1,
+                    flow_agent_enabled=True,
+                    flow_agent_auto_approve=True,
+                    job_id=job.id,
+                )
+
+        self.assertTrue(page.closed)
+        self.assertIsNone(fake_browser._flow_agent_page)
+        self.assertIsNone(fake_browser._page)
+        self.assertIn("close", events)
 
     async def test_single_reference_ui_stops_when_agent_source_not_verified(self) -> None:
         events: list[str] = []
