@@ -2532,7 +2532,7 @@ function renderEasyPanel(stats) {
       : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
   }
   if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.textContent = continuousAutoJob ? "Dừng auto" : autoTrelloReady && !batchItems.length ? "Auto AI Trello" : "Auto Trello";
+    elements.automationAutoRunButton.textContent = continuousAutoJob ? "Dừng auto" : "Bật auto liên tục";
     elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello"));
   }
   if (elements.automationResetReadyButton) {
@@ -2540,7 +2540,7 @@ function renderEasyPanel(stats) {
     elements.automationResetReadyButton.disabled = blockingActiveJobs.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
   }
   if (elements.automationRunButton) {
-    elements.automationRunButton.textContent = autoTrelloReady ? "Chạy auto" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
+    elements.automationRunButton.textContent = autoTrelloReady ? "Chạy 1 lượt" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
   }
   elements.easyPromptButton?.classList.toggle("ready", promptReady);
   elements.easyFlowButton?.classList.toggle("ready", flowReady);
@@ -4028,7 +4028,7 @@ async function resetReadyForAiOutputs({ skipConfirm = false, quiet = false } = {
     if (!quiet) {
       showMessage(
         deleted
-          ? `Đã reset ${cardsReset} card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, xóa ${deleted} ảnh output. Bấm Auto AI Trello để chạy lại.`
+          ? `Đã reset ${cardsReset} card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, xóa ${deleted} ảnh output. Bấm Bật auto liên tục để chạy lại.`
           : `${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} có ${cardsSeen} card nhưng chưa có ảnh output nào cần xóa.`,
         "success",
       );
@@ -4790,10 +4790,10 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
     showMessage(
       autoDiscoverTrello
         ? continuousAutoTrello
-          ? `Đã bật Auto AI Trello liên tục. App sẽ chờ card mới trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi bạn bấm Dừng auto.`
+          ? `Đã bật auto liên tục. App sẽ chờ card mới trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi bạn bấm Dừng auto.`
           : runUntilReadyEmpty
-          ? `Đã xếp hàng auto Trello. App sẽ quét toàn bộ card có ảnh trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi hết danh sách hiện tại.`
-          : `Đã xếp hàng auto Trello. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 12 ảnh trong một job rồi đẩy về đúng card để duyệt trên Trello.`
+          ? `Đã xếp hàng chạy 1 lượt. App sẽ quét toàn bộ card có ảnh trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi hết danh sách hiện tại.`
+          : `Đã xếp hàng chạy 1 lượt. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 12 ảnh trong một job rồi đẩy về đúng card để duyệt trên Trello.`
         : batchItems.length > 1
         ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi đẩy về đúng card Trello để duyệt.`
         : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, app sẽ lưu về Trello nếu cục Trello đang bật.",
