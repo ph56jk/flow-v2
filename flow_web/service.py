@@ -3824,7 +3824,7 @@ class FlowWebService:
             raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text)
+        parsed = self._parse_json_candidate(text, context="kế hoạch Flow AI")
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini không trả về kế hoạch Flow AI hợp lệ.")
         return parsed
@@ -5551,10 +5551,11 @@ class FlowWebService:
         prompt, _ = self._ensure_prompt_detail(baseline, baseline, "image")
         return prompt
 
-    def _parse_json_candidate(self, raw_text: str) -> Any:
+    def _parse_json_candidate(self, raw_text: str, *, context: str = "storyboard") -> Any:
+        context_label = str(context or "JSON").strip() or "JSON"
         text = str(raw_text or "").strip()
         if not text:
-            raise RuntimeError("Gemini không trả về nội dung storyboard.")
+            raise RuntimeError(f"Gemini không trả về nội dung {context_label}.")
 
         candidates = [text]
         for block in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
@@ -5577,7 +5578,7 @@ class FlowWebService:
                 return json.loads(candidate)
             except json.JSONDecodeError:
                 continue
-        raise RuntimeError("Gemini không trả về JSON storyboard hợp lệ.")
+        raise RuntimeError(f"Gemini không trả về JSON {context_label} hợp lệ.")
 
     def _storyboard_from_payload(
         self,
@@ -5759,7 +5760,7 @@ class FlowWebService:
             raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text)
+        parsed = self._parse_json_candidate(text, context="storyboard")
         scenes = self._storyboard_from_payload(parsed, request, scene_count, skills)
         if not scenes:
             raise RuntimeError("Gemini không trả về cảnh storyboard hợp lệ.")
@@ -7900,7 +7901,7 @@ exit 1
             raise RuntimeError(f"Không gọi được Gemini để kiểm tra ảnh: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text)
+        parsed = self._parse_json_candidate(text, context="kiểm tra ảnh")
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
         return parsed
@@ -7924,12 +7925,31 @@ exit 1
             image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
             generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
 
-        result = await asyncio.to_thread(
-            self._gemini_validate_trello_source_artifacts,
-            request,
-            source_path,
-            generated_items,
-        )
+        result: Dict[str, Any] | None = None
+        last_validation_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                result = await asyncio.to_thread(
+                    self._gemini_validate_trello_source_artifacts,
+                    request,
+                    source_path,
+                    generated_items,
+                )
+                break
+            except Exception as exc:
+                last_validation_error = exc
+                detail = humanize_flow_error(str(exc))
+                retryable_parse_error = "json" in detail.lower() or "nội dung" in detail.lower() or "noi dung" in detail.lower()
+                if attempt == 0 and retryable_parse_error:
+                    await self.store.append_log(
+                        job_id,
+                        f"Gemini chưa trả JSON kiểm tra ảnh ổn định, app thử kiểm tra lại lần 2 trước khi quyết định upload Trello: {detail[:180]}",
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                raise
+        if result is None:
+            raise last_validation_error or RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
         ok = bool(result.get("ok"))
         bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
         reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
@@ -16764,10 +16784,35 @@ exit 1
         browser = getattr(client, "_bm", None)
         context = getattr(browser, "context", None)
         if context is not None:
+            cached_page = getattr(browser, "_flow_agent_page", None)
+            if cached_page is not None:
+                try:
+                    is_closed = bool(cached_page.is_closed()) if hasattr(cached_page, "is_closed") else False
+                    if not is_closed:
+                        try:
+                            browser._page = cached_page
+                        except Exception:
+                            pass
+                        if target_url:
+                            await self._ensure_valid_flow_project_page(cached_page, target_url)
+                        try:
+                            await cached_page.bring_to_front()
+                        except Exception:
+                            pass
+                        return cached_page, "reused isolated project tab"
+                except Exception:
+                    try:
+                        browser._flow_agent_page = None
+                    except Exception:
+                        pass
             try:
                 page = await context.new_page()
                 try:
                     browser._page = page
+                except Exception:
+                    pass
+                try:
+                    browser._flow_agent_page = page
                 except Exception:
                     pass
                 if target_url:
@@ -17779,8 +17824,11 @@ exit 1
                 current_count = int(last_snapshot.get("count") or 0)
             except Exception:
                 current_count = 0
-            if last_snapshot.get("visible") and current_count > before_count:
-                return True, f"new attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+            if last_snapshot.get("visible") and current_count > 0:
+                if current_count > before_count:
+                    return True, f"new attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+                if before_count > 0:
+                    return True, f"source attachment visible after attach {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
             await asyncio.sleep(0.5)
         try:
             current_count = int(last_snapshot.get("count") or 0)

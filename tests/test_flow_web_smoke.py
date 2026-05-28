@@ -3329,6 +3329,99 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.store = StateStore()
         self.service = FlowWebService(self.store)
 
+    async def test_wait_for_flow_agent_source_attachment_accepts_replaced_chip_count(self) -> None:
+        class FakePage:
+            async def evaluate(self, *_args: object, **_kwargs: object) -> dict:
+                return {
+                    "visible": True,
+                    "count": 9,
+                    "media_count": 4,
+                    "chip_count": 5,
+                    "detail": "attachments=9 media=4 chips=5",
+                }
+
+        ok, detail = await self.service._wait_for_flow_agent_source_attachment(
+            FakePage(),
+            {"visible": True, "count": 11, "detail": "attachments=11 media=6 chips=5"},
+            timeout_s=1,
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("source attachment visible", detail)
+
+    async def test_acquire_isolated_flow_agent_page_reuses_cached_agent_tab(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.front_count = 0
+
+            def is_closed(self) -> bool:
+                return False
+
+            async def bring_to_front(self) -> None:
+                self.front_count += 1
+
+        class FakeContext:
+            def __init__(self) -> None:
+                self.new_page_count = 0
+
+            async def new_page(self) -> FakePage:
+                self.new_page_count += 1
+                return FakePage()
+
+        context = FakeContext()
+        browser = SimpleNamespace(context=context)
+        client = SimpleNamespace(_bm=browser)
+
+        with patch.object(self.service, "_ensure_valid_flow_project_page", new=AsyncMock(return_value=None)) as ensure_page:
+            first_page, first_detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
+            second_page, second_detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
+
+        self.assertEqual(1, context.new_page_count)
+        self.assertIs(first_page, second_page)
+        self.assertEqual("new isolated project tab", first_detail)
+        self.assertEqual("reused isolated project tab", second_detail)
+        self.assertEqual(2, ensure_page.await_count)
+
+    async def test_trello_source_validation_retries_transient_gemini_json_failure(self) -> None:
+        source = self.uploads_dir / "source.jpg"
+        source.write_bytes(b"source")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(self.downloads_dir / "out.jpg"), mime_type="image/jpeg")
+        Path(artifact.local_path).write_bytes(b"generated")
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_enabled=True,
+            trello_card_id="source-card",
+            reference_image_paths=[str(source)],
+            automation_graph={
+                "modules": [
+                    {"id": "trello_source", "type": "trello_source", "enabled": True},
+                    {"id": "flow", "type": "flow", "enabled": True},
+                    {"id": "trello", "type": "trello", "enabled": True},
+                ]
+            },
+        )
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch.object(
+            self.service,
+            "_artifact_validation_image_bytes",
+            new=AsyncMock(return_value=(b"generated", "image/jpeg")),
+        ), patch.object(
+            self.service,
+            "_gemini_validate_trello_source_artifacts",
+            side_effect=[
+                RuntimeError("Gemini không trả về JSON kiểm tra ảnh hợp lệ."),
+                {"ok": True, "reason": "matches", "bad_indexes": [], "confidence": 0.9},
+            ],
+        ) as validate:
+            await self.service._validate_trello_source_artifacts_before_upload(job.id, request, [artifact])
+
+        self.assertEqual(2, validate.call_count)
+        saved = self.store.get_job(job.id)
+        self.assertTrue(any("thử kiểm tra lại lần 2" in entry.message for entry in saved.logs))
+
     async def test_plan_storyboard_returns_local_scenes_when_gemini_is_not_configured(self) -> None:
         with patch.object(self.service, "ensure_media_skill_library", AsyncMock(return_value={})), patch.object(
             self.service,
