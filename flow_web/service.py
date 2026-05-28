@@ -17914,10 +17914,122 @@ exit 1
                     || el.closest('a')
                     || el
                   );
+                  const labelFor = (el) => [
+                    el?.textContent || '',
+                    el?.getAttribute?.('placeholder') || '',
+                    el?.getAttribute?.('aria-label') || '',
+                    el?.getAttribute?.('title') || '',
+                    el?.getAttribute?.('data-testid') || '',
+                  ].join(' ').replace(/\s+/g, ' ').trim();
+                  const clippedRect = (rect) => ({
+                    left: Math.max(0, rect.left),
+                    top: Math.max(0, rect.top),
+                    right: Math.min(window.innerWidth, rect.right),
+                    bottom: Math.min(window.innerHeight, rect.bottom),
+                    get width() { return Math.max(0, this.right - this.left); },
+                    get height() { return Math.max(0, this.bottom - this.top); },
+                  });
+                  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+                  const rightPanelish = (rect) => rect.left >= window.innerWidth * 0.42
+                    || (rect.right >= window.innerWidth * 0.82 && rect.width <= window.innerWidth * 0.62);
+                  const agentPanel = () => {
+                    const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                      .filter((candidate) => {
+                        const rect = candidate.getBoundingClientRect();
+                        const style = window.getComputedStyle(candidate);
+                        if (rect.width < 260 || rect.height < 180) return false;
+                        if (!rightPanelish(rect)) return false;
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        return rect.bottom > window.innerHeight * 0.45 && rect.top < window.innerHeight;
+                      })
+                      .map((candidate) => {
+                        const rect = candidate.getBoundingClientRect();
+                        const text = labelFor(candidate);
+                        const hasTextbox = Boolean(candidate.querySelector('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'));
+                        const agentish = /Flow\s+Agent|Tác\s*nhân|Tac\s*nhan|Bạn\s*muốn|Ban\s*muon|What\s+do\s+you|Phiên\s+không\s+có\s+tiêu\s+đề|Phien\s+khong\s+co\s+tieu\s+de/i.test(text);
+                        const score = (hasTextbox ? 900 : 0) + (agentish ? 700 : 0) + rect.right / 10 + rect.height / 20;
+                        return { el: candidate, rect, score };
+                      })
+                      .filter((item) => item.score >= 900)
+                      .sort((a, b) => b.score - a.score);
+                    return panels[0] || null;
+                  };
+                  const agentComposerDropTarget = () => {
+                    const panelItem = agentPanel();
+                    const panel = panelItem?.el || document;
+                    const panelRect = panelItem?.rect || { left: window.innerWidth * 0.45, right: window.innerWidth, top: 0, bottom: window.innerHeight, width: window.innerWidth * 0.55, height: window.innerHeight };
+                    const controls = [...panel.querySelectorAll('button, [role="button"], label, [aria-label], [title], [data-testid]')]
+                      .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        const label = labelFor(el);
+                        const visibleControl = rect.width >= 18 && rect.height >= 18
+                          && rect.bottom > window.innerHeight * 0.55
+                          && rect.top < window.innerHeight
+                          && rect.left >= panelRect.left - 12
+                          && rect.right <= panelRect.right + 12
+                          && style.display !== 'none'
+                          && style.visibility !== 'hidden'
+                          && style.opacity !== '0';
+                        const addish = /\+|add_2|add|attach|upload|image|media|file|ảnh|anh|hình|hinh|thêm|them/i.test(label);
+                        const leftish = rect.left <= panelRect.left + panelRect.width * 0.32;
+                        const nearBottom = rect.bottom >= panelRect.bottom - Math.max(180, panelRect.height * 0.28);
+                        const score = (visibleControl ? 1000 : -9999) + (addish ? 1000 : 0) + (leftish ? 350 : 0) + (nearBottom ? 350 : 0) - Math.abs(rect.bottom - panelRect.bottom) / 4;
+                        return { el, rect, label, score };
+                      })
+                      .filter((item) => item.score > 900)
+                      .sort((a, b) => b.score - a.score);
+                    const plus = controls[0];
+                    if (plus) {
+                      const x = clamp(plus.rect.right + 44, panelRect.left + 42, panelRect.right - 72);
+                      const y = clamp(plus.rect.top - 22, Math.max(24, panelRect.top + 36), Math.min(window.innerHeight - 30, panelRect.bottom - 42));
+                      return { x, y, detail: `chat composer plus ${Math.round(plus.rect.left)},${Math.round(plus.rect.top)}` };
+                    }
+
+                    const editors = [...panel.querySelectorAll('[contenteditable="true"], div[role="textbox"], textarea')]
+                      .filter((candidate) => {
+                        const rect = candidate.getBoundingClientRect();
+                        const clipped = clippedRect(rect);
+                        const style = window.getComputedStyle(candidate);
+                        return clipped.width > 120
+                          && clipped.height > 12
+                          && clipped.bottom > window.innerHeight * 0.45
+                          && clipped.right > panelRect.left
+                          && clipped.left < panelRect.right
+                          && style.display !== 'none'
+                          && style.visibility !== 'hidden';
+                      })
+                      .map((candidate) => {
+                        const rect = candidate.getBoundingClientRect();
+                        const clipped = clippedRect(rect);
+                        const label = labelFor(candidate);
+                        const agentish = /Bạn\s*muốn\s*tạo\s*gì|Ban\s*muon\s*tao\s*gi|What\s+do\s+you|prompt|create/i.test(label);
+                        const score = (agentish ? 800 : 0) + clipped.bottom / 10 + clipped.height / 30;
+                        return { candidate, rect, clipped, label, score };
+                      })
+                      .sort((a, b) => b.score - a.score);
+                    const editor = editors[0];
+                    if (!editor) return null;
+                    const x = clamp(editor.clipped.left + Math.max(48, editor.clipped.width * 0.16), panelRect.left + 32, panelRect.right - 72);
+                    const y = clamp(editor.clipped.bottom - Math.max(28, Math.min(56, editor.clipped.height * 0.18)), editor.clipped.top + 18, window.innerHeight - 30);
+                    return { x, y, detail: `chat composer textbox ${Math.round(editor.rect.left)},${Math.round(editor.rect.top)}` };
+                  };
                   const rectInfo = (el) => {
                     const target = draggable(el);
                     target.scrollIntoView({block: 'center', inline: 'center'});
                     const sourceRect = target.getBoundingClientRect();
+                    if (requireAgentPanel) {
+                      const drop = agentComposerDropTarget();
+                      if (!drop) return {ok: false, detail: 'no visible agent chat composer drop target'};
+                      return {
+                        ok: true,
+                        sourceX: sourceRect.left + sourceRect.width / 2,
+                        sourceY: sourceRect.top + sourceRect.height / 2,
+                        targetX: drop.x,
+                        targetY: drop.y,
+                        detail: `drag ${target.tagName.toLowerCase()} ${Math.round(sourceRect.left)},${Math.round(sourceRect.top)} -> agent chat ${drop.detail}`,
+                      };
+                    }
                     const editors = [...document.querySelectorAll('[contenteditable="true"], div[role="textbox"], textarea')]
                       .filter((candidate) => {
                         const rect = candidate.getBoundingClientRect();
