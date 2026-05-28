@@ -400,24 +400,42 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Pennant/banner category lock", item["prompt"])
         self.assertIn("top dowel or rod", item["prompt"])
         self.assertIn("Never create a pillow/cushion/blanket/shirt/hoop version", item["prompt"])
+        self.assertIn("image 7 is the only allowed four-panel close-up collage", item["prompt"])
+        self.assertIn("woman sitting at a clean craft table", item["prompt"])
+        self.assertIn("Mother and baby gently touching", item["prompt"])
+        self.assertIn("folded neatly and flat", item["prompt"])
         self.assertNotIn("Nursery hero arrangement", item["shot_labels"])
         self.assertEqual(
             [
-                "Pennant embroidery craft proof",
-                "Full hanging pennant hero",
-                "Nursery wall decor scene",
-                "Side seam and hanging detail",
-                "Pennant flat lay styling",
-                "Gift ready pennant presentation",
-                "Hands embroidering pennant",
-                "Personalized pennant detail",
-                "Pennant fabric colorway lineup",
-                "Nursery wall colorway trio",
-                "Pennant material swatch flat lay",
-                "Four pennant option display",
+                "Pennant image 1 baby room flag scene",
+                "Pennant image 2 alternate nursery corner",
+                "Pennant image 3 two hanging color variants",
+                "Pennant image 4 two tabletop color variants",
+                "Pennant image 5 three nursery color variants",
+                "Pennant image 6 four nursery color variants",
+                "Pennant image 7 four-panel embroidery close-up collage",
+                "Pennant image 8 woman embroidering in hoop",
+                "Pennant image 9 mother and baby touch embroidery",
+                "Pennant image 10 two babies touch two pennants",
+                "Pennant image 11 sleeping baby room scene",
+                "Pennant image 12 flat gift box presentation",
             ],
             item["shot_labels"],
         )
+
+    def test_flow_agent_multi_image_prompt_allows_only_pennant_detail_collage(self) -> None:
+        base = (
+            "Required shot plan: "
+            "1. Pennant image 1 baby room flag scene: one single pennant. "
+            "7. Pennant image 7 four-panel embroidery close-up collage: one single 1:1 square image made of four small close-up panels."
+        )
+
+        prompt = self.service._flow_agent_multi_image_prompt(base, 12)
+
+        self.assertIn("image 7 may be one 1:1 four-panel close-up collage", prompt)
+        self.assertIn("the only exception is the Required shot plan's image 7", prompt)
+        self.assertIn("Follow the Required shot plan already written in the base brief exactly", prompt)
+        self.assertNotIn("Do NOT create a 12-frame grid, contact sheet, collage, storyboard", prompt)
 
     def test_auto_trello_generic_tao_filename_does_not_infer_shirt(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -5369,6 +5387,81 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertEqual(["first card", "second card"], seen_prompts)
         pause.assert_awaited_once_with(batch.id, 2, 2)
+
+    async def test_auto_trello_batch_stops_after_successful_trello_upload(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        base = CreateJobRequest(type="image", prompt="", count=12, flow_agent_enabled=True, trello_enabled=True)
+        items = [
+            {
+                "prompt": "first card",
+                "product": "First",
+                "trello_card_id": "card-1",
+                "flow_agent_instruction": True,
+                "flow_agent_image_count": 12,
+            },
+            {
+                "prompt": "second card",
+                "product": "Second",
+                "trello_card_id": "card-2",
+                "flow_agent_instruction": True,
+                "flow_agent_image_count": 12,
+            },
+        ]
+        batch = JobRecord(
+            type="batch_image",
+            status="queued",
+            title="batch",
+            input={"trello_source_hint": {"mode": "auto_trello"}, "batch_key": "auto"},
+            result={"trello_source_hint": {"mode": "auto_trello"}, "batch_key": "auto"},
+        )
+        await self.store.add_job(batch)
+        seen_prompts: list[str] = []
+        live_scan_calls = 0
+
+        async def fake_next_live_item(batch_id, base_request, seed_items, attempted_card_ids):
+            nonlocal live_scan_calls
+            live_scan_calls += 1
+            if live_scan_calls > 1:
+                raise AssertionError("Auto Trello scanned for another card after Trello upload completed")
+            return base_request, items[0], {"mode": "auto_trello"}
+
+        async def fake_run_flow_job(job_id, child_request):
+            seen_prompts.append(child_request.prompt)
+            await self.store.patch_job(
+                job_id,
+                status="completed",
+                result={
+                    "count": 12,
+                    "mode": "image",
+                    "trello": {"configured": True, "sent": 12, "failed": 0},
+                },
+            )
+
+        with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
+            self.service,
+            "_next_live_auto_trello_prompt_item",
+            side_effect=fake_next_live_item,
+        ), patch.object(
+            self.service,
+            "_run_flow_job",
+            side_effect=fake_run_flow_job,
+        ), patch.object(
+            self.service,
+            "_sleep_between_flow_agent_batches",
+            new=AsyncMock(),
+        ) as pause:
+            await self.service._run_prompt_batch(batch.id, base, items)
+
+        saved = self.store.get_job(batch.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(["first card"], seen_prompts)
+        self.assertEqual(1, live_scan_calls)
+        self.assertTrue(saved.result["stop_requested"])
+        self.assertEqual(1, saved.result["completed"])
+        self.assertEqual(0, saved.result["failed"])
+        self.assertEqual(1, len(saved.result["child_job_ids"]))
+        pause.assert_not_awaited()
 
     async def test_trello_prompt_batch_runs_one_matching_prompt_and_dedupes_active_batch(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
