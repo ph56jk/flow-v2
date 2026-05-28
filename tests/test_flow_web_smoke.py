@@ -1121,7 +1121,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         job = JobRecord(type="image", status="running", title="test")
         asyncio.run(self.store.add_job(job))
 
-        with patch.object(
+        with patch.dict(os.environ, {"FLOW_UPSAMPLE_API_ENABLED": "1"}, clear=False), patch.object(
             self.service,
             "_read_remote_file",
             return_value=(source_bytes, "image/jpeg"),
@@ -3420,7 +3420,46 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertEqual(2, validate.call_count)
         saved = self.store.get_job(job.id)
-        self.assertTrue(any("thử kiểm tra lại lần 2" in entry.message for entry in saved.logs))
+        self.assertTrue(any("thử lại lần 2" in entry.message for entry in saved.logs))
+
+    async def test_trello_source_validation_warns_without_blocking_on_gemini_json_outage(self) -> None:
+        source = self.uploads_dir / "source.jpg"
+        source.write_bytes(b"source")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(self.downloads_dir / "out.jpg"), mime_type="image/jpeg")
+        Path(artifact.local_path).write_bytes(b"generated")
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_enabled=True,
+            trello_card_id="source-card",
+            reference_image_paths=[str(source)],
+            automation_graph={
+                "modules": [
+                    {"id": "trello_source", "type": "trello_source", "enabled": True},
+                    {"id": "flow", "type": "flow", "enabled": True},
+                    {"id": "trello", "type": "trello", "enabled": True},
+                ]
+            },
+        )
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch.object(
+            self.service,
+            "_artifact_validation_image_bytes",
+            new=AsyncMock(return_value=(b"generated", "image/jpeg")),
+        ), patch.object(
+            self.service,
+            "_gemini_validate_trello_source_artifacts",
+            side_effect=RuntimeError("Gemini không trả về JSON kiểm tra ảnh hợp lệ."),
+        ) as validate:
+            await self.service._validate_trello_source_artifacts_before_upload(job.id, request, [artifact])
+
+        self.assertEqual(2, validate.call_count)
+        saved = self.store.get_job(job.id)
+        messages = [entry.message for entry in saved.logs]
+        self.assertTrue(any("vẫn upload" in message for message in messages))
+        self.assertTrue(any("cảnh báo kỹ thuật" in message for message in messages))
 
     async def test_plan_storyboard_returns_local_scenes_when_gemini_is_not_configured(self) -> None:
         with patch.object(self.service, "ensure_media_skill_library", AsyncMock(return_value={})), patch.object(

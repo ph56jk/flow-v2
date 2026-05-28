@@ -7860,13 +7860,14 @@ exit 1
                 "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
                 "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
                 "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
+                "bad_indexes must contain the zero-based artifact indexes shown in the OUTPUT_IMAGE_INDEX_N labels.",
                 f"Source card/product title: {request.prompt_product or request.title or ''}",
                 f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
             ]
         )
         parts: List[Dict[str, Any]] = [{"text": prompt}, {"text": "SOURCE_IMAGE"}, self._inline_gemini_image_part(source_bytes, source_mime)]
         for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_TARGET_OUTPUT_COUNT]:
-            parts.append({"text": f"OUTPUT_IMAGE_{index + 1}"})
+            parts.append({"text": f"OUTPUT_IMAGE_INDEX_{index}"})
             parts.append(self._inline_gemini_image_part(image_bytes, mime))
 
         payload = {
@@ -7925,40 +7926,66 @@ exit 1
             image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
             generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
 
-        result: Dict[str, Any] | None = None
-        last_validation_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                result = await asyncio.to_thread(
-                    self._gemini_validate_trello_source_artifacts,
-                    request,
-                    source_path,
-                    generated_items,
-                )
-                break
-            except Exception as exc:
-                last_validation_error = exc
-                detail = humanize_flow_error(str(exc))
-                retryable_parse_error = "json" in detail.lower() or "nội dung" in detail.lower() or "noi dung" in detail.lower()
-                if attempt == 0 and retryable_parse_error:
-                    await self.store.append_log(
-                        job_id,
-                        f"Gemini chưa trả JSON kiểm tra ảnh ổn định, app thử kiểm tra lại lần 2 trước khi quyết định upload Trello: {detail[:180]}",
+        chunk_size = 4
+        validation_warnings: List[str] = []
+        for chunk_start in range(0, len(generated_items), chunk_size):
+            chunk = generated_items[chunk_start : chunk_start + chunk_size]
+            result: Dict[str, Any] | None = None
+            last_validation_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    result = await asyncio.to_thread(
+                        self._gemini_validate_trello_source_artifacts,
+                        request,
+                        source_path,
+                        chunk,
                     )
-                    await asyncio.sleep(2.0)
-                    continue
-                raise
-        if result is None:
-            raise last_validation_error or RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
-        ok = bool(result.get("ok"))
-        bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
-        reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
-        if not ok or bad_indexes:
-            display_indexes = ", ".join(str(int(item) + 1) for item in bad_indexes if isinstance(item, (int, float))) or "không rõ"
-            raise RuntimeError(
-                f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
+                    break
+                except Exception as exc:
+                    last_validation_error = exc
+                    detail = humanize_flow_error(str(exc))
+                    retryable_parse_error = "json" in detail.lower() or "nội dung" in detail.lower() or "noi dung" in detail.lower()
+                    if attempt == 0 and retryable_parse_error:
+                        await self.store.append_log(
+                            job_id,
+                            f"Gemini chưa trả JSON kiểm tra ảnh ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}, app thử lại lần 2: {detail[:180]}",
+                        )
+                        await asyncio.sleep(2.0)
+                        continue
+                    break
+            if result is None:
+                warning = humanize_flow_error(str(last_validation_error or "")) or "Gemini không trả về kết quả kiểm tra ảnh hợp lệ."
+                validation_warnings.append(warning)
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Gemini QA không ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
+                        "card nguồn đã khóa đúng nên app vẫn upload để duyệt trực tiếp trên Trello. "
+                        f"Chi tiết: {warning[:180]}"
+                    ),
+                )
+                continue
+
+            ok = bool(result.get("ok"))
+            raw_bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
+            bad_indexes = [
+                int(item)
+                for item in raw_bad_indexes
+                if isinstance(item, (int, float)) and 0 <= int(item) < self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+            ]
+            reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
+            if not ok or bad_indexes:
+                display_indexes = ", ".join(str(index + 1) for index in bad_indexes) or "không rõ"
+                raise RuntimeError(
+                    f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
+                )
+        if validation_warnings:
+            await self.store.append_log(
+                job_id,
+                f"Gemini QA có {len(validation_warnings)} cảnh báo kỹ thuật nhưng không báo ảnh sai; tiếp tục upload vào card Trello đã khóa.",
             )
-        await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
+        else:
+            await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
 
     async def _archive_trello_artifacts(
         self,
@@ -10607,10 +10634,12 @@ exit 1
         return payload if isinstance(payload, dict) else {}
 
     # ── Flow image upsampler (POST /v1/flow/upsampleImage) ──────────────────
-    # Confirmed via captured DevTools request (2026-05): the endpoint accepts
-    # ``{"encodedImage": <base64 JPEG>}`` and returns an upscaled JPEG in the
-    # same field. The response is treated defensively in ``_extract_encoded_image``
-    # so wrapping objects like ``{"image": {"encodedImage": ...}}`` also work.
+    # This endpoint has changed schema more than once. Keep it opt-in so Trello
+    # upload does not spend time on a broken helper before falling back locally.
+
+    def _flow_upsample_api_enabled(self) -> bool:
+        value = os.getenv("FLOW_UPSAMPLE_API_ENABLED", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
 
     async def _upsample_image_via_flow(self, client: Any, jpeg_bytes: bytes) -> bytes:
         """Call POST /v1/flow/upsampleImage and return the upscaled JPEG bytes.
@@ -10668,9 +10697,9 @@ exit 1
     ) -> tuple[bytes, str, bool, tuple[int, int], tuple[int, int]]:
         """Return JPEG bytes whose long edge is at least 2048px.
 
-        Flow's upsampler is preferred because it can recover detail, but it may
-        occasionally return the original asset. This local pass guarantees the
-        Trello file itself is not a low-resolution thumbnail.
+        This local pass guarantees the Trello file itself is not a
+        low-resolution thumbnail when Flow's optional upsample API is disabled
+        or unavailable.
         """
         if not image_bytes:
             return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
@@ -10745,10 +10774,11 @@ exit 1
             return await self._upsample_image_via_flow(client, source_bytes)
 
         flow_upscaled: bytes = b""
-        try:
-            flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
-        except Exception as exc:
-            log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
+        if self._flow_upsample_api_enabled():
+            try:
+                flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
+            except Exception as exc:
+                log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
 
         candidate_bytes = flow_upscaled if flow_upscaled and flow_upscaled != source_bytes else source_bytes
         candidate_mime = "image/jpeg" if flow_upscaled and flow_upscaled != source_bytes else source_mime
