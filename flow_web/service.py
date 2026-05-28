@@ -16426,7 +16426,11 @@ exit 1
 
         attached_agent_source = False
         attached_local_source = False
+        source_attachment_before: Dict[str, Any] = {}
+        source_attachment_verified = not flow_agent_enabled
+        source_verify_detail = ""
         if flow_agent_enabled and str(reference_media_name or "").strip():
+            source_attachment_before = await self._flow_agent_panel_attachment_snapshot(page)
             dragged_source, drag_detail = await self._select_flow_edit_target_image(
                 page,
                 reference_media_name,
@@ -16435,6 +16439,11 @@ exit 1
                 require_agent_panel=True,
             )
             attached_agent_source = dragged_source
+            if attached_agent_source:
+                source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
+                    page,
+                    source_attachment_before,
+                )
             if job_id:
                 await self.store.append_log(
                     job_id,
@@ -16444,29 +16453,51 @@ exit 1
                         else f"Fallback UI Flow: chưa kéo được ảnh nguồn vào khung Tác nhân ({drag_detail[:120]})."
                     ),
                 )
+                if dragged_source:
+                    await self.store.append_log(
+                        job_id,
+                        (
+                            f"Fallback UI Flow: da xac minh anh nguon nam trong panel Tac nhan ({source_verify_detail[:140]})."
+                            if source_attachment_verified
+                            else f"Fallback UI Flow: chua thay anh nguon trong panel Tac nhan sau khi keo ({source_verify_detail[:140]})."
+                        ),
+                    )
         elif flow_agent_enabled and job_id:
             await self.store.append_log(
                 job_id,
                 "Fallback UI Flow: no project media id for the Trello source; using local file attach in Flow Agent.",
             )
 
-        if flow_agent_enabled and not attached_agent_source and safe_reference_image_path:
+        if flow_agent_enabled and (not attached_agent_source or not source_attachment_verified) and safe_reference_image_path:
+            fallback_before = await self._flow_agent_panel_attachment_snapshot(page)
             attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, safe_reference_image_path)
-            attached_agent_source = attached_local_source
+            if attached_local_source:
+                attached_agent_source = True
+                source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
+                    page,
+                    fallback_before,
+                )
             if job_id:
                 await self.store.append_log(
                     job_id,
                     (
                         f"Fallback UI Flow: đã upload ảnh Trello vào khung Tác nhân ({attach_detail[:120]})."
-                        if attached_local_source
+                        if attached_local_source and source_attachment_verified
                         else f"Fallback UI Flow: chưa upload được ảnh Trello vào khung Tác nhân ({attach_detail[:120]})."
                     ),
                 )
-            if not attached_agent_source:
+            if not attached_agent_source or not source_attachment_verified:
                 raise RuntimeError(
                     "Auto AI Trello chưa kéo/upload được ảnh Trello vào Tác nhân Flow. "
-                    f"App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: {attach_detail}"
+                    f"App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: {attach_detail}; {source_verify_detail}"
                 )
+
+        elif flow_agent_enabled and not source_attachment_verified:
+            raise RuntimeError(
+                "Auto AI Trello chua xac minh duoc anh nguon trong panel Tac nhan Flow. "
+                "App da dung truoc khi bam tao de tranh Flow Agent dung ngu canh/anh cu. "
+                f"Chi tiet: {source_verify_detail or 'khong thay attachment moi trong panel'}"
+            )
 
         if not attached_agent_source:
             selected, selected_detail = await self._select_flow_edit_target_image(
@@ -17638,6 +17669,125 @@ exit 1
         except Exception as exc:
             return False, humanize_flow_error(str(exc))
 
+    async def _flow_agent_panel_attachment_snapshot(self, page: Any) -> Dict[str, Any]:
+        try:
+            result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el, minW = 1, minH = 1) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < minW || rect.height < minH) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight
+                      && rect.right > 0
+                      && rect.left < window.innerWidth;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('alt') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                    el.getAttribute('src') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                    .filter((el) => visible(el, 260, 160))
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const text = labelFor(el);
+                      const rightPanel = rect.left >= window.innerWidth * 0.35 || rect.right >= window.innerWidth * 0.78;
+                      const hasTextbox = Boolean(el.querySelector('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'));
+                      const agentish = /Flow\\s+Agent|Tác\\s*nhân|Tac\\s*nhan|Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|Credit\\s+Spend\\s+Approval|Shot\\s+Brief|Design\\s+Analysis/i.test(text);
+                      const score = (rightPanel ? 1200 : 0) + (hasTextbox ? 700 : 0) + (agentish ? 600 : 0) + rect.height / 20;
+                      return { el, rect, text, score };
+                    })
+                    .filter((item) => item.score >= 1200)
+                    .sort((a, b) => b.score - a.score);
+                  const panel = panels[0];
+                  if (!panel) return { visible: false, count: 0, media_count: 0, chip_count: 0, detail: 'agent panel not found' };
+                  const panelRect = panel.rect;
+                  const textboxes = [...panel.el.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                    .filter((el) => visible(el, 120, 12))
+                    .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                    .sort((a, b) => b.rect.bottom - a.rect.bottom);
+                  const inputBox = textboxes[0];
+                  const composerTop = inputBox ? Math.max(panelRect.top, inputBox.rect.top - 220) : panelRect.top + panelRect.height * 0.52;
+                  const composerBottom = panelRect.bottom + 12;
+                  const insideTextbox = (el) => textboxes.some((box) => box.el === el || box.el.contains(el));
+                  const inComposer = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.top >= composerTop
+                      && rect.bottom <= composerBottom
+                      && rect.left >= panelRect.left - 8
+                      && rect.right <= panelRect.right + 8;
+                  };
+                  const media = [...panel.el.querySelectorAll('img, canvas, video, [role="img"], [style*="background-image"]')]
+                    .filter((el) => visible(el, 24, 24))
+                    .filter((el) => inComposer(el) && !insideTextbox(el))
+                    .filter((el) => {
+                      const rect = el.getBoundingClientRect();
+                      return rect.width * rect.height >= 900 && !(rect.width <= 38 && rect.height <= 38);
+                    })
+                    .map((el) => labelFor(el).slice(0, 80));
+                  const chips = [...panel.el.querySelectorAll('span, div, p, a, button, [role="button"]')]
+                    .filter((el) => visible(el, 24, 12))
+                    .filter((el) => inComposer(el) && !insideTextbox(el))
+                    .map((el) => labelFor(el))
+                    .filter((label) => label.length > 0 && label.length <= 180)
+                    .filter((label) => /\\.jpe?g|\\.png|\\.webp|\\.heic|trello-|source|upload(ed)?|attached|attachment|ảnh|anh|image/i.test(label))
+                    .slice(0, 12);
+                  const count = media.length + chips.length;
+                  return {
+                    visible: true,
+                    count,
+                    media_count: media.length,
+                    chip_count: chips.length,
+                    labels: [...media, ...chips].slice(0, 12),
+                    detail: `attachments=${count} media=${media.length} chips=${chips.length}`,
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "detail": humanize_flow_error(str(exc))}
+        if isinstance(result, dict):
+            return result
+        return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "detail": "attachment snapshot unavailable"}
+
+    async def _wait_for_flow_agent_source_attachment(
+        self,
+        page: Any,
+        before: Dict[str, Any] | None = None,
+        *,
+        timeout_s: float = 8.0,
+    ) -> tuple[bool, str]:
+        before = before if isinstance(before, dict) else {}
+        try:
+            before_count = int(before.get("count") or 0)
+        except Exception:
+            before_count = 0
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(timeout_s or 8.0))
+        last_snapshot: Dict[str, Any] = before
+        while asyncio.get_running_loop().time() < deadline:
+            last_snapshot = await self._flow_agent_panel_attachment_snapshot(page)
+            try:
+                current_count = int(last_snapshot.get("count") or 0)
+            except Exception:
+                current_count = 0
+            if last_snapshot.get("visible") and current_count > before_count:
+                return True, f"new attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+            await asyncio.sleep(0.5)
+        try:
+            current_count = int(last_snapshot.get("count") or 0)
+        except Exception:
+            current_count = 0
+        return False, f"no new attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+
     async def _attach_flow_agent_source_file(self, page: Any, image_path: str) -> tuple[bool, str]:
         source = Path(str(image_path or "")).expanduser()
         if not source.is_file():
@@ -17775,6 +17925,10 @@ exit 1
                         return rect.width > 120
                           && rect.height > 12
                           && rect.bottom > window.innerHeight * 0.45
+                          && rect.top < window.innerHeight - 12
+                          && rect.bottom <= window.innerHeight + 20
+                          && rect.right > 0
+                          && rect.left < window.innerWidth
                           && style.display !== 'none'
                           && style.visibility !== 'hidden';
                       })
@@ -17803,7 +17957,7 @@ exit 1
                       sourceX: sourceRect.left + sourceRect.width / 2,
                       sourceY: sourceRect.top + sourceRect.height / 2,
                       targetX: editorRect.left + Math.min(editorRect.width - 20, Math.max(20, editorRect.width * 0.15)),
-                      targetY: editorRect.top + editorRect.height / 2,
+                      targetY: Math.min(window.innerHeight - 24, Math.max(24, editorRect.top + editorRect.height / 2)),
                       detail: `drag ${target.tagName.toLowerCase()} ${Math.round(sourceRect.left)},${Math.round(sourceRect.top)} -> ${requireAgentPanel ? 'agent panel' : 'prompt'} ${Math.round(editorRect.left)},${Math.round(editorRect.top)}`,
                     };
                   };
