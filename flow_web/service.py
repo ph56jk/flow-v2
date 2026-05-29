@@ -32,6 +32,7 @@ from fastapi import HTTPException, UploadFile
 
 from .messages import humanize_flow_error
 from .paths import DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
+from .shot_rules import PRODUCT_SHOT_RULE_PRIORITY, PRODUCT_SHOT_RULES
 from .schemas import (
     AppConfig,
     ArtifactOpenRequest,
@@ -142,7 +143,7 @@ class FlowWebService:
     AI_PROMPT_SUITE_SIZE = 6
     FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12
     FLOW_AGENT_TARGET_OUTPUT_COUNT = 12
-    FLOW_AGENT_MAX_IMAGES_PER_RUN = 8
+    FLOW_AGENT_MAX_IMAGES_PER_RUN = 12
     FLOW_AGENT_BATCH_PAUSE_MIN_S = 60
     FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
@@ -2832,8 +2833,11 @@ class FlowWebService:
         if job is None:
             return False
         result = dict(job.result or {})
+        input_payload = job.input if isinstance(job.input, dict) else {}
+        if result.get("run_until_empty") or input_payload.get("run_until_empty") or result.get("continuous") or input_payload.get("continuous"):
+            return False
         result["stop_requested"] = True
-        result["continuous"] = bool(result.get("continuous") or (job.input or {}).get("continuous"))
+        result["continuous"] = bool(result.get("continuous") or input_payload.get("continuous"))
         await self.store.patch_job(batch_id, result=result)
         if not already_requested:
             await self.store.append_log(
@@ -8139,16 +8143,33 @@ exit 1
         failed = 0
         attachments: List[Dict[str, Any]] = []
         upscale_announced = False
+        total_uploads = len(artifacts)
+        await self.store.set_progress_hint(
+            job_id,
+            stage="trello_upload",
+            detail=f"Đang chuẩn bị upload {total_uploads} ảnh kết quả lên Trello.",
+        )
+        await self.store.append_log(job_id, f"Đang upload {total_uploads} ảnh kết quả lên Trello.")
         for index, artifact in enumerate(artifacts):
             artifact_url = str(artifact.url or artifact.public_url or "").strip()
             artifact_local_path = str(artifact.local_path or "").strip()
             has_local_artifact = bool(artifact_local_path and Path(artifact_local_path).expanduser().is_file())
             if not artifact_url and not has_local_artifact:
                 failed += 1
+                await self.store.append_log(
+                    job_id,
+                    f"Bỏ qua ảnh {index + 1}/{total_uploads} vì thiếu file cục bộ hoặc URL để upload Trello.",
+                )
                 continue
 
             name = self._trello_attachment_name(job_id, artifact, index)
             try:
+                await self.store.set_progress_hint(
+                    job_id,
+                    stage="trello_upload",
+                    detail=f"Đang upload ảnh {index + 1}/{total_uploads} lên Trello.",
+                )
+                await self.store.append_log(job_id, f"Đang upload ảnh {index + 1}/{total_uploads} lên Trello.")
                 if upload_mode == "url" and artifact_url:
                     attachment_payload = await self._trello_attach_url_with_cover_fallback(
                         job_id,
@@ -8238,6 +8259,12 @@ exit 1
 
                 stored += 1
                 attachments.append(self._trello_attachment_summary(attachment_payload))
+                await self.store.set_progress_hint(
+                    job_id,
+                    stage="trello_upload",
+                    detail=f"Đã upload {stored}/{total_uploads} ảnh lên Trello.",
+                )
+                await self.store.append_log(job_id, f"Đã upload ảnh {index + 1}/{total_uploads} lên Trello.")
             except Exception as exc:
                 failed += 1
                 await self.store.append_log(
@@ -9261,11 +9288,12 @@ exit 1
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         )
         primary_raw = " ".join([card_name, query, attachment_names, card_description]).strip()
-        user_instruction = str(request.prompt or "").strip()
-        raw = primary_raw or user_instruction
+        user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
+        raw = " ".join(part for part in (primary_raw, user_instruction) if part).strip()
         normalized = self._normalize_skill_token(raw)
         compact = self._compact_match_text(raw)
         tokens = set(self._tokenize_match_words(raw))
+        product_rule_key = self._flow_operator_product_rule_key_from_text(raw)
         is_child_shirt = (
             ("ao" in tokens or "shirt" in tokens or "tshirt" in tokens or "tee" in tokens)
             and (
@@ -9281,6 +9309,7 @@ exit 1
             "attachment_names": attachment_names,
             "normalized": normalized,
             "compact": compact,
+            "product_rule_key": product_rule_key,
             "is_apron": any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact,
             "is_doll": (
                 any(term in normalized for term in ("bup_be", "bupbe", "baby_doll", "babydoll"))
@@ -9306,8 +9335,10 @@ exit 1
                         "nursery_banner",
                         "nursery_pennant",
                         "co_treo",
+                        "la_co",
                         "co_vai",
                         "co_theu",
+                        "co_vai_treo",
                         "banner_treo",
                         "co_trang_tri",
                     )
@@ -9366,14 +9397,105 @@ exit 1
         # Nếu prompt cũ không nhắc tới sản phẩm đang lọc, bỏ qua để tránh đổi sai loại hàng.
         return ""
 
+    def _flow_operator_product_rule_key_from_text(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        normalized = self._normalize_skill_token(raw)
+        compact = self._compact_match_text(raw)
+        tokens = set(self._tokenize_match_words(raw))
+        for key in PRODUCT_SHOT_RULE_PRIORITY:
+            suite = PRODUCT_SHOT_RULES.get(key) or {}
+            for alias in suite.get("aliases", ()):
+                alias_text = str(alias or "").strip()
+                if not alias_text:
+                    continue
+                alias_normalized = self._normalize_skill_token(alias_text)
+                alias_compact = self._compact_match_text(alias_text)
+                alias_tokens = set(self._tokenize_match_words(alias_text))
+                if alias_compact and alias_compact in compact:
+                    return key
+                if alias_normalized and alias_normalized in normalized:
+                    return key
+                if len(alias_tokens) >= 2 and alias_tokens.issubset(tokens):
+                    return key
+        return ""
+
+    def _flow_operator_product_rule_shot_suite(self, product_key: str) -> List[Dict[str, str]]:
+        suite = PRODUCT_SHOT_RULES.get(str(product_key or "").strip())
+        if not suite:
+            return []
+        display_name = str(suite.get("display_name") or product_key).strip()
+        lock = str(suite.get("lock") or "").strip()
+        suffix = (
+            f"Product/category lock: {lock}. "
+            "The listed concept may change only the scene, pose, props, color options, or presentation; it must not change the source product form, construction, material, embroidery/print layout, or handmade identity. "
+            "Use clean clear white daylight, keep the product premium handmade, and avoid logos, watermarks, UI text, and readable tags/cards unless that readable text is visibly on the source product itself."
+        )
+        shots: List[Dict[str, str]] = []
+        for index, raw_shot in enumerate(suite.get("shots", ()), start=1):
+            if len(raw_shot) < 3:
+                continue
+            kind, title, concept = (str(item or "").strip() for item in raw_shot[:3])
+            label_bits = [display_name, f"image {index}", title or kind]
+            shots.append(
+                {
+                    "label": " ".join(part for part in label_bits if part),
+                    "brief": f"{concept}. {suffix}",
+                    "must_include": f"{display_name}, {kind}, exact source product identity",
+                }
+            )
+
+        supplemental = (
+            (
+                "Supplemental full product hero",
+                f"Clean full-product ecommerce hero for {display_name}, showing the full object clearly with the source design placement and construction visible. {suffix}",
+            ),
+            (
+                "Supplemental alternate angle",
+                f"Alternate angle or side/detail view for {display_name}, revealing depth, edge finish, fabric/material texture, and scale while preserving the source product exactly. {suffix}",
+            ),
+            (
+                "Supplemental craft macro",
+                f"Premium macro detail of {display_name}, focusing on raised stitches, fabric weave, seams, edge finish, and handmade material quality. {suffix}",
+            ),
+            (
+                "Supplemental gift-ready scene",
+                f"Gift-ready presentation for {display_name} with minimal premium packaging or soft props; the product and its design must remain clearly visible. {suffix}",
+            ),
+            (
+                "Supplemental lifestyle variant",
+                f"Distinct lifestyle or room-context scene for {display_name}, different from the other shots, with natural interaction or display while the source design stays visible. {suffix}",
+            ),
+        )
+        target = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        fill_index = 0
+        while shots and len(shots) < target:
+            title, brief = supplemental[fill_index % len(supplemental)]
+            shots.append(
+                {
+                    "label": f"{display_name} image {len(shots) + 1} {title}",
+                    "brief": brief,
+                    "must_include": f"{display_name}, exact source product identity, no category change",
+                }
+            )
+            fill_index += 1
+        return shots
+
     def _flow_operator_design_analysis_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
         signals = self._flow_operator_card_product_signals(request, card)
         card_name = str(signals.get("card_name") or "").strip()
         card_url = str(signals.get("card_url") or "").strip()
         attachment_names = str(signals.get("attachment_names") or "").strip()
+        product_rule_key = str(signals.get("product_rule_key") or "").strip()
+        product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
 
         product_bits: List[str] = []
-        if signals.get("is_apron"):
+        if product_rule:
+            product_bits.append(
+                f"{str(product_rule.get('display_name') or product_rule_key)} category: {str(product_rule.get('lock') or '').strip()}"
+            )
+        elif signals.get("is_apron"):
             product_bits.append("apron silhouette, chest bib, waist tie, shoulder/neck straps, hem length, and fit")
         elif signals.get("is_pennant"):
             product_bits.append(
@@ -9583,6 +9705,12 @@ exit 1
         signals = self._flow_operator_card_product_signals(request, card)
         is_apron = bool(signals.get("is_apron"))
         is_embroidery = bool(signals.get("is_embroidery"))
+        product_rule_key = str(signals.get("product_rule_key") or "").strip()
+
+        if product_rule_key and not signals.get("is_pennant") and not is_apron:
+            product_rule_shots = self._flow_operator_product_rule_shot_suite(product_rule_key)
+            if product_rule_shots:
+                return product_rule_shots
 
         if is_apron:
             return [
@@ -9995,6 +10123,8 @@ exit 1
         card_description_note = self._flow_operator_trello_card_description_note(card)
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         signals = self._flow_operator_card_product_signals(request, card)
+        product_rule_key = str(signals.get("product_rule_key") or "").strip()
+        product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
         card_id = str(card.get("id") or card.get("shortLink") or "").strip()
         source_attachment_ids = [
             str(item or "").strip()
@@ -10053,6 +10183,12 @@ exit 1
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
+            (
+                "HAVI product shot rule lock: "
+                f"{str(product_rule.get('display_name') or product_rule_key)} uses the fixed shot plan imported from HAVI_Shot_Types_All_Products.xlsx. "
+                f"{str(product_rule.get('lock') or '').strip()}. "
+                "The product may be styled in the listed scenes, but the product category, construction, material, embroidery/print layout, proportions, and premium handmade identity must not change."
+            ) if product_rule else "",
             (
                 "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
                 "Every main generated product must remain a pennant/banner with a top dowel or rod, cord/string hanger, straight side seams, pointed V bottom, flat linen/fabric panel, and the same embroidery layout. "
@@ -10203,6 +10339,9 @@ exit 1
                 continue
             if any(trigger in normalized or trigger in compact for trigger in triggers):
                 aliases.extend(values)
+        product_rule_key = self._flow_operator_product_rule_key_from_text(query)
+        if product_rule_key:
+            aliases.extend(str(alias) for alias in PRODUCT_SHOT_RULES.get(product_rule_key, {}).get("aliases", ()))
         unique: List[str] = []
         seen: set[str] = set()
         for alias in aliases:
@@ -15911,6 +16050,114 @@ exit 1
         except Exception:
             return {}
 
+    async def _visible_flow_project_images_from_page(
+        self,
+        client: Any,
+        *,
+        prompt: str,
+        target_count: int,
+        fallback_workflow_id: str = "",
+    ) -> List[Any]:
+        from flow._api import GeneratedImage
+
+        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
+        try:
+            page = await client._bm.page()
+            items = await page.evaluate(
+                """
+                (limit) => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return style.display !== 'none'
+                      && style.visibility !== 'hidden'
+                      && rect.width >= 120
+                      && rect.height >= 120
+                      && rect.bottom > 0
+                      && rect.right > 0
+                      && rect.top < window.innerHeight
+                      && rect.left < window.innerWidth;
+                  };
+                  const srcFor = (img) => {
+                    const current = img.currentSrc || img.src || '';
+                    if (current) return current;
+                    const srcset = img.getAttribute('srcset') || '';
+                    return srcset.split(',').map((part) => part.trim().split(/\\s+/)[0]).filter(Boolean).pop() || '';
+                  };
+                  const toItem = (img, index) => {
+                    const rect = img.getBoundingClientRect();
+                    const src = srcFor(img);
+                    const link = img.closest('a[href*="/edit/"]');
+                    const href = link ? link.href || link.getAttribute('href') || '' : '';
+                    const workflowMatch = href.match(/\\/edit\\/([^/?#]+)/);
+                    const card = img.closest('a[href*="/edit/"], [role="gridcell"], article, li, [data-testid], div');
+                    const cardRect = card && card.getBoundingClientRect ? card.getBoundingClientRect() : rect;
+                    return {
+                      src,
+                      workflow_id: workflowMatch ? workflowMatch[1] : '',
+                      top: cardRect.top,
+                      left: cardRect.left,
+                      width: rect.width,
+                      height: rect.height,
+                      area: rect.width * rect.height,
+                      linked: Boolean(link),
+                      index,
+                    };
+                  };
+                  const seen = new Set();
+                  const all = Array.from(document.querySelectorAll('img[src], img[srcset]'))
+                    .filter(visible)
+                    .map(toItem)
+                    .filter((item) => item.src && !item.src.startsWith('data:') && !item.src.startsWith('blob:'))
+                    .filter((item) => item.area >= 18000)
+                    .filter((item) => {
+                      const key = item.workflow_id || item.src;
+                      if (seen.has(key)) return false;
+                      seen.add(key);
+                      return true;
+                    });
+                  const linked = all.filter((item) => item.linked);
+                  const pool = linked.length >= Math.min(limit, 3) ? linked : all;
+                  return pool
+                    .sort((a, b) => (a.top - b.top) || (a.left - b.left) || (a.index - b.index))
+                    .slice(0, limit)
+                    .map((item) => ({
+                      src: item.src,
+                      workflow_id: item.workflow_id,
+                      width: Math.round(item.width),
+                      height: Math.round(item.height),
+                    }));
+                }
+                """,
+                target,
+            )
+        except Exception:
+            return []
+
+        images: List[Any] = []
+        seen_urls: set[str] = set()
+        for index, item in enumerate(items if isinstance(items, list) else [], start=1):
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("src") or "").strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            image = GeneratedImage.__new__(GeneratedImage)
+            image._raw = {"visible_ui_fallback": True, **item}
+            image.media_name = f"visible-flow-{index}.jpg"
+            image.project_id = ""
+            image.workflow_id = str(item.get("workflow_id") or fallback_workflow_id or "").strip()
+            image.fife_url = url
+            image.seed = 0
+            image.model = ""
+            image.prompt = prompt
+            image.dimensions = {"width": int(item.get("width") or 0), "height": int(item.get("height") or 0)}
+            image.file_path = None
+            images.append(image)
+        return images[:target]
+
     async def _wait_for_new_project_images(
         self,
         client: Any,
@@ -15921,6 +16168,7 @@ exit 1
         timeout_s: float,
         fallback_workflow_id: str = "",
         settle_s: float = 4.0,
+        allow_visible_fallback: bool = False,
     ) -> List[Any]:
         target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
         deadline = time.monotonic() + max(5.0, float(timeout_s or 30))
@@ -15961,6 +16209,15 @@ exit 1
 
         if best:
             return best[:target]
+        if allow_visible_fallback:
+            visible_images = await self._visible_flow_project_images_from_page(
+                client,
+                prompt=prompt,
+                target_count=target,
+                fallback_workflow_id=fallback_workflow_id,
+            )
+            if visible_images:
+                return visible_images[:target]
         raise RuntimeError("Google Flow không trả ảnh mới trong project sau khi bấm tạo ảnh.")
 
     async def _generate_image_edit_result(
@@ -16415,6 +16672,8 @@ exit 1
         total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(total or 1)))
         full_total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(full_total or total)))
         shot_offset = max(0, min(full_total - 1, int(shot_offset or 0)))
+        shot_start = shot_offset + 1
+        shot_end = min(full_total, shot_offset + total)
         all_shot_specs = self._flow_agent_shot_specs()
         shot_specs = all_shot_specs[shot_offset : shot_offset + total]
         if len(shot_specs) < total and all_shot_specs:
@@ -16444,21 +16703,41 @@ exit 1
             if allows_four_panel_detail_collage
             else f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
         )
-        shot_plan_text = (
-            "Follow the Required shot plan already written in the base brief exactly; do not replace it with generic shot ideas. "
-            if has_base_shot_plan
-            else f"CURRENT SHOT PLAN: {shot_lines} "
-        )
+        requested_shot_range = self._required_shot_plan_range_text(base, shot_start, shot_end) if has_base_shot_plan else ""
+        if has_base_shot_plan and (full_total > total or shot_offset):
+            earlier_range = f"1-{shot_offset}" if shot_offset > 1 else "1" if shot_offset == 1 else ""
+            restart_guard = (
+                f" Do not create, summarize, repeat, or restart Required shot plan items {earlier_range}; those items were already assigned to an earlier Flow pass."
+                if earlier_range
+                else ""
+            )
+            shot_plan_text = (
+                f"CURRENT UI PASS SHOT RANGE: create ONLY Required shot plan items {shot_start}-{shot_end}. "
+                f"{restart_guard} "
+                f"Use these exact Required shot items for this pass: {requested_shot_range or f'items {shot_start}-{shot_end} from the base brief'}. "
+                f"Number and think of these outputs as continuation images {shot_start}-{shot_end}, not as a new set starting at image 1. "
+            )
+        elif has_base_shot_plan:
+            shot_plan_text = "Follow the Required shot plan already written in the base brief exactly; do not replace it with generic shot ideas. "
+        else:
+            shot_plan_text = (
+                f"CURRENT UI PASS SHOT RANGE: create ONLY images {shot_start}-{shot_end}. "
+                f"CURRENT SHOT PLAN: {shot_lines} "
+                if full_total > total or shot_offset
+                else f"CURRENT SHOT PLAN: {shot_lines} "
+            )
         if full_total > total or shot_offset:
             run_scope = (
-                f"This is images {shot_offset + 1}-{min(full_total, shot_offset + total)} of a {full_total}-image product set. "
+                f"This is images {shot_start}-{shot_end} of a {full_total}-image product set. "
                 f"Override any earlier full-set count in the base brief for this UI pass: create exactly {total} outputs now, not {full_total}. "
-                "The app will handle the other images in separate Flow passes."
+                "The app will handle the other images in separate Flow passes. "
+                f"Fresh-task isolation is only to clear old Flow chat context; it does not reset the numbered shot range, so this pass must continue at image {shot_start}."
             )
         else:
             run_scope = "This run must produce the full image set."
         correction = (
-            f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
+            f"Create exactly {total} separate standalone images now in ONE Flow Agent run. This is the first instruction and it overrides any later broad/full-set wording. "
+            f"Use the x{total} image setting when available, and if the UI setting is lower, Flow Agent must still plan and create exactly {total} outputs from this message. "
             f"{run_scope} "
             f"{self._flow_agent_fresh_context_rule()} "
             "These generated outputs are in addition to the attached Trello source/reference image; never count the source image as one of the generated outputs. "
@@ -16484,7 +16763,45 @@ exit 1
             "Use the attached Trello source product image as the reference for every output. "
             "Keep every output 1:1 square, commercial product photography, and visually identical to the same source product identity."
         )
-        return f"{base}\n\n{correction}" if base else correction
+        return f"{correction}\n\n{base}" if base else correction
+
+    def _required_shot_plan_range_text(self, base: str, start: int, end: int) -> str:
+        text = str(base or "")
+        if not text or "Required shot plan:" not in text:
+            return ""
+        start = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(start or 1)))
+        end = max(start, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(end or start)))
+        section = text[text.find("Required shot plan:") :]
+        matches = list(re.finditer(r"(?<!\d)(\d{1,2})\.\s+", section))
+        if not matches:
+            return ""
+        stop_markers = (
+            "Lighting and color rule",
+            "Product-specific notes",
+            "Treat the Trello description",
+            "Use the learned product-prompt style",
+            "Preserve the original product shape",
+            "Only change scene",
+            "Do not change the source product",
+            "All outputs must be true",
+            "Do not use Google Sheet prompts",
+            "Source card:",
+        )
+        items: List[str] = []
+        for index, match in enumerate(matches):
+            number = int(match.group(1))
+            if number < start or number > end:
+                continue
+            next_start = matches[index + 1].start() if index + 1 < len(matches) else len(section)
+            item = section[match.start() : next_start]
+            for marker in stop_markers:
+                marker_pos = item.find(marker)
+                if marker_pos >= 0:
+                    item = item[:marker_pos]
+            item = re.sub(r"\s+", " ", item).strip(" ;")
+            if item:
+                items.append(item)
+        return " ".join(items)
 
     async def _generate_single_reference_image_via_ui(
         self,
@@ -16826,8 +17143,14 @@ exit 1
                             target_count=target_count,
                             timeout_s=min(120.0, max(20.0, ui_timeout_s / 2)),
                             fallback_workflow_id=resolved_workflow_id,
+                            allow_visible_fallback=True,
                         )
                         if images:
+                            if job_id and getattr(images[0], "_raw", {}).get("visible_ui_fallback"):
+                                await self.store.append_log(
+                                    job_id,
+                                    f"Fallback UI Flow: panel bao loi nhung app thay {len(images)} anh lon trong grid Flow; tiep tuc lay anh dang hien thi.",
+                                )
                             if job_id:
                                 await self.store.append_log(
                                     job_id,
@@ -16871,6 +17194,7 @@ exit 1
                 target_count=target_count,
                 timeout_s=ui_timeout_s,
                 fallback_workflow_id=resolved_workflow_id,
+                allow_visible_fallback=flow_agent_enabled,
             )
         elif flow_agent_enabled and len(images) < target_count:
             if job_id:
@@ -16887,6 +17211,7 @@ exit 1
                     timeout_s=min(ui_timeout_s, 150.0),
                     fallback_workflow_id=resolved_workflow_id,
                     settle_s=min(90.0, max(25.0, ui_timeout_s / 5)),
+                    allow_visible_fallback=flow_agent_enabled,
                 )
                 merged: List[Any] = []
                 seen_keys: set[str] = set()
@@ -17804,10 +18129,34 @@ exit 1
                         return found;
                       };
                       const bodyText = document.body?.innerText || '';
-                      const isApproveLabel = (label) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|Run|Start/i.test(label)
-                        && !/Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|không\\s*cho\\s*phép|khong\\s*cho\\s*phep|không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
-                      const isNegativeLabel = (label) => /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep/i.test(label)
-                        && !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
+                      const plainText = (value) => String(value || '')
+                        .normalize('NFD')
+                        .replace(/[\\u0300-\\u036f]/g, '')
+                        .replace(/[\\u0111\\u0110]/g, 'd')
+                        .toLowerCase();
+                      const approvalTextPattern = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i;
+                      const isNegativeLabel = (label) => {
+                        const plain = plainText(label);
+                        return (
+                          /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep/i.test(label)
+                          || /\\b(tu\\s*choi|reject|cancel|huy|close|stop|dung|xoa|delete|settings|cai\\s*dat|khong\\s*cho\\s*phep)\\b/i.test(plain)
+                        ) && !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
+                      };
+                      const isApproveLabel = (label) => {
+                        const plain = plainText(label);
+                        return (
+                          /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|Run|Start/i.test(label)
+                          || /\\b(phe\\s*duyet|approve|allow|confirm|cho\\s*phep|dong\\s*y|tiep\\s*tuc|chap\\s*thuan|continue|run|start)\\b/i.test(plain)
+                        ) && !isNegativeLabel(label);
+                      };
+                      const isApprovalActionLabel = (label) => {
+                        const plain = plainText(label);
+                        return (
+                          isApproveLabel(label)
+                          || /Create|Generate|Submit|Send|Go/i.test(label)
+                          || /\\b(tao|tao\\s*anh|chay|gui|create|generate|submit|send|go)\\b/i.test(plain)
+                        ) && !isNegativeLabel(label);
+                      };
                       const approveButtons = deepQuery('button, [role="button"]')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
@@ -17824,22 +18173,37 @@ exit 1
                         })
                         .filter(({ label, rect }) => label.length <= 120 && isApproveLabel(label) && rect.width <= 420 && rect.height <= 140)
                         .sort((a, b) => ((a.rect.width * a.rect.height) - (b.rect.width * b.rect.height)) || (b.rect.right - a.rect.right));
-                      const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
+                      const waiting = approvalTextPattern.test(bodyText);
                       const dialogRoots = deepQuery('[role="dialog"], [aria-modal="true"], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                         .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.right - a.rect.right));
                       const approvalDialogRoots = dialogRoots.filter((root) => {
                         const text = `${root.label || ''} ${root.el?.innerText || ''}`;
-                        return /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(text);
+                        return approvalTextPattern.test(text);
                       });
+                      const approvalTextRoots = waiting
+                        ? deepQuery('section, aside, form, div, [role="group"], [role="alertdialog"], [role="status"]')
+                            .filter(visible)
+                            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el), text: el.innerText || el.textContent || '' }))
+                            .filter(({ rect, text }) =>
+                              approvalTextPattern.test(text)
+                              && rect.width >= 180
+                              && rect.height >= 70
+                              && rect.width <= window.innerWidth * 0.96
+                              && rect.height <= window.innerHeight * 0.9
+                            )
+                            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
+                        : [];
+                      const approvalRoots = [...approvalDialogRoots, ...approvalTextRoots]
+                        .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index);
                       const dialogFallbackButtons = waiting
-                        ? approvalDialogRoots.flatMap((root) =>
-                            Array.from(root.el.querySelectorAll('button, [role="button"]'))
+                        ? approvalRoots.flatMap((root) =>
+                            deepQuery('button, [role="button"], [tabindex], a', root.el)
                               .filter(visible)
                               .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                           )
-                            .filter(({ label, rect }) => !isNegativeLabel(label) && rect.width >= 32 && rect.height >= 24 && rect.width <= 360 && rect.height <= 120)
+                            .filter(({ label, rect }) => isApprovalActionLabel(label) && rect.width >= 24 && rect.height >= 18 && rect.width <= 360 && rect.height <= 120)
                             .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.right - a.rect.right))
                         : [];
                       const approve = approveButtons[0] || textCandidates[0] || dialogFallbackButtons[0];
@@ -17946,6 +18310,21 @@ exit 1
             result = await page.evaluate(
                 """
                 () => {
+                  const deepQuery = (selector, root = document, seen = new Set()) => {
+                    const found = [];
+                    const visit = (node) => {
+                      if (!node || seen.has(node)) return;
+                      seen.add(node);
+                      try {
+                        found.push(...node.querySelectorAll(selector));
+                        for (const el of node.querySelectorAll('*')) {
+                          if (el.shadowRoot) visit(el.shadowRoot);
+                        }
+                      } catch (_) {}
+                    };
+                    visit(root);
+                    return found;
+                  };
                   const visible = (el, minW = 1, minH = 1) => {
                     if (!el || !(el instanceof Element)) return false;
                     const rect = el.getBoundingClientRect();
@@ -17965,71 +18344,120 @@ exit 1
                     el.getAttribute('aria-label') || '',
                     el.getAttribute('title') || '',
                     el.getAttribute('data-testid') || '',
+                    el.getAttribute('class') || '',
                     el.getAttribute('src') || '',
+                    el.getAttribute('style') || '',
                   ].join(' ').replace(/\\s+/g, ' ').trim();
-                  const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                  const panels = deepQuery('aside, dialog, section, [role="dialog"], [aria-modal="true"], div')
                     .filter((el) => visible(el, 260, 160))
                     .map((el) => {
                       const rect = el.getBoundingClientRect();
                       const text = labelFor(el);
-                      const rightPanel = rect.left >= window.innerWidth * 0.35 || rect.right >= window.innerWidth * 0.78;
-                      const hasTextbox = Boolean(el.querySelector('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'));
+                      const rightPanel = rect.left >= window.innerWidth * 0.35
+                        && rect.right >= window.innerWidth * 0.72
+                        && rect.width <= window.innerWidth * 0.72;
+                      const hasTextbox = Boolean(deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]', el).length);
                       const agentish = /Flow\\s+Agent|Tác\\s*nhân|Tac\\s*nhan|Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|Credit\\s+Spend\\s+Approval|Shot\\s+Brief|Design\\s+Analysis/i.test(text);
-                      const score = (rightPanel ? 1200 : 0) + (hasTextbox ? 700 : 0) + (agentish ? 600 : 0) + rect.height / 20;
+                      const score = (rightPanel ? 1400 : -900) + (hasTextbox ? 700 : 0) + (agentish ? 600 : 0) + rect.height / 20 + rect.left / 20;
                       return { el, rect, text, score };
                     })
                     .filter((item) => item.score >= 1200)
                     .sort((a, b) => b.score - a.score);
                   const panel = panels[0];
-                  if (!panel) return { visible: false, count: 0, media_count: 0, chip_count: 0, detail: 'agent panel not found' };
+                  const fileInputsWithFiles = deepQuery('input[type="file"]')
+                    .filter((el) => {
+                      try {
+                        const accept = `${el.getAttribute('accept') || ''} ${labelFor(el)}`;
+                        return el.files && el.files.length > 0 && (!accept.trim() || /image|jpeg|jpg|png|webp|heic|media|file/i.test(accept));
+                      } catch (_) {
+                        return false;
+                      }
+                    })
+                    .map((el) => {
+                      try {
+                        return [...el.files].map((file) => file.name || file.type || 'selected file').join(', ');
+                      } catch (_) {
+                        return 'selected file';
+                      }
+                    });
+                  if (!panel) {
+                    const count = fileInputsWithFiles.length;
+                    return {
+                      visible: count > 0,
+                      count,
+                      media_count: 0,
+                      chip_count: 0,
+                      file_input_count: count,
+                      card_count: 0,
+                      labels: fileInputsWithFiles.slice(0, 12),
+                      detail: `agent panel not found; files=${count}`,
+                    };
+                  }
                   const panelRect = panel.rect;
-                  const textboxes = [...panel.el.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                  const textboxes = deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]', panel.el)
                     .filter((el) => visible(el, 120, 12))
                     .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                     .sort((a, b) => b.rect.bottom - a.rect.bottom);
                   const inputBox = textboxes[0];
-                  const composerTop = inputBox ? Math.max(panelRect.top, inputBox.rect.top - 220) : panelRect.top + panelRect.height * 0.52;
+                  const composerTop = inputBox ? Math.max(panelRect.top + 44, inputBox.rect.top - Math.max(260, panelRect.height * 0.62)) : panelRect.top + 44;
                   const composerBottom = panelRect.bottom + 12;
                   const insideTextbox = (el) => textboxes.some((box) => box.el === el || box.el.contains(el));
-                  const inComposer = (el) => {
+                  const inPanelAttachmentArea = (el) => {
                     const rect = el.getBoundingClientRect();
                     return rect.top >= composerTop
                       && rect.bottom <= composerBottom
                       && rect.left >= panelRect.left - 8
                       && rect.right <= panelRect.right + 8;
                   };
-                  const media = [...panel.el.querySelectorAll('img, canvas, video, [role="img"], [style*="background-image"]')]
+                  const mediaCandidates = deepQuery('img, canvas, video, [role="img"], [style*="background-image"]', panel.el);
+                  const media = mediaCandidates
                     .filter((el) => visible(el, 24, 24))
-                    .filter((el) => inComposer(el) && !insideTextbox(el))
+                    .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
                     .filter((el) => {
                       const rect = el.getBoundingClientRect();
                       return rect.width * rect.height >= 900 && !(rect.width <= 38 && rect.height <= 38);
                     })
                     .map((el) => labelFor(el).slice(0, 80));
-                  const chips = [...panel.el.querySelectorAll('span, div, p, a, button, [role="button"]')]
+                  const chips = deepQuery('span, div, p, a, button, [role="button"]', panel.el)
                     .filter((el) => visible(el, 24, 12))
-                    .filter((el) => inComposer(el) && !insideTextbox(el))
+                    .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
                     .map((el) => labelFor(el))
                     .filter((label) => label.length > 0 && label.length <= 180)
-                    .filter((label) => /\\.jpe?g|\\.png|\\.webp|\\.heic|trello-|source|upload(ed)?|attached|attachment|ảnh|anh|image/i.test(label))
+                    .filter((label) => /\\.jpe?g|\\.png|\\.webp|\\.heic|trello-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label))
                     .slice(0, 12);
-                  const count = media.length + chips.length;
+                  const attachmentCards = deepQuery('[data-testid], [aria-label], [title], [class]', panel.el)
+                    .filter((el) => visible(el, 24, 18))
+                    .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      return { label: labelFor(el), area: rect.width * rect.height };
+                    })
+                    .filter((item) => item.area >= 900 && item.label.length > 0 && item.label.length <= 220)
+                    .filter((item) => /upload|attached|attachment|thumbnail|preview|file|media|image|photo|picture|remove.*image|xoa.*anh|áº£nh|anh/i.test(item.label))
+                    .map((item) => item.label.slice(0, 80))
+                    .slice(0, 12);
+                  const labels = [...media, ...chips, ...attachmentCards, ...fileInputsWithFiles]
+                    .filter((label, index, arr) => label && arr.indexOf(label) === index)
+                    .slice(0, 12);
+                  const count = media.length + chips.length + attachmentCards.length + fileInputsWithFiles.length;
                   return {
                     visible: true,
                     count,
                     media_count: media.length,
                     chip_count: chips.length,
-                    labels: [...media, ...chips].slice(0, 12),
-                    detail: `attachments=${count} media=${media.length} chips=${chips.length}`,
+                    file_input_count: fileInputsWithFiles.length,
+                    card_count: attachmentCards.length,
+                    labels,
+                    detail: `attachments=${count} media=${media.length} chips=${chips.length} files=${fileInputsWithFiles.length} cards=${attachmentCards.length} allMedia=${mediaCandidates.length}`,
                   };
                 }
                 """
             )
         except Exception as exc:
-            return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "detail": humanize_flow_error(str(exc))}
+            return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "file_input_count": 0, "card_count": 0, "detail": humanize_flow_error(str(exc))}
         if isinstance(result, dict):
             return result
-        return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "detail": "attachment snapshot unavailable"}
+        return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "file_input_count": 0, "card_count": 0, "detail": "attachment snapshot unavailable"}
 
     async def _wait_for_flow_agent_source_attachment(
         self,

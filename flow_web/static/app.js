@@ -350,15 +350,17 @@ function moduleTypeConfig(type) {
   return AUTOMATION_MODULE_TYPE_CONFIG[type] || AUTOMATION_MODULE_TYPE_CONFIG.custom;
 }
 
-function boundedGenerationCount(value, fallback = 1) {
+function boundedGenerationCount(value, fallback = 1, maxCount = 4) {
   const numeric = Number(value);
   const fallbackNumeric = Number(fallback);
+  const maxNumeric = Number(maxCount);
+  const resolvedMax = Number.isFinite(maxNumeric) && maxNumeric > 0 ? maxNumeric : 4;
   const resolved = Number.isFinite(numeric) && numeric > 0
     ? numeric
     : Number.isFinite(fallbackNumeric) && fallbackNumeric > 0
       ? fallbackNumeric
       : 1;
-  return Math.max(1, Math.min(4, resolved));
+  return Math.max(1, Math.min(resolvedMax, resolved));
 }
 
 function flowAgentEnabledFromSettings(settings = {}) {
@@ -366,13 +368,15 @@ function flowAgentEnabledFromSettings(settings = {}) {
 }
 
 function flowModuleImageCount(settings = {}, fallbackCount = 1) {
+  const maxCount = flowAgentEnabledFromSettings(settings) ? FLOW_AGENT_TARGET_OUTPUT_COUNT : 4;
   const hasExplicitCount = Boolean(settings) && Object.prototype.hasOwnProperty.call(settings, "imageCount");
   if (hasExplicitCount) {
-    return boundedGenerationCount(settings.imageCount, FLOW_AGENT_DEFAULT_IMAGE_COUNT);
+    return boundedGenerationCount(settings.imageCount, FLOW_AGENT_DEFAULT_IMAGE_COUNT, maxCount);
   }
   return boundedGenerationCount(
     flowAgentEnabledFromSettings(settings) ? FLOW_AGENT_DEFAULT_IMAGE_COUNT : fallbackCount,
     fallbackCount,
+    maxCount,
   );
 }
 
@@ -2081,6 +2085,7 @@ function renderModuleSettings(module) {
     const imageAspect = settings.imageAspect || state.drafts.image.aspect;
     const imageCount = flowModuleImageCount(settings, state.drafts.image.count || MODE_CONFIG.image.defaultCount);
     const flowAgentEnabled = flowAgentEnabledFromSettings(settings);
+    const imageCountMax = flowAgentEnabled ? FLOW_AGENT_TARGET_OUTPUT_COUNT : 4;
     const flowAgentAutoApprove = settings.flowAgentAutoApprove !== false;
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
@@ -2100,7 +2105,7 @@ function renderModuleSettings(module) {
         </label>
         <label class="field">
           <span>Số ảnh</span>
-          <input type="number" min="1" max="4" step="1" data-module-setting="imageCount" value="${escapeHtml(imageCount)}" />
+          <input type="number" min="1" max="${imageCountMax}" step="1" data-module-setting="imageCount" value="${escapeHtml(imageCount)}" />
         </label>
       </div>
       <label class="inline-check module-check">
@@ -4454,7 +4459,8 @@ function syncModuleSettingFromControl(control) {
   } else if (setting === "imageAspect") {
     state.drafts.image.aspect = value || "square";
   } else if (setting === "imageCount") {
-    const count = Math.max(1, Math.min(4, Number(value || 1)));
+    const maxCount = flowAgentEnabledFromSettings(module.settings) ? FLOW_AGENT_TARGET_OUTPUT_COUNT : 4;
+    const count = Math.max(1, Math.min(maxCount, Number(value || 1)));
     state.drafts.image.count = count;
     module.settings[setting] = count;
   } else if (setting === "telegramChat") {
