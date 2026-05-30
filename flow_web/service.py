@@ -144,6 +144,7 @@ class FlowWebService:
     FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12
     FLOW_AGENT_TARGET_OUTPUT_COUNT = 12
     FLOW_AGENT_MAX_IMAGES_PER_RUN = 12
+    VISUAL_PRODUCT_RULE_MIN_CONFIDENCE = 0.7
     FLOW_AGENT_BATCH_PAUSE_MIN_S = 60
     FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
@@ -281,6 +282,7 @@ class FlowWebService:
         self._shared_browser_profile_key = ""
         self._active_flow_profile_index = 0
         self._trello_source_downloads: Dict[str, Dict[str, Any]] = {}
+        self._trello_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
         )
@@ -2124,6 +2126,7 @@ class FlowWebService:
         base_request: CreateJobRequest,
         items: List[Dict[str, Any]],
         limit: int,
+        skip_card_ids: set[str] | None = None,
     ) -> tuple[CreateJobRequest, List[Dict[str, Any]], Dict[str, Any]]:
         graph = self._automation_graph_payload(base_request)
         module = next(
@@ -2144,6 +2147,7 @@ class FlowWebService:
                 module_request,
                 items,
                 limit,
+                skip_card_ids,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
@@ -3293,7 +3297,8 @@ class FlowWebService:
                     scan_request, items, discovery = await self._expand_prompt_batch_with_trello_images(
                         base_request,
                         seed_items,
-                        0,
+                        1,
+                        seen_card_ids,
                     )
                 except HTTPException as exc:
                     detail = self._flow_error_detail(exc)
@@ -3312,7 +3317,12 @@ class FlowWebService:
                             failed=failed,
                             current_index=0,
                             current_child_job_id="",
-                            extra={"cycles": cycles, "idle_cycles": idle_cycles, "last_scan_at": utc_now()},
+                            extra={
+                                "cycles": cycles,
+                                "idle_cycles": idle_cycles,
+                                "last_scan_at": utc_now(),
+                                "seen_card_ids": sorted(seen_card_ids),
+                            },
                         )
                         await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
                         continue
@@ -3635,6 +3645,7 @@ class FlowWebService:
             "The attached source image is the authority: keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
             "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan or Trello description explicitly requests alternate personalized names may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
             "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, tactile fibers, clear stitch direction, crisp edges, and natural thread shadows; never make it flat printed, painted, digital, vinyl, or sticker-like. "
+            f"{self._flow_agent_embroidery_clarity_rule()} "
             "Include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
             "Use clean clear white neutral daylight in every image with accurate whites and no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             "Use pastel fabric colorway variety only when the exact same source product form, construction, motif placement, and scale can be preserved; if not, skip colorways and vary only scene/angle/styling. "
@@ -3642,10 +3653,22 @@ class FlowWebService:
             + self._flow_agent_no_tag_label_rule()
         )
 
+    def _flow_agent_embroidery_clarity_rule(self) -> str:
+        return (
+            "For any source product with visible embroidery, stitched lettering, stitched motif, or hand-sewn decorative design, "
+            "every generated image must be tack-sharp around the embroidered areas, keep the embroidery readable and clearly focused, "
+            "show individual thread strands, stitch direction, raised hand-work texture, needlework depth, and linen/fabric weave, "
+            "and make the hand-embroidery technique obvious rather than soft, blurry, smeared, printed, or machine-flat."
+        )
+
     def _flow_agent_no_tag_label_rule(self) -> str:
         return (
             "Do not add any sticker, tag, price tag, hang tag, loose label, barcode, QR code, sale badge, watermark, "
-            "new logo, fake brand mark, or extra text overlay unless that exact mark already exists on the source product image."
+            "new logo, fake brand mark, or extra text overlay unless that exact mark already exists on the source product image. "
+            "Do not attach any new physical tag to the product itself: no paper hang tag tied to a strap, button, zipper, "
+            "dowel, cord, sleeve, hem, seam, or gift ribbon; no sewn-in or woven brand label, care label, size label, "
+            "fabric label, or product tag visible on the item; no tag, card, or label may touch, cover, hang from, "
+            "or distract from the product."
         )
 
     def _flow_operator_steps(
@@ -9130,6 +9153,7 @@ exit 1
         request: CreateJobRequest,
         items: List[Dict[str, Any]],
         limit: int,
+        skip_card_ids: set[str] | None = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         key, token = self._trello_credentials()
         if not key or not token:
@@ -9184,6 +9208,21 @@ exit 1
                         continue
                     seen_cards.add(card_id)
                     cards.append(card)
+        normalized_skip_card_ids = {
+            self._normalize_trello_card_id(str(item or ""))
+            for item in (skip_card_ids or set())
+            if self._normalize_trello_card_id(str(item or ""))
+        }
+        skipped_seen_cards = 0
+        if normalized_skip_card_ids and not explicit_card_id:
+            fresh_cards: List[Dict[str, Any]] = []
+            for card in cards:
+                card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+                if card_id and card_id in normalized_skip_card_ids:
+                    skipped_seen_cards += 1
+                    continue
+                fresh_cards.append(card)
+            cards = fresh_cards
         raw_limit = int(limit or 0)
         max_items = max(1, len(cards)) if raw_limit <= 0 else max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit))
         expanded: List[Dict[str, Any]] = []
@@ -9207,6 +9246,8 @@ exit 1
                 "match_mode": "flow_agent",
                 "prompt_mode": "flow_agent",
             }
+            if skipped_seen_cards:
+                discovery["skipped_seen_cards"] = skipped_seen_cards
             return expanded, discovery
 
         for card in cards:
@@ -9264,6 +9305,8 @@ exit 1
             "matched_items": len(expanded),
             "match_mode": "keyword" if any(item.get("trello_match_mode") == "keyword" for item in expanded) else "product",
         }
+        if skipped_seen_cards:
+            discovery["skipped_seen_cards"] = skipped_seen_cards
         return expanded, discovery
 
     def _flow_operator_trello_card_description_note(self, card: Dict[str, Any]) -> str:
@@ -9293,7 +9336,9 @@ exit 1
         normalized = self._normalize_skill_token(raw)
         compact = self._compact_match_text(raw)
         tokens = set(self._tokenize_match_words(raw))
-        product_rule_key = self._flow_operator_product_rule_key_from_text(raw)
+        visual_product_rule_key = self._flow_operator_card_visual_product_rule_key(card)
+        text_product_rule_key = self._flow_operator_product_rule_key_from_text(raw)
+        product_rule_key = visual_product_rule_key or text_product_rule_key
         is_child_shirt = (
             ("ao" in tokens or "shirt" in tokens or "tshirt" in tokens or "tee" in tokens)
             and (
@@ -9307,6 +9352,10 @@ exit 1
             "query": query,
             "card_description": card_description,
             "attachment_names": attachment_names,
+            "visual_product_rule_key": visual_product_rule_key,
+            "text_product_rule_key": text_product_rule_key,
+            "visual_product_rule_confidence": card.get("_visual_product_rule_confidence"),
+            "visual_product_rule_visible_product": card.get("_visual_product_rule_visible_product"),
             "normalized": normalized,
             "compact": compact,
             "product_rule_key": product_rule_key,
@@ -9421,6 +9470,231 @@ exit 1
                     return key
         return ""
 
+    def _flow_operator_card_visual_product_rule_key(self, card: Dict[str, Any]) -> str:
+        raw = str(
+            card.get("_visual_product_rule_key")
+            or card.get("_visual_product_rule")
+            or ""
+        ).strip()
+        if not raw:
+            return ""
+        rule_key = raw if raw in PRODUCT_SHOT_RULES else self._flow_operator_product_rule_key_from_text(raw)
+        if rule_key not in PRODUCT_SHOT_RULES:
+            return ""
+        confidence_raw = card.get("_visual_product_rule_confidence")
+        if confidence_raw not in (None, ""):
+            try:
+                confidence = float(confidence_raw)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if confidence > 1.0 and confidence <= 100.0:
+                confidence = confidence / 100.0
+            if confidence < self.VISUAL_PRODUCT_RULE_MIN_CONFIDENCE:
+                return ""
+        return rule_key
+
+    def _flow_operator_visual_product_rule_options(self) -> str:
+        lines: List[str] = []
+        for key in PRODUCT_SHOT_RULE_PRIORITY:
+            suite = PRODUCT_SHOT_RULES.get(key) or {}
+            display = str(suite.get("display_name") or key).strip()
+            aliases = ", ".join(str(alias) for alias in (suite.get("aliases") or ())[:6])
+            lock = str(suite.get("lock") or "").strip()
+            lines.append(f"- {key}: {display}. Aliases: {aliases}. Visual lock: {lock}")
+        return "\n".join(lines)
+
+    def _flow_operator_visual_rule_cache_key(
+        self,
+        card_id: str,
+        attachment: Dict[str, Any],
+    ) -> str:
+        attachment_id = self._normalize_trello_id(str(attachment.get("id") or ""))
+        name = str(attachment.get("name") or "").strip()
+        marker = str(attachment.get("date") or attachment.get("bytes") or "").strip()
+        return "|".join([self._normalize_trello_card_id(card_id), attachment_id or name, marker])
+
+    def _flow_operator_product_rule_from_visual_payload(self, payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {
+                "product_rule_key": "",
+                "confidence": 0.0,
+                "visible_product": "",
+                "reason": "Gemini did not return a JSON object.",
+            }
+        raw_key = str(
+            payload.get("product_rule_key")
+            or payload.get("rule_key")
+            or payload.get("key")
+            or ""
+        ).strip()
+        visible_product = str(payload.get("visible_product") or payload.get("product") or "").strip()
+        reason = str(payload.get("reason") or "").strip()
+        confidence_raw = payload.get("confidence", 0.0)
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence > 1.0 and confidence <= 100.0:
+            confidence = confidence / 100.0
+
+        normalized_key = self._normalize_skill_token(raw_key)
+        if normalized_key in {"", "none", "unknown", "unclear", "no_match", "nomatch", "other"}:
+            rule_key = ""
+        else:
+            candidate_text = " ".join([raw_key, visible_product, reason]).strip()
+            rule_key = raw_key if raw_key in PRODUCT_SHOT_RULES else self._flow_operator_product_rule_key_from_text(candidate_text)
+            if rule_key not in PRODUCT_SHOT_RULES:
+                rule_key = ""
+        if confidence < self.VISUAL_PRODUCT_RULE_MIN_CONFIDENCE:
+            rule_key = ""
+        return {
+            "product_rule_key": rule_key,
+            "confidence": confidence,
+            "visible_product": visible_product,
+            "reason": reason,
+        }
+
+    def _gemini_classify_trello_source_product_rule(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        card_name: str,
+        attachment_name: str,
+        card_description: str,
+    ) -> Dict[str, Any]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Gemini is not configured for visual product classification.")
+        prompt = "\n".join(
+            [
+                "Classify the SOURCE_IMAGE into one HAVI ecommerce product shot rule.",
+                "Use the image as the authority. Treat card names and attachment filenames as weak clues only; they are often random or wrong.",
+                "Return an empty product_rule_key when the product is not clearly one of the allowed rules.",
+                "Do not guess from motif text, filename, or background props. Classify only the main physical product form visible in the image.",
+                "Allowed product_rule_key values:",
+                self._flow_operator_visual_product_rule_options(),
+                'Return JSON only with this exact shape: {"product_rule_key": string, "confidence": number, "visible_product": string, "reason": string}.',
+                "confidence must be 0.0 to 1.0.",
+                f"Card name: {card_name}",
+                f"Attachment name: {attachment_name}",
+                f"Card description: {card_description[:1200]}",
+            ]
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {"text": "SOURCE_IMAGE"},
+                        self._inline_gemini_image_part(image_bytes, mime_type or "image/jpeg"),
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 512,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API returned HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not call Gemini for visual product classification: {exc.reason}") from exc
+
+        text = self._extract_gemini_text(body)
+        parsed = self._parse_json_candidate(text, context="visual product classification")
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini did not return a valid visual classification object.")
+        return parsed
+
+    def _flow_operator_enrich_card_with_visual_product_rule(
+        self,
+        request: CreateJobRequest,
+        card: Dict[str, Any],
+    ) -> None:
+        if card.get("_visual_product_rule_checked"):
+            return
+        card["_visual_product_rule_checked"] = True
+        if self._flow_operator_card_visual_product_rule_key(card):
+            return
+        if not self._gemini_api_key():
+            return
+        key, token = self._trello_credentials()
+        if not key or not token:
+            return
+
+        card_id = self._normalize_trello_card_id(
+            str(card.get("id") or card.get("shortLink") or request.trello_source_card_id or request.trello_card_id or "")
+        )
+        image_attachments = [
+            item
+            for item in (card.get("_image_attachments") or [])
+            if isinstance(item, dict) and self._trello_attachment_is_image(item)
+        ]
+        if not card_id or not image_attachments:
+            return
+
+        selected_ids = set(self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids))
+        attachment = next(
+            (
+                item
+                for item in image_attachments
+                if self._normalize_trello_id(str(item.get("id") or "")) in selected_ids
+            ),
+            image_attachments[0],
+        )
+        cache_key = self._flow_operator_visual_rule_cache_key(card_id, attachment)
+        cached = self._trello_visual_product_rule_cache.get(cache_key)
+        if cached is not None:
+            card.update(cached)
+            return
+
+        try:
+            image_bytes, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
+            raw_payload = self._gemini_classify_trello_source_product_rule(
+                image_bytes=image_bytes,
+                mime_type=mime,
+                card_name=str(card.get("name") or ""),
+                attachment_name=str(attachment.get("name") or ""),
+                card_description=self._flow_operator_trello_card_description_note(card),
+            )
+            parsed = self._flow_operator_product_rule_from_visual_payload(raw_payload)
+            metadata = {
+                "_visual_product_rule_key": parsed.get("product_rule_key") or "",
+                "_visual_product_rule_confidence": parsed.get("confidence") or 0.0,
+                "_visual_product_rule_visible_product": parsed.get("visible_product") or "",
+                "_visual_product_rule_reason": parsed.get("reason") or "",
+            }
+        except Exception as exc:
+            metadata = {
+                "_visual_product_rule_key": "",
+                "_visual_product_rule_confidence": 0.0,
+                "_visual_product_rule_visible_product": "",
+                "_visual_product_rule_reason": "",
+                "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
+            }
+        self._trello_visual_product_rule_cache[cache_key] = metadata
+        card.update(metadata)
+
     def _flow_operator_product_rule_shot_suite(self, product_key: str) -> List[Dict[str, str]]:
         suite = PRODUCT_SHOT_RULES.get(str(product_key or "").strip())
         if not suite:
@@ -9489,9 +9763,12 @@ exit 1
         attachment_names = str(signals.get("attachment_names") or "").strip()
         product_rule_key = str(signals.get("product_rule_key") or "").strip()
         product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
+        visual_product_rule_key = str(signals.get("visual_product_rule_key") or "").strip()
+        visual_visible_product = str(signals.get("visual_product_rule_visible_product") or "").strip()
+        visual_confidence = signals.get("visual_product_rule_confidence")
 
         product_bits: List[str] = []
-        if product_rule:
+        if product_rule and not signals.get("is_apron"):
             product_bits.append(
                 f"{str(product_rule.get('display_name') or product_rule_key)} category: {str(product_rule.get('lock') or '').strip()}"
             )
@@ -9526,6 +9803,18 @@ exit 1
         source_hint = f" Visible Trello clues: {visible_sources}." if visible_sources else ""
         if card_url:
             source_hint += f" Source card: {card_url}."
+        if visual_product_rule_key:
+            try:
+                confidence_text = f"{float(visual_confidence):.2f}"
+            except (TypeError, ValueError):
+                confidence_text = ""
+            display = str(product_rule.get("display_name") or visual_product_rule_key).strip() if product_rule else visual_product_rule_key
+            detail = f" as {display}"
+            if visual_visible_product:
+                detail += f" ({visual_visible_product})"
+            if confidence_text:
+                detail += f", confidence {confidence_text}"
+            source_hint += f" Visual source classification{detail}; this overrides random or generic card filenames."
         return (
             "Before creating images, carefully analyze the selected Trello reference image for "
             + "; ".join(product_bits)
@@ -9707,7 +9996,7 @@ exit 1
         is_embroidery = bool(signals.get("is_embroidery"))
         product_rule_key = str(signals.get("product_rule_key") or "").strip()
 
-        if product_rule_key and not signals.get("is_pennant") and not is_apron:
+        if product_rule_key and not is_apron:
             product_rule_shots = self._flow_operator_product_rule_shot_suite(product_rule_key)
             if product_rule_shots:
                 return product_rule_shots
@@ -10188,7 +10477,7 @@ exit 1
                 f"{str(product_rule.get('display_name') or product_rule_key)} uses the fixed shot plan imported from HAVI_Shot_Types_All_Products.xlsx. "
                 f"{str(product_rule.get('lock') or '').strip()}. "
                 "The product may be styled in the listed scenes, but the product category, construction, material, embroidery/print layout, proportions, and premium handmade identity must not change."
-            ) if product_rule else "",
+            ) if product_rule and not signals.get("is_apron") else "",
             (
                 "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
                 "Every main generated product must remain a pennant/banner with a top dowel or rod, cord/string hanger, straight side seams, pointed V bottom, flat linen/fabric panel, and the same embroidery layout. "
@@ -10260,6 +10549,7 @@ exit 1
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
             selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
+            self._flow_operator_enrich_card_with_visual_product_rule(request, card)
             existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
             rerun_full_set = existing_flow_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT
             image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT if rerun_full_set else max(1, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - existing_flow_count)
@@ -16444,10 +16734,18 @@ exit 1
                     if not batch_generated and last_exc is not None:
                         raise last_exc
                     if len(batch_generated) < run_count:
-                        raise RuntimeError(
-                            f"Flow Agent chi tao duoc {len(batch_generated)}/{run_count} anh trong luot x{run_count}. "
-                            "App da dung truoc khi upload len Trello de tranh bo anh thieu."
-                        )
+                        if not batch_generated:
+                            raise RuntimeError(f"Flow Agent chua tao duoc anh nao trong luot x{run_count}.")
+                        if job_id:
+                            await self.store.append_log(
+                                job_id,
+                                (
+                                    f"Flow Agent chi tao duoc {len(batch_generated)}/{run_count} anh trong luot x{run_count}; "
+                                    f"app se upload {len(batch_generated)} anh da co roi chuyen sang card tiep theo."
+                                ),
+                            )
+                        generated.extend(batch_generated[:run_count])
+                        break
                     generated.extend(batch_generated[:run_count])
                     if len(generated) < target_count:
                         if job_id:
@@ -16513,6 +16811,16 @@ exit 1
             if not generated and last_exc is not None:
                 raise last_exc
             if flow_agent_enabled and len(generated) < target_count:
+                if generated:
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            (
+                                f"Flow Agent chi tao duoc {len(generated)}/{target_count} anh trong luot x{target_count}; "
+                                f"app se upload {len(generated)} anh da co roi chuyen sang card tiep theo."
+                            ),
+                        )
+                    return generated[:target_count]
                 raise RuntimeError(
                     f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh trong lượt x{target_count}. "
                     "App đã dừng trước khi upload lên Trello để tránh bộ ảnh thiếu."
@@ -16754,6 +17062,7 @@ exit 1
             "If two ideas look like the same product-on-table view, change one before generating. "
             "Lighting for every output must be clean clear white neutral daylight with accurate whites; no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             "Every stitched or embroidered area in every output must look like real hand embroidery: raised thread, visible stitch direction, tactile fibers, crisp embroidered edges, and natural thread shadows; never make embroidery look flat printed, painted, digital, vinyl, or sticker-like. "
+            f"{self._flow_agent_embroidery_clarity_rule()} "
             "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
             "Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. For the explicitly planned process shot only, a round embroidery hoop may appear as a temporary tool holding the pennant fabric while stitching, not as a finished hoop product. "
             "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Required shot plan or Trello description explicitly asks for alternate names and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "

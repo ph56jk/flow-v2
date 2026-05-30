@@ -397,29 +397,29 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual(1, len(items))
         item = items[0]
-        self.assertIn("pennant/banner wall hanging product", item["design_analysis"])
+        self.assertIn("Banner category", item["design_analysis"])
         self.assertIn("Pennant/banner category lock", item["prompt"])
         self.assertIn("top dowel or rod", item["prompt"])
         self.assertIn("Never create a pillow/cushion/blanket/shirt/hoop version", item["prompt"])
         self.assertIn("image 7 is the only allowed four-panel close-up collage", item["prompt"])
         self.assertIn("woman sitting at a clean craft table", item["prompt"])
-        self.assertIn("Mother and baby gently touching", item["prompt"])
-        self.assertIn("folded neatly and flat", item["prompt"])
+        self.assertIn("mother and baby together", item["prompt"])
+        self.assertIn("flat and neatly folded", item["prompt"])
         self.assertNotIn("Nursery hero arrangement", item["shot_labels"])
         self.assertEqual(
             [
-                "Pennant image 1 baby room flag scene",
-                "Pennant image 2 alternate nursery corner",
-                "Pennant image 3 two hanging color variants",
-                "Pennant image 4 two tabletop color variants",
-                "Pennant image 5 three nursery color variants",
-                "Pennant image 6 four nursery color variants",
-                "Pennant image 7 four-panel embroidery close-up collage",
-                "Pennant image 8 woman embroidering in hoop",
-                "Pennant image 9 mother and baby touch embroidery",
-                "Pennant image 10 two babies touch two pennants",
-                "Pennant image 11 sleeping baby room scene",
-                "Pennant image 12 flat gift box presentation",
+                "Banner image 1 Mẹ và bé chạm vào cờ thêu tên",
+                "Banner image 2 Hero cờ treo trong nursery",
+                "Banner image 3 2 cờ cùng kiểu, khác tên, khác màu nền",
+                "Banner image 4 2 cờ đặt trên bàn với đồ em bé",
+                "Banner image 5 3 cờ, 3 màu nền",
+                "Banner image 6 4 cờ treo cùng nhau",
+                "Banner image 7 Collage 4 ảnh nhỏ",
+                "Banner image 8 Người phụ nữ đang thêu cờ",
+                "Banner image 9 Mẹ và bé cùng sờ hình thêu",
+                "Banner image 10 2 bé với 2 cờ, không lộ mặt",
+                "Banner image 11 Em bé ngủ, cờ treo gần nôi",
+                "Banner image 12 Cờ trong hộp quà mở",
             ],
             item["shot_labels"],
         )
@@ -451,13 +451,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual(1, len(items))
         item = items[0]
-        self.assertIn("pennant/banner wall hanging product", item["design_analysis"])
-        self.assertIn("Pennant image 9 mother and baby touch embroidery", item["prompt"])
-        self.assertIn("Pennant image 12 flat gift box presentation", item["prompt"])
+        self.assertIn("Banner category", item["design_analysis"])
+        self.assertIn("Banner image 9 Mẹ và bé cùng sờ hình thêu", item["prompt"])
+        self.assertIn("Banner image 12 Cờ trong hộp quà mở", item["prompt"])
         self.assertIn("For the required process shot only, a round embroidery hoop is allowed", item["prompt"])
         self.assertNotIn("Pastel fabric colorway lineup", item["shot_labels"])
-        self.assertEqual("Pennant image 1 baby room flag scene", item["shot_labels"][0])
-        self.assertEqual("Pennant image 12 flat gift box presentation", item["shot_labels"][-1])
+        self.assertEqual("Banner image 1 Mẹ và bé chạm vào cờ thêu tên", item["shot_labels"][0])
+        self.assertEqual("Banner image 12 Cờ trong hộp quà mở", item["shot_labels"][-1])
 
     def test_havi_product_shot_rules_supply_twelve_safe_shots_for_each_product(self) -> None:
         for product_key in PRODUCT_SHOT_RULES:
@@ -494,9 +494,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Gấu bông category", item["design_analysis"])
         self.assertEqual("Gấu bông image 1 Product display", item["shot_labels"][0])
         self.assertIn("Baby hug", item["shot_labels"][1])
-        self.assertIn("3 gấu bông tên thêu khác nhau", item["prompt"])
+        self.assertIn("Three stuffed animals", item["prompt"])
         self.assertIn("HAVI product shot rule lock", item["prompt"])
         self.assertNotIn("Full doll/plush product", item["prompt"])
+
+    def test_auto_trello_visual_product_rule_overrides_random_card_name(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        cards = [
+            {
+                "id": "card-dress",
+                "shortLink": "dress",
+                "idList": "ready",
+                "name": "A_single_white_linen_pillow_202605271042.jpeg",
+                "url": "https://trello.example/c/dress",
+                "_image_attachments": [{"id": "att-dress", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-dress"],
+                "_visual_product_rule_key": "dress_baby",
+                "_visual_product_rule_confidence": 0.94,
+                "_visual_product_rule_visible_product": "baby dress with ruffled sleeves",
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertIn("Dress Baby category", item["design_analysis"])
+        self.assertNotIn("Linen Pillowcase category", item["design_analysis"])
+        self.assertIn("Visual source classification as Dress Baby", item["design_analysis"])
+        self.assertEqual(12, len(item["shot_labels"]))
+        self.assertTrue(item["shot_labels"][0].startswith("Dress Baby image 1 "))
+        self.assertIn("mannequin", item["prompt"])
+        self.assertIn("HAVI product shot rule lock: Dress Baby", item["prompt"])
+        self.assertNotIn("Pastel fabric colorway lineup", item["shot_labels"])
 
     def test_auto_trello_uses_havi_vows_book_active_rules_only(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4, prompt="Vows Book")
@@ -542,7 +572,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         item = items[0]
         self.assertIn("Wedding Pillowcase category", item["design_analysis"])
         self.assertEqual("Wedding Pillowcase image 1 Cô dâu ôm/cầm gối", item["shot_labels"][0])
-        self.assertIn("2 gối Bride & Groom", item["prompt"])
+        self.assertIn("two pillows neatly arranged", item["prompt"])
         self.assertNotIn("Mẹ bế bé + gối thêu tên", item["prompt"])
 
     def test_flow_agent_multi_image_prompt_allows_only_pennant_detail_collage(self) -> None:
@@ -662,6 +692,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("clean clear white neutral daylight", items[0]["prompt"])
         self.assertIn("no yellow/orange/golden/tungsten", items[0]["prompt"])
         self.assertIn("Every output must make stitched or embroidered areas look genuinely hand embroidered", items[0]["prompt"])
+        self.assertIn("tack-sharp around the embroidered areas", items[0]["prompt"])
+        self.assertIn("make the hand-embroidery technique obvious", items[0]["prompt"])
         self.assertIn("Only if the source image visibly contains an embroidered/personalized name", items[0]["prompt"])
         self.assertIn("If the source has no embroidered name, keep all variants nameless", items[0]["prompt"])
         self.assertIn("12 generated output images plus the 1 source image", items[0]["prompt"])
@@ -773,23 +805,23 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Color option display", items[0]["shot_labels"])
         self.assertEqual(
             [
-                "Wedding Hoop image 1 Flat display thêu hoa",
+                "Wedding Hoop image 1 Flat display — thêu hoa",
                 "Wedding Hoop image 2 Cận thêu tay",
                 "Wedding Hoop image 3 Giữa vest chú rể & áo cô dâu",
                 "Wedding Hoop image 4 Cô dâu đứng cầm showcase",
                 "Wedding Hoop image 5 4 vòng trên voile trắng",
                 "Wedding Hoop image 6 Gift box",
-                "Wedding Hoop image 7 Tay thêu process lifestyle",
+                "Wedding Hoop image 7 Tay thêu — process lifestyle",
                 "Wedding Hoop image 8 Đôi uyên ương cầm #1",
-                "Wedding Hoop image 9 2 vòng tên khác trên gỗ",
+                "Wedding Hoop image 9 2 vòng tên khác — trên gỗ",
                 "Wedding Hoop image 10 Treo trên móc tường",
-                "Wedding Hoop image 11 Flat cận chi tiết thêu #2",
+                "Wedding Hoop image 11 Flat — cận chi tiết thêu #2",
                 "Wedding Hoop image 12 Đôi uyên ương cầm #2",
             ],
             items[0]["shot_labels"],
         )
         self.assertIn("HAVI product shot rule lock", items[0]["prompt"])
-        self.assertIn("2 hoop cùng thiết kế khác tên", items[0]["prompt"])
+        self.assertIn("Two identical rings with different names", items[0]["prompt"])
         self.assertIn("If the source has no embroidered name", items[0]["prompt"])
 
     def test_project_generated_images_extracts_new_flow_media(self) -> None:
@@ -1879,6 +1911,55 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["ready-card"], [item["trello_card_id"] for item in items])
         self.assertEqual(["ready-list"], discovery["list_ids"])
         self.assertEqual("Ready for AI", discovery["list_name"])
+
+    def test_auto_trello_scan_skips_seen_cards_before_visual_analysis(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="board123",
+            trello_list_id="ready-list",
+        )
+        seen_card = {
+            "id": "seen-card",
+            "shortLink": "seen",
+            "idList": "ready-list",
+            "name": "seen product",
+            "url": "https://trello.example/c/seen",
+            "_image_attachments": [{"id": "seen-att", "name": "seen.jpg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["seen-att"],
+        }
+        fresh_card = {
+            "id": "fresh-card",
+            "shortLink": "fresh",
+            "idList": "ready-list",
+            "name": "fresh product",
+            "url": "https://trello.example/c/fresh",
+            "_image_attachments": [{"id": "fresh-att", "name": "fresh.jpg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["fresh-att"],
+        }
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=[seen_card, fresh_card],
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ), patch.object(
+            self.service,
+            "_flow_operator_enrich_card_with_visual_product_rule",
+        ) as enrich:
+            items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 1, {"seen-card"})
+
+        self.assertEqual(["fresh-card"], [item["trello_card_id"] for item in items])
+        self.assertEqual(1, discovery["skipped_seen_cards"])
+        enrich.assert_called_once()
+        self.assertEqual("fresh-card", enrich.call_args.args[1]["id"])
 
     def test_auto_trello_explicit_card_ignores_stale_attachment_id_for_oldest_source(self) -> None:
         request = CreateJobRequest(
@@ -6402,7 +6483,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "Gấu bông image 8 Bé ôm trên chăn muslin",
                 "Gấu bông image 9 Flat lay baby shower",
                 "Gấu bông image 10 Vintage floral",
-                "Gấu bông image 11 Editorial quy trình",
+                "Gấu bông image 11 Editorial — Grid quy trình",
                 "Gấu bông image 12 Supplemental full product hero",
             ],
             saved.input["items"][0]["shot_labels"],
@@ -6419,6 +6500,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("sticker", seen[0][0])
         self.assertIn("price tag", seen[0][0])
         self.assertIn("barcode", seen[0][0])
+        self.assertIn("Do not attach any new physical tag to the product itself", seen[0][0])
+        self.assertIn("no paper hang tag tied to a strap", seen[0][0])
+        self.assertIn("no sewn-in or woven brand label", seen[0][0])
+        self.assertIn("no tag, card, or label may touch, cover, hang from", seen[0][0])
         self.assertNotIn("name tag", seen[0][0])
 
     async def test_auto_trello_rejects_explicit_card_outside_ready(self) -> None:
@@ -6666,17 +6751,17 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(
             [
                 "Baby Pillowcase image 1 Mẹ bế bé + gối thêu tên",
-                "Baby Pillowcase image 2 Hero gối trên giường nursery",
-                "Baby Pillowcase image 3 2 gối cùng màu khác tên",
+                "Baby Pillowcase image 2 Hero — gối trên giường nursery",
+                "Baby Pillowcase image 3 2 gối cùng màu — khác tên",
                 "Baby Pillowcase image 4 4 gối stack dọc",
                 "Baby Pillowcase image 5 3 gối 3 màu",
-                "Baby Pillowcase image 6 Cận thêu collage",
+                "Baby Pillowcase image 6 Cận thêu — collage",
                 "Baby Pillowcase image 7 Bé nằm trên gối",
                 "Baby Pillowcase image 8 3 gối tổng hợp",
                 "Baby Pillowcase image 9 Quy trình thêu",
                 "Baby Pillowcase image 10 Standalone đơn",
-                "Baby Pillowcase image 11 2 trẻ nằm 2 tên khác",
-                "Baby Pillowcase image 12 Gift box quà sinh nhật",
+                "Baby Pillowcase image 11 2 trẻ nằm — 2 tên khác",
+                "Baby Pillowcase image 12 Gift box — quà sinh nhật",
             ],
             saved.input["items"][0]["shot_labels"],
         )
@@ -6686,7 +6771,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("numbered shot brief", prompt)
         self.assertIn("separate standalone 1:1 images", prompt)
         self.assertIn("never make a collage", prompt)
-        self.assertIn("texture vải linen bé", prompt)
+        self.assertIn("fabric texture", prompt)
 
     async def test_auto_trello_ai_suite_does_not_reuse_apron_template_for_doll_query(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
@@ -7306,6 +7391,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("sticker", prompt)
         self.assertIn("price tag", prompt)
         self.assertIn("barcode", prompt)
+        self.assertIn("Do not attach any new physical tag to the product itself", prompt)
+        self.assertIn("no paper hang tag tied to a strap", prompt)
+        self.assertIn("no sewn-in or woven brand label", prompt)
+        self.assertIn("no tag, card, or label may touch, cover, hang from", prompt)
         self.assertNotIn("name tag", prompt)
 
     async def test_generate_images_via_ui_retries_stale_agent_context_once(self) -> None:
@@ -7386,9 +7475,41 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("pastel fabric colorway lineup image", prompt)
         self.assertIn("no yellow, orange, golden-hour", prompt)
         self.assertIn("real hand embroidery", prompt)
+        self.assertIn("tack-sharp around the embroidered areas", prompt)
         self.assertIn("never count the source image as one of the generated outputs", prompt)
         self.assertIn("if the source has no name, do not invent names", prompt)
         pause.assert_not_awaited()
+
+    async def test_generate_images_via_ui_uploads_partial_flow_agent_outputs(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="tao bo anh san pham",
+            count=12,
+            flow_agent_enabled=True,
+            flow_agent_auto_approve=True,
+            reference_image_paths=["/tmp/source.jpg"],
+        )
+        fake_images = [SimpleNamespace(media_name=f"img-{index}") for index in range(9)]
+        fake_client = SimpleNamespace()
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch.object(
+            self.service,
+            "_find_workflow_id_for_media",
+            AsyncMock(return_value="source-workflow"),
+        ), patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(return_value=fake_images),
+        ) as single_ref:
+            result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"], job_id=job.id)
+
+        self.assertEqual(fake_images, result)
+        single_ref.assert_awaited_once()
+        updated = self.store.get_job(job.id)
+        messages = [entry.message for entry in (updated.logs if updated else [])]
+        self.assertTrue(any("9/12" in message and "upload 9 anh" in message for message in messages))
 
     async def test_single_reference_ui_requires_flow_agent_mode_when_enabled(self) -> None:
         events: list[str] = []
