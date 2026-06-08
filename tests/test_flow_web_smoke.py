@@ -400,6 +400,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Banner category", item["design_analysis"])
         self.assertIn("Pennant/banner category lock", item["prompt"])
         self.assertIn("top dowel or rod", item["prompt"])
+        self.assertIn("clearly visible wall hook", item["prompt"])
+        self.assertIn("rope/cord visibly hanging", item["prompt"])
         self.assertIn("Never create a pillow/cushion/blanket/shirt/hoop version", item["prompt"])
         self.assertIn("image 7 is the only allowed four-panel close-up collage", item["prompt"])
         self.assertIn("woman sitting at a clean craft table", item["prompt"])
@@ -473,6 +475,20 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 self.assertIn("Product/category lock", shots[0]["brief"])
                 self.assertIn("white daylight", joined)
 
+    def test_banner_wall_hanging_shots_require_visible_wall_hook(self) -> None:
+        shots = self.service._flow_operator_product_rule_shot_suite("banner")
+        self.assertGreaterEqual(len(shots), 12)
+
+        hook_briefs = [shot["brief"] for shot in shots if "clearly visible wall hook" in shot["brief"]]
+        self.assertGreaterEqual(len(hook_briefs), 6)
+        self.assertTrue(all("rope/cord visibly hanging" in brief for brief in hook_briefs))
+
+        by_index = {index: shot["brief"] for index, shot in enumerate(shots, start=1)}
+        self.assertNotIn("clearly visible wall hook", by_index[4])
+        self.assertNotIn("clearly visible wall hook", by_index[7])
+        self.assertNotIn("clearly visible wall hook", by_index[8])
+        self.assertNotIn("clearly visible wall hook", by_index[12])
+
     def test_auto_trello_uses_havi_plush_shot_rules_from_excel(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4, prompt="Gấu bông")
         cards = [
@@ -497,6 +513,69 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Three stuffed animals", item["prompt"])
         self.assertIn("HAVI product shot rule lock", item["prompt"])
         self.assertNotIn("Full doll/plush product", item["prompt"])
+
+    def test_auto_trello_uses_havi_crown_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        cards = [
+            {
+                "id": "card-crown",
+                "shortLink": "crown",
+                "idList": "ready",
+                "name": "Olive_green_linen_crown_with_202606050851.jpeg",
+                "url": "https://trello.example/c/crown",
+                "_image_attachments": [{"id": "att-crown", "name": "olive_green_linen_crown.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-crown"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertIn("Crown category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Crown", item["prompt"])
+        self.assertIn("Crown image 1 Crown upright on wood birthday table", item["shot_labels"])
+        self.assertIn("Crown image 8 Four-panel crown making process", item["shot_labels"])
+        self.assertIn("Crown image 11 Crown on cake stand", item["shot_labels"])
+        self.assertTrue(any("Supplemental full product hero" in label for label in item["shot_labels"]))
+        self.assertIn("pom-pom or felt-ball tips", item["prompt"])
+        self.assertNotIn("Fabric Cross category", item["design_analysis"])
+
+    def test_auto_trello_uses_havi_drawstring_bag_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        cards = [
+            {
+                "id": "card-drawstring-bag",
+                "shortLink": "drawstring-bag",
+                "idList": "ready",
+                "name": "Sage_green_linen_drawstring_bag_tui_rut_day_202606080915.jpeg",
+                "url": "https://trello.example/c/drawstring-bag",
+                "_image_attachments": [{"id": "att-bag", "name": "embroidered_drawstring_pouch.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-bag"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("drawstring_bag")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Drawstring Bag category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Drawstring Bag", item["prompt"])
+        self.assertIn("Show one single cotton linen drawstring bag standing naturally", item["prompt"])
+        self.assertIn("Show three drawstring bags standing upright together in a shallow light wooden tray", item["prompt"])
+        self.assertIn("Create one square detail collage made of four small close-up photos", item["prompt"])
+        self.assertIn("Place one drawstring bag neatly inside a small open paper gift box", item["prompt"])
+        self.assertNotIn("light wood shelf with fabric-covered books", item["prompt"])
+        self.assertNotIn("held naturally in one adult woman hand", item["prompt"])
+        self.assertNotIn("relaxing tea-table corner", item["prompt"])
+        self.assertNotIn("hanging naturally from a small wooden hook or rail", item["prompt"])
+        self.assertNotIn("suspended by one side of its own drawstring cord", item["prompt"])
+        self.assertIn("drawstring cord color must match", item["prompt"])
+        self.assertIn("not a hoop product", item["prompt"])
+        self.assertNotIn("Banner category", item["design_analysis"])
 
     def test_auto_trello_visual_product_rule_overrides_random_card_name(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
@@ -616,7 +695,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("not as a new set starting at image 1", prompt)
         self.assertIn("does not reset the numbered shot range", prompt)
 
-    def test_auto_trello_generic_tao_filename_does_not_infer_shirt(self) -> None:
+    def test_auto_trello_generic_tao_filename_stops_without_product_rule(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         card = {
             "id": "card-generic",
@@ -629,19 +708,174 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         }
 
         signals = self.service._flow_operator_card_product_signals(request, card)
-        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
 
         self.assertFalse(signals["is_shirt"])
+        with self.assertRaisesRegex(RuntimeError, "HAVI product shot rule"):
+            self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+    def test_auto_trello_skips_unknown_rule_card_when_later_card_is_valid(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        generic_card = {
+            "id": "card-generic",
+            "shortLink": "generic",
+            "idList": "ready",
+            "name": "tao_hinh_image_202605161423.jpeg",
+            "url": "https://trello.example/c/generic",
+            "_image_attachments": [{"id": "att-generic", "name": "image.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-generic"],
+        }
+        dress_card = {
+            "id": "card-dress",
+            "shortLink": "dress",
+            "idList": "ready",
+            "name": "Dress Baby linen product",
+            "url": "https://trello.example/c/dress",
+            "_image_attachments": [{"id": "att-dress", "name": "dress_baby.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-dress"],
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([generic_card, dress_card], request, 1)
+
         self.assertEqual(1, len(items))
-        self.assertNotIn("shirt silhouette", items[0]["design_analysis"])
-        self.assertNotIn("Hands sewing shirt detail", items[0]["shot_labels"])
-        self.assertIn("without inferring a category from a generic filename", items[0]["design_analysis"])
-        self.assertIn("do not infer product type from generic names", items[0]["prompt"])
-        self.assertIn("Fresh-task isolation", items[0]["prompt"])
-        self.assertIn("Current source lock: Trello card id card-generic", items[0]["prompt"])
-        self.assertIn("selected attachment id(s) att-generic", items[0]["prompt"])
-        self.assertIn("The only valid main product is the exact visible product object", items[0]["prompt"])
-        self.assertNotIn("square pillow with a sheep embroidery", items[0]["prompt"])
+        self.assertEqual("card-dress", items[0]["trello_card_id"])
+        self.assertIn("HAVI product shot rule lock: Dress Baby", items[0]["prompt"])
+
+    def test_auto_trello_generic_card_uses_visual_product_rule_instead_of_fallback(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        card = {
+            "id": "card-generic-dress",
+            "shortLink": "generic-dress",
+            "idList": "ready",
+            "name": "Full-length_professional_product_photography_of_202605281034.jpeg",
+            "url": "https://trello.example/c/generic-dress",
+            "_image_attachments": [{"id": "att-dress", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-dress"],
+            "_visual_product_rule_key": "dress_baby",
+            "_visual_product_rule_confidence": 0.91,
+            "_visual_product_rule_visible_product": "baby linen dress",
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertIn("Dress Baby category", items[0]["design_analysis"])
+        self.assertIn("Visual source classification as Dress Baby", items[0]["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Dress Baby", items[0]["prompt"])
+        self.assertTrue(items[0]["shot_labels"][0].startswith("Dress Baby image 1 "))
+        self.assertNotIn("Detail craft proof", items[0]["shot_labels"])
+
+    def test_auto_trello_generic_card_infers_dress_rule_from_visual_description(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+        card = {
+            "id": "6a17f150f691950be79b94a8",
+            "shortLink": "generic-visual-dress",
+            "idList": "ready",
+            "name": "Full-length_professional_product_photography_of_202605281034.jpeg",
+            "url": "https://trello.example/c/generic-visual-dress",
+            "_image_attachments": [{"id": "6a17f150f691950be79b95d2", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["6a17f150f691950be79b95d2"],
+        }
+
+        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("trello-key", "trello-token"),
+        ), patch.object(
+            self.service,
+            "_trello_download_attachment_bytes",
+            return_value=(b"image", "image/jpeg"),
+        ), patch.object(
+            self.service,
+            "_gemini_classify_trello_source_product_rule",
+            return_value={
+                "product_rule_key": "",
+                "confidence": 0.62,
+                "visible_product": "white linen sleeveless child dress on a hanger with ruffled sleeves and skirt",
+                "reason": "The main product is a small child garment with a bodice, skirt, pocket, and flutter sleeves.",
+            },
+        ):
+            items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("dress_baby", card["_visual_product_rule_key"])
+        self.assertIn("Dress Baby category", items[0]["design_analysis"])
+        self.assertIn("Visual source classification as Dress Baby", items[0]["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Dress Baby", items[0]["prompt"])
+        self.assertTrue(items[0]["shot_labels"][0].startswith("Dress Baby image 1 "))
+        self.assertNotIn("Detail craft proof", items[0]["shot_labels"])
+
+    def test_visual_product_rule_maps_photo_album_to_guest_book(self) -> None:
+        parsed = self.service._flow_operator_product_rule_from_visual_payload(
+            {
+                "product_rule_key": "",
+                "confidence": 0.62,
+                "visible_product": "fabric covered wedding photo album scrapbook with embroidered cover",
+                "reason": "The main object is a handmade keepsake album with a linen cover.",
+            }
+        )
+
+        self.assertEqual("guest_book", parsed["product_rule_key"])
+        self.assertTrue(parsed["inferred_from_visual_text"])
+
+    def test_visual_product_rule_infers_all_havi_products_from_visual_description(self) -> None:
+        examples = {
+            "wedding_pillowcase": "square cushion embroidered with bride and groom names for a romantic wedding keepsake",
+            "baby_pillowcase": "soft rectangular cushion with nursery name embroidery for an infant crib",
+            "linen_pillowcase": "rectangular cushion cover made from linen fabric with embroidery for home decor sofa styling",
+            "ring_bearer_pillow": "small square cushion with ribbons holding wedding rings for the ceremony",
+            "hoops_with_photos": "round wooden embroidery frame containing a baby portrait photo with stitched name and date",
+            "wedding_hoop": "round wooden embroidery frame with floral stitched couple names for wedding decor",
+            "bride_handkerchief": "embroidered bridal cloth square folded with lace edge for wedding tears keepsake",
+            "vows_book": "small fabric covered booklet for personal vows with embroidered cover lettering",
+            "guest_book": "fabric covered sign in album for wedding guests with embroidered cover",
+            "bouquet_ribbon": "long fabric strip tied to a bridal bouquet with stitched lettering",
+            "drawstring_bag": "cotton linen drawstring pouch with rope cords, gathered top, and hand embroidered lavender motif",
+            "banner": "flat triangular nursery wall hanging with top wooden dowel cord hanger and pointed V bottom",
+            "crown": "soft fabric birthday crown made of linen with pom-pom tips and embroidered details for a baby party",
+            "fabric_cross": "soft sewn religious cross keepsake made of linen with embroidered name",
+            "dress_baby": "white linen sleeveless child dress on a hanger with ruffled sleeves and skirt",
+            "plush": "soft stuffed animal toy bear with fabric pile seams and stitched face",
+        }
+
+        self.assertEqual(set(PRODUCT_SHOT_RULES), set(examples))
+        for product_key, visual_text in examples.items():
+            with self.subTest(product_key=product_key):
+                parsed = self.service._flow_operator_product_rule_from_visual_payload(
+                    {
+                        "product_rule_key": "",
+                        "confidence": 0.62,
+                        "visible_product": visual_text,
+                        "reason": "The main object is visible.",
+                    }
+                )
+
+                self.assertEqual(product_key, parsed["product_rule_key"])
+                self.assertTrue(parsed["inferred_from_visual_text"])
+
+    def test_visual_product_rule_overrides_fabric_cross_when_visible_product_is_crown(self) -> None:
+        parsed = self.service._flow_operator_product_rule_from_visual_payload(
+            {
+                "product_rule_key": "fabric_cross",
+                "confidence": 1.0,
+                "visible_product": "fabric crown with embroidery and pom-poms",
+                "reason": "The main object is a soft linen birthday crown accessory with pointed tips.",
+            }
+        )
+
+        self.assertEqual("crown", parsed["product_rule_key"])
+        self.assertTrue(parsed["inferred_from_visual_text"])
+
+    def test_visual_product_rule_does_not_infer_dress_from_excluded_product_form(self) -> None:
+        payload = {
+            "product_rule_key": "",
+            "confidence": 0.9,
+            "visible_product": "embroidered pillow with a baby dress motif",
+            "reason": "The main object is a square pillow.",
+        }
+
+        parsed = self.service._flow_operator_product_rule_from_visual_payload(payload)
+
+        self.assertNotEqual("dress_baby", parsed["product_rule_key"])
 
     def test_auto_trello_partial_card_generates_missing_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -695,6 +929,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("tack-sharp around the embroidered areas", items[0]["prompt"])
         self.assertIn("make the hand-embroidery technique obvious", items[0]["prompt"])
         self.assertIn("Only if the source image visibly contains an embroidered/personalized name", items[0]["prompt"])
+        self.assertIn("Colorway text/name rule", items[0]["prompt"])
+        self.assertIn("each differently colored product variant must use a different plausible name/text", items[0]["prompt"])
         self.assertIn("If the source has no embroidered name, keep all variants nameless", items[0]["prompt"])
         self.assertIn("12 generated output images plus the 1 source image", items[0]["prompt"])
         self.assertEqual(
@@ -748,6 +984,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             items[0]["shot_labels"],
         )
         self.assertIn("Only if the source image visibly has an embroidered/personalized name", items[0]["prompt"])
+        self.assertIn("Colorway text/name rule", items[0]["prompt"])
+        self.assertIn("never repeat the exact same readable name/text across all color variants", items[0]["prompt"])
         self.assertIn("otherwise all options must remain nameless", items[0]["prompt"])
 
     def test_auto_trello_ten_output_card_generates_exactly_two_missing_images(self) -> None:
@@ -1865,9 +2103,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "id": "ready-card",
             "shortLink": "ready",
             "idList": "ready-list",
-            "name": "ready product",
+            "name": "baby_pillowcase ready product",
             "url": "https://trello.example/c/ready",
-            "_image_attachments": [{"id": "ready-att", "name": "ready.jpg", "mimeType": "image/jpeg"}],
+            "_image_attachments": [{"id": "ready-att", "name": "baby_pillowcase_ready.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["ready-att"],
         }
         ideas_card = {
@@ -1932,9 +2170,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "id": "fresh-card",
             "shortLink": "fresh",
             "idList": "ready-list",
-            "name": "fresh product",
+            "name": "fresh baby_pillowcase product",
             "url": "https://trello.example/c/fresh",
-            "_image_attachments": [{"id": "fresh-att", "name": "fresh.jpg", "mimeType": "image/jpeg"}],
+            "_image_attachments": [{"id": "fresh-att", "name": "fresh_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["fresh-att"],
         }
 
@@ -1974,11 +2212,11 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "id": "ready-card",
             "shortLink": "ready",
             "idList": "ready-list",
-            "name": "ready product",
+            "name": "ready baby_pillowcase product",
             "url": "https://trello.example/c/ready",
             "_image_attachments": [
-                {"id": "old-source", "name": "old.jpg", "mimeType": "image/jpeg", "date": "2026-05-20T08:00:00.000Z"},
-                {"id": "new-source", "name": "new.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T08:00:00.000Z"},
+                {"id": "old-source", "name": "baby_pillowcase_old.jpg", "mimeType": "image/jpeg", "date": "2026-05-20T08:00:00.000Z"},
+                {"id": "new-source", "name": "baby_pillowcase_new.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T08:00:00.000Z"},
             ],
             "_selected_attachment_ids": ["old-source"],
             "_flow_output_count": 0,
@@ -3583,36 +3821,134 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.store = StateStore()
         self.service = FlowWebService(self.store)
 
+    async def test_flow_agent_quota_check_ignores_stale_pre_submit_message(self) -> None:
+        class FakePage:
+            async def evaluate(self, *_args: object, **_kwargs: object) -> str:
+                return "Bạn đã dùng hết hạn mức về số lượt tạo đối với Nano Banana 2. Hãy thử dùng một mô hình khác. Tác nhân Flow"
+
+        stale_message = "Bạn đã dùng hết hạn mức về số lượt tạo đối với Nano Banana 2. Hãy thử dùng một mô hình khác."
+
+        await self.service._raise_flow_agent_quota_if_visible(FakePage(), ignore_message=stale_message)
+
+    async def test_flow_agent_quota_check_still_raises_for_new_message(self) -> None:
+        class FakePage:
+            async def evaluate(self, *_args: object, **_kwargs: object) -> str:
+                return "Bạn đã dùng hết hạn mức về số lượt tạo đối với Nano Banana 2. Hãy thử dùng một mô hình khác. Tác nhân Flow"
+
+        with self.assertRaises(FlowAgentQuotaError):
+            await self.service._raise_flow_agent_quota_if_visible(FakePage(), ignore_message="")
+
     async def test_wait_for_flow_agent_source_attachment_accepts_replaced_chip_count(self) -> None:
         class FakePage:
             async def evaluate(self, *_args: object, **_kwargs: object) -> dict:
                 return {
                     "visible": True,
                     "count": 9,
+                    "ready_count": 9,
+                    "busy_count": 0,
                     "media_count": 4,
                     "chip_count": 5,
+                    "ready_labels": ["source-card-new"],
                     "detail": "attachments=9 media=4 chips=5",
                 }
 
         ok, detail = await self.service._wait_for_flow_agent_source_attachment(
             FakePage(),
-            {"visible": True, "count": 11, "detail": "attachments=11 media=6 chips=5"},
+            {"visible": True, "count": 11, "ready_count": 11, "ready_labels": ["source-card-old"], "detail": "attachments=11 media=6 chips=5"},
             timeout_s=1,
         )
 
         self.assertTrue(ok)
-        self.assertIn("source attachment visible", detail)
+        self.assertIn("ready attachment changed", detail)
 
-    async def test_wait_for_flow_agent_source_attachment_accepts_selected_file_input(self) -> None:
+    async def test_wait_for_flow_agent_source_attachment_accepts_new_composer_thumbnail(self) -> None:
+        class FakePage:
+            async def evaluate(self, *_args: object, **_kwargs: object) -> dict:
+                return {
+                    "visible": True,
+                    "count": 14,
+                    "ready_count": 14,
+                    "busy_count": 0,
+                    "composer_ready_count": 1,
+                    "composer_busy_count": 0,
+                    "media_count": 7,
+                    "chip_count": 0,
+                    "ready_labels": ["old-gallery-thumb"],
+                    "composer_ready_labels": ["composer image preview"],
+                    "detail": "attachments=14 ready=14 busy=0 composerReady=1 composerBusy=0 media=7 chips=0 files=0 cards=7 allMedia=23",
+                }
+
+        ok, detail = await self.service._wait_for_flow_agent_source_attachment(
+            FakePage(),
+            {
+                "visible": True,
+                "count": 14,
+                "ready_count": 14,
+                "busy_count": 0,
+                "composer_ready_count": 0,
+                "composer_busy_count": 0,
+                "ready_labels": ["old-gallery-thumb"],
+                "composer_ready_labels": [],
+                "detail": "attachments=14 ready=14 busy=0 composerReady=0 composerBusy=0",
+            },
+            timeout_s=1,
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("composer attachment ready", detail)
+
+    async def test_wait_for_flow_agent_source_attachment_accepts_stable_ready_after_file_attach(self) -> None:
+        class FakePage:
+            async def evaluate(self, *_args: object, **_kwargs: object) -> dict:
+                return {
+                    "visible": True,
+                    "count": 16,
+                    "ready_count": 16,
+                    "busy_count": 0,
+                    "composer_ready_count": 0,
+                    "composer_busy_count": 0,
+                    "media_count": 8,
+                    "chip_count": 0,
+                    "file_input_count": 0,
+                    "card_count": 8,
+                    "ready_labels": ["flow-agent-ready-gallery"],
+                    "composer_ready_labels": [],
+                    "detail": "attachments=16 ready=16 busy=0 composerReady=0 composerBusy=0 media=8 chips=0 files=0 cards=8 allMedia=23",
+                }
+
+        ok, detail = await self.service._wait_for_flow_agent_source_attachment(
+            FakePage(),
+            {
+                "visible": True,
+                "count": 16,
+                "ready_count": 16,
+                "busy_count": 0,
+                "composer_ready_count": 0,
+                "composer_busy_count": 0,
+                "ready_labels": ["flow-agent-ready-gallery"],
+                "composer_ready_labels": [],
+            },
+            timeout_s=1,
+            accept_stable_ready_after_attach=True,
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("stable after file attach", detail)
+
+    async def test_wait_for_flow_agent_source_attachment_rejects_selected_file_input_until_ready(self) -> None:
         class FakePage:
             async def evaluate(self, *_args: object, **_kwargs: object) -> dict:
                 return {
                     "visible": True,
                     "count": 1,
+                    "ready_count": 0,
+                    "busy_count": 0,
                     "media_count": 0,
                     "chip_count": 0,
                     "file_input_count": 1,
-                    "detail": "attachments=1 media=0 chips=0 files=1",
+                    "composer_ready_count": 0,
+                    "composer_busy_count": 0,
+                    "detail": "attachments=1 ready=0 media=0 chips=0 files=1",
                 }
 
         ok, detail = await self.service._wait_for_flow_agent_source_attachment(
@@ -3621,8 +3957,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             timeout_s=1,
         )
 
-        self.assertTrue(ok)
-        self.assertIn("new attachment visible 0->1", detail)
+        self.assertFalse(ok)
+        self.assertIn("no new ready attachment visible", detail)
 
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
@@ -3633,9 +3969,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 return {
                     "visible": True,
                     "count": 1,
+                    "ready_count": 0,
+                    "busy_count": 0,
+                    "composer_ready_count": 0,
+                    "composer_busy_count": 0,
                     "media_count": 0,
                     "chip_count": 0,
                     "file_input_count": 1,
+                    "ready_labels": [],
+                    "composer_ready_labels": [],
                     "detail": "attachments=1 media=0 chips=0 files=1 cards=0 allMedia=0",
                 }
 
@@ -3643,13 +3985,16 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         snapshot = await self.service._flow_agent_panel_attachment_snapshot(page)
 
         self.assertEqual(1, snapshot["count"])
+        self.assertEqual(0, snapshot["ready_count"])
         self.assertIn("deepQuery", page.script)
         self.assertIn("shadowRoot", page.script)
         self.assertIn("fileInputsWithFiles", page.script)
         self.assertIn("inPanelAttachmentArea", page.script)
+        self.assertIn("composerReady", page.script)
+        self.assertIn("inCurrentComposer", page.script)
         self.assertIn("allMedia", page.script)
 
-    async def test_acquire_isolated_flow_agent_page_reuses_cached_agent_tab(self) -> None:
+    async def test_acquire_isolated_flow_agent_page_opens_fresh_agent_tab_each_time(self) -> None:
         class FakePage:
             def __init__(self) -> None:
                 self.front_count = 0
@@ -3676,10 +4021,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             first_page, first_detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
             second_page, second_detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
 
-        self.assertEqual(1, context.new_page_count)
-        self.assertIs(first_page, second_page)
+        self.assertEqual(2, context.new_page_count)
+        self.assertIsNot(first_page, second_page)
         self.assertEqual("new isolated project tab", first_detail)
-        self.assertEqual("reused isolated project tab", second_detail)
+        self.assertEqual("new isolated project tab", second_detail)
         self.assertEqual(2, ensure_page.await_count)
 
     async def test_trello_source_validation_retries_transient_gemini_json_failure(self) -> None:
@@ -3926,6 +4271,98 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(2, build_client.await_count)
         self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
+
+    async def test_with_client_switches_profile_after_repeated_flow_agent_try_again_errors(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Main", path=self.temp_root / "main-profile"),
+            FlowBrowserProfile(index=1, label="Backup", path=self.temp_root / "backup-profile"),
+        ]
+        calls: list[str] = []
+
+        async def use_client(client: Any) -> str:
+            calls.append(client.name)
+            if client.name == "client-1":
+                raise RuntimeError("Đã xảy ra lỗi. Hãy thử lại.")
+            return client.name
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service,
+            "_flow_agent_try_again_threshold",
+            return_value=2,
+        ), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="browser-1")),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="client-1")),
+        ):
+            with self.assertRaises(HTTPException) as first_ctx:
+                await self.service._with_client(use_client)
+
+        self.assertIn("1/2", str(first_ctx.exception.detail))
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertEqual(1, self.store.snapshot().flow_profile_agent_retry_error_counts[profiles[0].key])
+
+        clients = [SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service,
+            "_flow_agent_try_again_threshold",
+            return_value=2,
+        ), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(side_effect=[SimpleNamespace(name="browser-1"), SimpleNamespace(name="browser-2")]),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(side_effect=clients),
+        ):
+            result = await self.service._with_client(use_client)
+
+        self.assertEqual("client-2", result)
+        self.assertEqual(["client-1", "client-1", "client-2"], calls)
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
+        self.assertNotIn(profiles[0].key, self.store.snapshot().flow_profile_agent_retry_error_counts)
+
+    async def test_with_client_resets_flow_agent_try_again_counter_after_success(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profile = FlowBrowserProfile(index=0, label="Main", path=self.temp_root / "main-profile")
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=[profile]), patch.object(
+            self.service,
+            "_flow_agent_try_again_threshold",
+            return_value=10,
+        ), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="browser-1")),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="client-1")),
+        ):
+            with self.assertRaises(HTTPException):
+                await self.service._with_client(lambda client: asyncio.sleep(0, result=(_ for _ in ()).throw(RuntimeError("Đã xảy ra lỗi. Hãy thử lại."))))
+
+        self.assertEqual(1, self.store.snapshot().flow_profile_agent_retry_error_counts[profile.key])
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=[profile]), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="browser-1")),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="client-1")),
+        ):
+            result = await self.service._with_client(lambda client: asyncio.sleep(0, result="ok"))
+
+        self.assertEqual("ok", result)
+        self.assertNotIn(profile.key, self.store.snapshot().flow_profile_agent_retry_error_counts)
 
     async def test_with_client_stops_after_last_profile_quota_without_wrapping_to_first(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
@@ -5982,11 +6419,11 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         cards = [
             {
                 "id": f"card-{index}",
-                "name": f"Ready product {index}",
+                "name": f"Ready baby_pillowcase product {index}",
                 "shortLink": f"short-{index}",
                 "url": f"https://trello.com/c/card-{index}",
                 "idList": "ready-list",
-                "_image_attachments": [{"id": f"att-{index}", "name": f"image-{index}.jpg", "mimeType": "image/jpeg"}],
+                "_image_attachments": [{"id": f"att-{index}", "name": f"baby_pillowcase-{index}.jpg", "mimeType": "image/jpeg"}],
             }
             for index in range(45)
         ]
@@ -6068,20 +6505,20 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         stale_card = {
             "id": "stale-card",
-            "name": "Moved product",
+            "name": "Moved baby_pillowcase product",
             "shortLink": "stale",
             "url": "https://trello.com/c/stale",
             "idList": "ready-list",
-            "_image_attachments": [{"id": "stale-att", "name": "stale.jpg", "mimeType": "image/jpeg"}],
+            "_image_attachments": [{"id": "stale-att", "name": "stale_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["stale-att"],
         }
         live_card = {
             "id": "live-card",
-            "name": "Live product",
+            "name": "Live baby_pillowcase product",
             "shortLink": "live",
             "url": "https://trello.com/c/live",
             "idList": "ready-list",
-            "_image_attachments": [{"id": "live-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
+            "_image_attachments": [{"id": "live-att", "name": "live_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["live-att"],
         }
         scans = [[stale_card, live_card], [live_card], []]
@@ -6229,11 +6666,11 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         cards = [
             {
                 "id": "repeat-card",
-                "name": "Repeat product",
+                "name": "Repeat baby_pillowcase product",
                 "shortLink": "repeat",
                 "url": "https://trello.com/c/repeat",
                 "idList": "ready-list",
-                "_image_attachments": [{"id": "repeat-att", "name": "image.jpg", "mimeType": "image/jpeg"}],
+                "_image_attachments": [{"id": "repeat-att", "name": "repeat_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["repeat-att"],
             }
         ]
@@ -7388,6 +7825,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("real hand embroidery", prompt)
         self.assertIn("never count the source image as one of the generated outputs", prompt)
         self.assertIn("if the source has no name, do not invent names", prompt)
+        self.assertIn("Colorway text/name rule", prompt)
+        self.assertIn("each differently colored product variant must use a different plausible name/text", prompt)
         self.assertIn("sticker", prompt)
         self.assertIn("price tag", prompt)
         self.assertIn("barcode", prompt)
@@ -7478,6 +7917,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("tack-sharp around the embroidered areas", prompt)
         self.assertIn("never count the source image as one of the generated outputs", prompt)
         self.assertIn("if the source has no name, do not invent names", prompt)
+        self.assertIn("Colorway text/name rule", prompt)
+        self.assertIn("never repeat the exact same readable name/text across all color variants", prompt)
         pause.assert_not_awaited()
 
     async def test_generate_images_via_ui_uploads_partial_flow_agent_outputs(self) -> None:

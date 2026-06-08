@@ -144,7 +144,13 @@ class FlowWebService:
     FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12
     FLOW_AGENT_TARGET_OUTPUT_COUNT = 12
     FLOW_AGENT_MAX_IMAGES_PER_RUN = 12
+    BANNER_VISIBLE_WALL_HOOK_RULE = (
+        "Wall-hanging banner shots must show a clearly visible wall hook, nail, or peg above the dowel, "
+        "with the rope/cord visibly hanging from that support; do not crop it out, hide it behind the dowel, "
+        "or let the banner float unsupported."
+    )
     VISUAL_PRODUCT_RULE_MIN_CONFIDENCE = 0.7
+    VISUAL_PRODUCT_RULE_MIN_INFERRED_CONFIDENCE = 0.5
     FLOW_AGENT_BATCH_PAUSE_MIN_S = 60
     FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
@@ -285,6 +291,9 @@ class FlowWebService:
         self._trello_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
+        )
+        self._flow_profile_agent_retry_error_counts: Dict[str, int] = self._valid_flow_profile_agent_retry_counts(
+            self.store.snapshot().flow_profile_agent_retry_error_counts
         )
 
     async def close(self) -> None:
@@ -2871,6 +2880,21 @@ class FlowWebService:
         normalized = self._strip_accents(str(detail or "")).lower()
         return "chua tim thay card" in normalized or "khong tim thay card" in normalized
 
+    def _auto_trello_should_stop_on_child_error(self, detail: str) -> bool:
+        normalized = self._strip_accents(str(detail or "")).lower()
+        stop_signals = (
+            "chua keo/upload duoc anh trello",
+            "chua keo duoc anh nguon",
+            "chua upload duoc anh trello",
+            "chua xac minh duoc anh nguon",
+            "khong thay attachment moi",
+            "khong dung anh nguon",
+            "request khong co anh goc",
+            "dung truoc khi bam tao",
+            "tat ca chrome profile flow da het quota",
+        )
+        return any(signal in normalized for signal in stop_signals)
+
     async def reset_ready_trello_outputs(self, request: ResetReadyTrelloRequest) -> Dict[str, Any]:
         key, token = self._trello_credentials()
         if not key or not token:
@@ -3418,6 +3442,17 @@ class FlowWebService:
                         failed += 1
                         detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
                         await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} bị lỗi: {detail}")
+                        if self._auto_trello_should_stop_on_child_error(detail):
+                            current_batch = self.store.get_job(batch_id)
+                            current_result = dict(current_batch.result or {}) if current_batch is not None else {}
+                            current_result["stop_requested"] = True
+                            current_result["continuous"] = True
+                            current_result["run_until_empty"] = True
+                            await self.store.patch_job(batch_id, result=current_result)
+                            await self.store.append_log(
+                                batch_id,
+                                "Auto AI Trello tự dừng vì lỗi an toàn ảnh nguồn/Flow Agent; app không nhận card mới để tránh reset tab đang chạy hoặc tạo sai ảnh.",
+                            )
 
                     await self._patch_prompt_batch_result(
                         batch_id,
@@ -3643,7 +3678,8 @@ class FlowWebService:
             f"{collage_rule}"
             "For each shot, state the product placement, background, props, lighting, camera angle, and the source details that must stay unchanged. "
             "The attached source image is the authority: keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
-            "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan or Trello description explicitly requests alternate personalized names may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
+            "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan, Trello description, or colorway/multi-color shot requires variants may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
+            f"{self._flow_agent_colorway_text_variant_rule()} "
             "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, tactile fibers, clear stitch direction, crisp edges, and natural thread shadows; never make it flat printed, painted, digital, vinyl, or sticker-like. "
             f"{self._flow_agent_embroidery_clarity_rule()} "
             "Include at least one craft-proof shot with visible thread fibers, raised stitches, needle/hoop/thread context, or close-up tactile texture. "
@@ -3659,6 +3695,13 @@ class FlowWebService:
             "every generated image must be tack-sharp around the embroidered areas, keep the embroidery readable and clearly focused, "
             "show individual thread strands, stitch direction, raised hand-work texture, needlework depth, and linen/fabric weave, "
             "and make the hand-embroidery technique obvious rather than soft, blurry, smeared, printed, or machine-flat."
+        )
+
+    def _flow_agent_colorway_text_variant_rule(self) -> str:
+        return (
+            "Colorway text/name rule: when a planned multi-color or colorway shot shows multiple product variants and the source product has a visible embroidered/personalized name, initials, date, word, or readable stitched text, "
+            "each differently colored product variant must use a different plausible name/text while keeping the same lettering placement, scale, thread style, and stitch quality; never repeat the exact same readable name/text across all color variants. "
+            "If the source product has no visible readable name/text, keep all color variants textless and do not invent new writing."
         )
 
     def _flow_agent_no_tag_label_rule(self) -> str:
@@ -9470,6 +9513,175 @@ exit 1
                     return key
         return ""
 
+    def _flow_operator_product_rule_key_from_visual_text(self, text: str) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        explicit_rule_key = self._flow_operator_product_rule_key_from_text(raw)
+        if explicit_rule_key:
+            return explicit_rule_key
+
+        normalized = self._normalize_skill_token(raw)
+        compact = self._compact_match_text(raw)
+        tokens = set(self._tokenize_match_words(raw))
+
+        def has_term(term: str) -> bool:
+            term_raw = str(term or "").strip()
+            if not term_raw:
+                return False
+            term_normalized = self._normalize_skill_token(term_raw)
+            term_compact = self._compact_match_text(term_raw)
+            term_tokens = set(self._tokenize_match_words(term_raw))
+            if len(term_tokens) == 1 and term_normalized in tokens:
+                return True
+            if term_normalized and term_normalized in normalized:
+                return True
+            return bool(term_compact and len(term_compact) >= 5 and term_compact in compact)
+
+        signatures: Dict[str, Dict[str, tuple[str, ...]]] = {
+            "wedding_pillowcase": {
+                "main": ("pillow", "pillowcase", "cushion", "cushion cover", "soft square"),
+                "context": ("wedding", "bride", "groom", "couple", "romantic", "keepsake", "anniversary"),
+                "exclude": ("ring bearer", "wedding rings", "ring holder", "vow book", "guest book"),
+            },
+            "baby_pillowcase": {
+                "main": ("pillow", "pillowcase", "cushion", "cushion cover", "soft rectangular", "soft square"),
+                "context": ("baby", "nursery", "child", "children", "kid", "toddler", "infant", "crib", "name embroidery"),
+                "exclude": ("wedding", "bride", "groom", "ring bearer", "wedding rings"),
+            },
+            "linen_pillowcase": {
+                "main": ("pillow", "pillowcase", "cushion", "cushion cover", "rectangular cushion"),
+                "context": ("linen", "home decor", "sofa", "bedroom", "fabric weave", "embroidered cushion"),
+                "exclude": ("baby", "nursery", "wedding", "bride", "groom", "ring bearer"),
+            },
+            "ring_bearer_pillow": {
+                "main": ("pillow", "pillowcase", "cushion", "ring holder", "soft square"),
+                "context": ("ring bearer", "wedding rings", "ring", "rings", "ribbon", "ceremony", "ring attachment"),
+                "exclude": ("guest book", "vow book"),
+            },
+            "hoops_with_photos": {
+                "main": ("hoop", "embroidery hoop", "frame", "embroidery frame", "round frame"),
+                "context": ("photo", "portrait", "picture", "image", "baby portrait", "name and date", "date"),
+                "exclude": ("pillow", "cushion", "book", "banner", "dress"),
+            },
+            "wedding_hoop": {
+                "main": ("hoop", "embroidery hoop", "frame", "embroidery frame", "round frame"),
+                "context": ("wedding", "bride", "groom", "couple", "floral", "stitched names", "anniversary"),
+                "exclude": ("photo", "portrait", "pillow", "cushion", "book", "banner", "dress"),
+            },
+            "bride_handkerchief": {
+                "main": ("handkerchief", "hanky", "cloth square", "fabric square", "folded cloth", "soft cloth"),
+                "context": ("bride", "bridal", "wedding", "lace edge", "embroidered message", "keepsake"),
+                "exclude": ("pillow", "cushion", "book", "ribbon", "banner"),
+            },
+            "vows_book": {
+                "main": ("book", "booklet", "notebook", "fabric cover", "covered booklet"),
+                "context": ("vow", "vows", "personal vows", "bride vows", "groom vows", "wedding promise"),
+                "exclude": ("guest", "sign in", "signature", "album", "pillow", "cushion"),
+            },
+            "guest_book": {
+                "main": ("book", "album", "notebook", "fabric cover", "covered book"),
+                "context": (
+                    "guest",
+                    "guests",
+                    "guestbook",
+                    "sign in",
+                    "signature",
+                    "wedding guests",
+                    "registry",
+                    "photo album",
+                    "wedding album",
+                    "wedding photo album",
+                    "scrapbook",
+                    "memory book",
+                    "keepsake album",
+                ),
+                "exclude": ("vow", "vows", "pillow", "cushion"),
+            },
+            "bouquet_ribbon": {
+                "main": ("ribbon", "fabric strip", "long strip", "sash", "streamer"),
+                "context": ("bouquet", "bridal bouquet", "wedding", "stitched lettering", "embroidered message", "draped"),
+                "exclude": ("book", "pillow", "cushion", "banner", "dress"),
+            },
+            "drawstring_bag": {
+                "main": (
+                    "drawstring bag",
+                    "drawstring pouch",
+                    "linen pouch",
+                    "cotton pouch",
+                    "fabric pouch",
+                    "fabric bag",
+                    "linen bag",
+                    "small pouch",
+                    "jewelry pouch",
+                ),
+                "context": (
+                    "drawstring",
+                    "cord",
+                    "rope cord",
+                    "cotton cord",
+                    "knotted cord",
+                    "gathered top",
+                    "cinched top",
+                    "pouch opening",
+                    "linen",
+                    "cotton linen",
+                    "embroidered",
+                    "hand embroidered",
+                    "jewelry",
+                    "spice",
+                    "gift pouch",
+                ),
+                "exclude": ("book", "album", "pillow", "cushion", "banner", "hoop", "dress", "shirt", "crown", "cross", "plush"),
+            },
+            "banner": {
+                "main": ("banner", "pennant", "flag", "wall hanging", "fabric panel", "hanging panel"),
+                "context": ("dowel", "rod", "cord hanger", "rope hanger", "pointed v", "v bottom", "triangular", "nursery wall"),
+                "exclude": ("pillow", "cushion", "book", "hoop", "dress"),
+            },
+            "crown": {
+                "main": ("crown", "fabric crown", "linen crown", "birthday crown", "party crown", "baby crown", "wearable crown", "crown headband", "crown hat", "pom-pom crown", "pompom crown"),
+                "context": ("birthday", "party", "cake", "pom-pom", "pompom", "felt ball", "pointed", "points", "wearing", "head", "child", "baby", "linen", "embroidered"),
+                "exclude": ("cross", "crucifix", "banner", "pennant", "wall hanging", "dowel", "rod", "pillow", "cushion", "book", "dress", "hoop"),
+            },
+            "fabric_cross": {
+                "main": ("cross", "religious cross", "crucifix", "soft cross", "cross keepsake"),
+                "context": ("fabric", "linen", "stitched edge", "embroidered name", "baby keepsake", "soft sewn"),
+                "exclude": ("pillow", "cushion", "book", "banner", "hoop", "crown", "pom-pom", "pompom"),
+            },
+            "dress_baby": {
+                "main": ("dress", "dresses", "frock", "sundress", "pinafore", "garment"),
+                "context": ("baby", "child", "children", "kid", "kids", "toddler", "infant", "girl", "linen", "bodice", "ruffle", "flutter", "sleeve", "sleeveless", "skirt", "waist", "hanger"),
+                "exclude": ("pillow", "pillowcase", "cushion", "banner", "flag", "hoop", "book", "ribbon", "plush", "shirt"),
+            },
+            "plush": {
+                "main": ("plush", "stuffed animal", "stuffed toy", "soft toy", "teddy", "bear", "doll toy"),
+                "context": ("fabric pile", "stuffing", "stitched face", "seams", "cuddly", "toy", "embroidered name"),
+                "exclude": ("pillow", "cushion", "book", "banner", "dress"),
+            },
+        }
+
+        best_key = ""
+        best_score = 0
+        best_priority = len(PRODUCT_SHOT_RULE_PRIORITY)
+        for priority, key in enumerate(PRODUCT_SHOT_RULE_PRIORITY):
+            signature = signatures.get(key)
+            if not signature:
+                continue
+            main_hits = sum(1 for term in signature.get("main", ()) if has_term(term))
+            if main_hits <= 0:
+                continue
+            context_hits = sum(1 for term in signature.get("context", ()) if has_term(term))
+            exclude_hits = sum(1 for term in signature.get("exclude", ()) if has_term(term))
+            score = (main_hits * 5) + (context_hits * 2) - (exclude_hits * 6)
+            if context_hits <= 0:
+                score -= 3
+            if score > best_score or (score == best_score and score > 0 and priority < best_priority):
+                best_key = key
+                best_score = score
+                best_priority = priority
+        return best_key if best_score >= 5 else ""
+
     def _flow_operator_card_visual_product_rule_key(self, card: Dict[str, Any]) -> str:
         raw = str(
             card.get("_visual_product_rule_key")
@@ -9489,7 +9701,12 @@ exit 1
                 confidence = 0.0
             if confidence > 1.0 and confidence <= 100.0:
                 confidence = confidence / 100.0
-            if confidence < self.VISUAL_PRODUCT_RULE_MIN_CONFIDENCE:
+            min_confidence = (
+                self.VISUAL_PRODUCT_RULE_MIN_INFERRED_CONFIDENCE
+                if card.get("_visual_product_rule_inferred")
+                else self.VISUAL_PRODUCT_RULE_MIN_CONFIDENCE
+            )
+            if confidence < min_confidence:
                 return ""
         return rule_key
 
@@ -9539,19 +9756,36 @@ exit 1
 
         normalized_key = self._normalize_skill_token(raw_key)
         if normalized_key in {"", "none", "unknown", "unclear", "no_match", "nomatch", "other"}:
-            rule_key = ""
+            candidate_text = " ".join([visible_product, reason]).strip()
+            rule_key = self._flow_operator_product_rule_key_from_visual_text(candidate_text)
+            inferred_from_visual_text = bool(rule_key)
         else:
             candidate_text = " ".join([raw_key, visible_product, reason]).strip()
-            rule_key = raw_key if raw_key in PRODUCT_SHOT_RULES else self._flow_operator_product_rule_key_from_text(candidate_text)
-            if rule_key not in PRODUCT_SHOT_RULES:
-                rule_key = ""
-        if confidence < self.VISUAL_PRODUCT_RULE_MIN_CONFIDENCE:
+            visual_text_rule_key = self._flow_operator_product_rule_key_from_visual_text(candidate_text)
+            if raw_key in PRODUCT_SHOT_RULES:
+                rule_key = raw_key
+                inferred_from_visual_text = False
+                if raw_key == "fabric_cross" and visual_text_rule_key == "crown":
+                    rule_key = "crown"
+                    inferred_from_visual_text = True
+            else:
+                rule_key = visual_text_rule_key
+                if rule_key not in PRODUCT_SHOT_RULES:
+                    rule_key = ""
+                inferred_from_visual_text = bool(rule_key)
+        min_confidence = (
+            self.VISUAL_PRODUCT_RULE_MIN_INFERRED_CONFIDENCE
+            if inferred_from_visual_text
+            else self.VISUAL_PRODUCT_RULE_MIN_CONFIDENCE
+        )
+        if confidence < min_confidence:
             rule_key = ""
         return {
             "product_rule_key": rule_key,
             "confidence": confidence,
             "visible_product": visible_product,
             "reason": reason,
+            "inferred_from_visual_text": inferred_from_visual_text,
         }
 
     def _gemini_classify_trello_source_product_rule(
@@ -9683,6 +9917,7 @@ exit 1
                 "_visual_product_rule_confidence": parsed.get("confidence") or 0.0,
                 "_visual_product_rule_visible_product": parsed.get("visible_product") or "",
                 "_visual_product_rule_reason": parsed.get("reason") or "",
+                "_visual_product_rule_inferred": bool(parsed.get("inferred_from_visual_text")),
             }
         except Exception as exc:
             metadata = {
@@ -9690,13 +9925,50 @@ exit 1
                 "_visual_product_rule_confidence": 0.0,
                 "_visual_product_rule_visible_product": "",
                 "_visual_product_rule_reason": "",
+                "_visual_product_rule_inferred": False,
                 "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
             }
         self._trello_visual_product_rule_cache[cache_key] = metadata
         card.update(metadata)
 
+    def _flow_operator_banner_wall_hook_rule_for_shot(self, product_key: str, *parts: str) -> str:
+        if str(product_key or "").strip() != "banner":
+            return ""
+        text = " ".join(str(part or "").lower() for part in parts)
+        non_wall_terms = (
+            "table",
+            "tabletop",
+            "flat lay",
+            "gift",
+            "box",
+            "folded",
+            "collage",
+            "close-up",
+            "macro",
+            "process",
+            "embroidering",
+            "craft table",
+            "round embroidery hoop",
+        )
+        if any(term in text for term in non_wall_terms):
+            return ""
+        wall_terms = (
+            "hanging",
+            "hung",
+            "wall",
+            "treo",
+            "nursery",
+            "crib",
+            "headboard",
+            "baby room",
+        )
+        if any(term in text for term in wall_terms):
+            return self.BANNER_VISIBLE_WALL_HOOK_RULE
+        return ""
+
     def _flow_operator_product_rule_shot_suite(self, product_key: str) -> List[Dict[str, str]]:
-        suite = PRODUCT_SHOT_RULES.get(str(product_key or "").strip())
+        product_key = str(product_key or "").strip()
+        suite = PRODUCT_SHOT_RULES.get(product_key)
         if not suite:
             return []
         display_name = str(suite.get("display_name") or product_key).strip()
@@ -9711,11 +9983,13 @@ exit 1
             if len(raw_shot) < 3:
                 continue
             kind, title, concept = (str(item or "").strip() for item in raw_shot[:3])
+            banner_hook_rule = self._flow_operator_banner_wall_hook_rule_for_shot(product_key, kind, title, concept)
+            banner_hook_text = f"{banner_hook_rule} " if banner_hook_rule else ""
             label_bits = [display_name, f"image {index}", title or kind]
             shots.append(
                 {
                     "label": " ".join(part for part in label_bits if part),
-                    "brief": f"{concept}. {suffix}",
+                    "brief": f"{concept}. {banner_hook_text}{suffix}",
                     "must_include": f"{display_name}, {kind}, exact source product identity",
                 }
             )
@@ -9820,6 +10094,43 @@ exit 1
             + "; ".join(product_bits)
             + ". Keep those design features consistent across the whole image set."
             + source_hint
+        )
+
+    def _flow_operator_missing_product_rule_detail(self, card: Dict[str, Any], signals: Dict[str, Any]) -> str:
+        card_name = str(signals.get("card_name") or card.get("name") or "").strip()
+        card_url = str(signals.get("card_url") or card.get("url") or "").strip()
+        attachment_names = str(signals.get("attachment_names") or "").strip()
+        visual_error = str(card.get("_visual_product_rule_error") or "").strip()
+        if visual_error:
+            reason = f"Visual classification failed: {visual_error}"
+        elif not self._gemini_api_key():
+            reason = "Gemini visual classification is not configured."
+        elif not self._trello_credentials()[0] or not self._trello_credentials()[1]:
+            reason = "Trello credentials are missing, so the source image could not be downloaded for visual classification."
+        else:
+            reason = "Gemini did not classify the source image into a known HAVI product rule with enough confidence."
+        source = ", ".join(part for part in (card_name, attachment_names, card_url) if part) or "unknown Trello card"
+        return (
+            "Auto AI Trello chua xac dinh duoc HAVI product shot rule cho anh nguon, "
+            "nen app da dung truoc khi gui Flow Agent de tranh tao bo anh sai rule. "
+            f"Nguon: {source}. {reason}"
+        )
+
+    def _flow_operator_has_product_rule_or_category_signal(self, signals: Dict[str, Any]) -> bool:
+        if str(signals.get("product_rule_key") or "").strip():
+            return True
+        return any(
+            bool(signals.get(key))
+            for key in (
+                "is_apron",
+                "is_pennant",
+                "is_doll",
+                "is_plush",
+                "is_hoop",
+                "is_pillowcase",
+                "is_child_shirt",
+                "is_shirt",
+            )
         )
 
     def _flow_operator_colorway_variant_shots(self, product_label: str = "product") -> List[Dict[str, str]]:
@@ -9947,25 +10258,28 @@ exit 1
 
     def _flow_operator_pennant_colorway_variant_shots(self) -> List[Dict[str, str]]:
         palette = "ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow"
+        wall_hook_rule = self.BANNER_VISIBLE_WALL_HOOK_RULE
         return [
             {
                 "label": "Pennant fabric colorway lineup",
                 "brief": (
                     f"Clean white-daylight ecommerce lineup showing three to four embroidered pennant/banner wall hangings in {palette}. "
                     "Every variant must stay a flat hanging pennant with the same top dowel/rod, cord hanger, straight side seams, pointed V bottom, motif placement, stitch texture, and wall-hanging scale. "
+                    f"{wall_hook_rule} "
                     "Only if the source image visibly contains an embroidered/personalized name, use a different plausible embroidered name on each pennant while preserving the same lettering style; otherwise keep every pennant nameless. "
                     "Do not turn any variant into a pillow, cushion, blanket, hoop, shirt, or framed print."
                 ),
-                "must_include": "multiple pennant/banner wall hangings, pastel fabric colors, same dowel cord and V bottom, different names only if source has a name, no pillow or cushion product",
+                "must_include": "multiple pennant/banner wall hangings, visible wall hooks, pastel fabric colors, same dowel cord and V bottom, different names only if source has a name, no pillow or cushion product",
             },
             {
                 "label": "Nursery wall colorway trio",
                 "brief": (
                     "Bright white nursery wall or shelf display with three coordinated pennant/banner color options hanging from small dowels. "
                     "Keep the banner flat, thin, and wall-mounted; preserve the source motif/name style and embroidery texture. "
+                    f"{wall_hook_rule} "
                     "Pillows, toys, shelves, or blankets may appear only as plain background props and must not carry the source design."
                 ),
-                "must_include": "pennants hanging on wall, three pastel variants, same source motif/name style, clean white daylight, props without copied embroidery",
+                "must_include": "pennants hanging on wall, clearly visible wall hooks, three pastel variants, same source motif/name style, clean white daylight, props without copied embroidery",
             },
             {
                 "label": "Pennant material swatch flat lay",
@@ -9980,9 +10294,10 @@ exit 1
                 "brief": (
                     "Polished ecommerce display with four real pennant/banner wall hanging options arranged naturally as separate hanging fabric flags, not a collage. "
                     "Preserve the source product construction, thin fabric panel, dowel, cord hanger, pointed bottom, embroidery motif, and handmade stitch quality while varying fabric color. "
+                    f"{wall_hook_rule} "
                     "Never place the source motif or name onto a pillow, cushion, blanket, tote, shirt, hoop, or other product."
                 ),
-                "must_include": "four pennant options, same construction, pastel color options, wall hanging product only, no design transferred to other products",
+                "must_include": "four pennant options, visible wall hooks, same construction, pastel color options, wall hanging product only, no design transferred to other products",
             },
         ]
 
@@ -10059,30 +10374,35 @@ exit 1
                 "Use different embroidered names only if the source image visibly contains an embroidered/personalized name; preserve the same lettering style and thread colors. "
                 "If the source has no name, keep every pennant nameless."
             )
+            wall_hook_rule = self.BANNER_VISIBLE_WALL_HOOK_RULE
+            conditional_wall_hook_rule = f"If the pennant/banner is wall-hung or suspended in this shot, {wall_hook_rule}"
             return [
                 {
                     "label": "Pennant image 1 baby room flag scene",
                     "brief": (
                         "One single pennant/banner hanging in a bright airy baby room, near a crib corner or baby headboard wall, with a small teddy bear and soft blanket as secondary decor. "
+                        f"{wall_hook_rule} "
                         f"{exact_pennant_lock}"
                     ),
-                    "must_include": "one single pennant, crib or baby headboard wall, small teddy bear, soft blanket, exact reference design, white daylight",
+                    "must_include": "one single pennant, crib or baby headboard wall, clearly visible wall hook, small teddy bear, soft blanket, exact reference design, white daylight",
                 },
                 {
                     "label": "Pennant image 2 alternate nursery corner",
                     "brief": (
                         "One single pennant/banner in a different baby setting such as a fabric baby tent, cozy reading corner, or nursery nook with tasteful decor and natural white daylight. "
+                        f"{wall_hook_rule} "
                         f"{exact_pennant_lock}"
                     ),
-                    "must_include": "one single pennant, alternate baby tent or reading corner scene, natural clean white light, exact reference shape and embroidery",
+                    "must_include": "one single pennant, visible wall hook or peg, alternate baby tent or reading corner scene, natural clean white light, exact reference shape and embroidery",
                 },
                 {
                     "label": "Pennant image 3 two hanging color variants",
                     "brief": (
                         "Two pennant/banners hanging together on a beautiful nursery wall. Both must use the same construction, embroidery layout, motif placement, dowel, cord, V bottom, and handmade stitch quality as the reference; change only the embroidered name when allowed and the linen base fabric color. "
+                        f"{wall_hook_rule} "
                         f"{multi_name_rule} Keep all motif/name/heart thread colors the same as the reference. {exact_pennant_lock}"
                     ),
-                    "must_include": "two hanging pennants, different base fabric colors, different names only if source has a name, same thread colors, no pillow/cushion",
+                    "must_include": "two hanging pennants, clearly visible wall hooks, different base fabric colors, different names only if source has a name, same thread colors, no pillow/cushion",
                 },
                 {
                     "label": "Pennant image 4 two tabletop color variants",
@@ -10096,17 +10416,19 @@ exit 1
                     "label": "Pennant image 5 three nursery color variants",
                     "brief": (
                         "Three pennant/banners hanging together in a bright baby room. All three must keep the same reference style, same embroidery composition, same thread colors for the name and motif/heart details, same dowel/cord/V-bottom construction, and only vary the linen base color and embroidered name when allowed. "
+                        f"{wall_hook_rule} "
                         f"{multi_name_rule} {exact_pennant_lock}"
                     ),
-                    "must_include": "three hanging pennants, nursery room, different base fabric colors, same thread colors, different names only if source has a name",
+                    "must_include": "three hanging pennants, clearly visible wall hooks, nursery room, different base fabric colors, same thread colors, different names only if source has a name",
                 },
                 {
                     "label": "Pennant image 6 four nursery color variants",
                     "brief": (
                         "Four pennant/banners hanging together in a bright airy baby room. Every pennant must be the same physical product form as the reference with top dowel, rope hanger, pointed V bottom, same embroidery layout, and same thread colors; vary only linen base color and embroidered names when allowed. "
+                        f"{wall_hook_rule} "
                         f"{multi_name_rule} {exact_pennant_lock}"
                     ),
-                    "must_include": "four hanging pennants, pastel base fabric variety, same construction and embroidery layout, different names only if source has a name",
+                    "must_include": "four hanging pennants, clearly visible wall hooks, pastel base fabric variety, same construction and embroidery layout, different names only if source has a name",
                 },
                 {
                     "label": "Pennant image 7 four-panel embroidery close-up collage",
@@ -10130,25 +10452,28 @@ exit 1
                     "label": "Pennant image 9 mother and baby touch embroidery",
                     "brief": (
                         "Mother and baby gently touching the embroidered motif on the pennant. The pennant may be hanging or lightly held by the mother so the baby can touch the raised stitches. Use a bright airy baby room that feels warm but still white, clean, and spacious. "
+                        f"{conditional_wall_hook_rule} "
                         f"{exact_pennant_lock}"
                     ),
-                    "must_include": "mother and baby hands, baby touching embroidery, pennant hanging or held, bright airy nursery, motif visible and unchanged",
+                    "must_include": "mother and baby hands, baby touching embroidery, pennant hanging or held, visible wall hook if hanging, bright airy nursery, motif visible and unchanged",
                 },
                 {
                     "label": "Pennant image 10 two babies touch two pennants",
                     "brief": (
                         "Two babies interacting with two pennant/banners and touching the embroidery; do not show their faces. The two flags must have different embroidered names only if the source visibly has a name, while keeping the exact same embroidery style, thread colors, product shape, dowel, rope hanger, and V bottom. "
+                        f"{conditional_wall_hook_rule} "
                         f"{multi_name_rule} {exact_pennant_lock}"
                     ),
-                    "must_include": "two babies, faces not visible, two pennants, touch embroidery, different names only if source has a name, same thread colors",
+                    "must_include": "two babies, faces not visible, two pennants, touch embroidery, visible wall hooks if hanging, different names only if source has a name, same thread colors",
                 },
                 {
                     "label": "Pennant image 11 sleeping baby room scene",
                     "brief": (
                         "A baby sleeping in a calm baby room with the pennant clearly visible near the crib or on the wall above/near the headboard. The composition must show the flag clearly and harmoniously within the sleep space, using soft clean white airy light. "
+                        f"{wall_hook_rule} "
                         f"{exact_pennant_lock}"
                     ),
-                    "must_include": "sleeping baby, pennant near crib or headboard wall, flag clear and visible, soft clean white light",
+                    "must_include": "sleeping baby, pennant near crib or headboard wall, clearly visible wall hook, flag clear and visible, soft clean white light",
                 },
                 {
                     "label": "Pennant image 12 flat gift box presentation",
@@ -10468,7 +10793,7 @@ exit 1
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
                 "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, drawstring bag, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
@@ -10476,11 +10801,13 @@ exit 1
                 "HAVI product shot rule lock: "
                 f"{str(product_rule.get('display_name') or product_rule_key)} uses the fixed shot plan imported from HAVI_Shot_Types_All_Products.xlsx. "
                 f"{str(product_rule.get('lock') or '').strip()}. "
+                f"{('For any wall-hanging banner output, ' + self.BANNER_VISIBLE_WALL_HOOK_RULE + ' ') if product_rule_key == 'banner' else ''}"
                 "The product may be styled in the listed scenes, but the product category, construction, material, embroidery/print layout, proportions, and premium handmade identity must not change."
             ) if product_rule and not signals.get("is_apron") else "",
             (
                 "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
                 "Every main generated product must remain a pennant/banner with a top dowel or rod, cord/string hanger, straight side seams, pointed V bottom, flat linen/fabric panel, and the same embroidery layout. "
+                f"For any wall-hanging banner output, {self.BANNER_VISIBLE_WALL_HOOK_RULE} "
                 "Never create a pillow/cushion/blanket/shirt/hoop version of this design, and never place the source motif or name onto a pillow/cushion/blanket/shirt/hoop. "
                 "If a nursery scene includes a pillow, cushion, toy, blanket, or fabric swatch, it must be a plain prop without the source embroidery/design. "
                 "For the required process shot only, a round embroidery hoop is allowed as a temporary tool holding the pennant fabric while a person stitches it; it must not become a finished hoop product."
@@ -10499,10 +10826,13 @@ exit 1
                 "Treat the Trello description as user-supplied product guidance for customization, product identity, style, scene restrictions, and do/don't rules; "
                 "preserving the source product and avoiding tags, stickers, labels, barcodes, and price tags remain higher-priority constraints."
             ) if card_description_note else "",
-            self._flow_agent_reference_prompt_style_guide(target_count, allow_detail_collage=bool(signals.get("is_pennant"))),
+            self._flow_agent_reference_prompt_style_guide(
+                target_count,
+                allow_detail_collage=bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag"}),
+            ),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is apparel, it must remain the same apparel form.",
+            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is apparel, it must remain the same apparel form.",
             (
                 "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
                 if signals.get("is_pennant")
@@ -10539,6 +10869,7 @@ exit 1
                 else:
                     return []
         expanded: List[Dict[str, Any]] = []
+        missing_rule_errors: List[str] = []
         for card in matched_cards:
             if len(expanded) >= max_items:
                 break
@@ -10550,6 +10881,10 @@ exit 1
             card_url = str(card.get("url") or "").strip()
             selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
             self._flow_operator_enrich_card_with_visual_product_rule(request, card)
+            signals = self._flow_operator_card_product_signals(request, card)
+            if not self._flow_operator_has_product_rule_or_category_signal(signals):
+                missing_rule_errors.append(self._flow_operator_missing_product_rule_detail(card, signals))
+                continue
             existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
             rerun_full_set = existing_flow_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT
             image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT if rerun_full_set else max(1, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - existing_flow_count)
@@ -10602,6 +10937,8 @@ exit 1
                     "generated_by_flow_agent": True,
                 }
             )
+        if not expanded and missing_rule_errors:
+            raise RuntimeError(missing_rule_errors[0])
         return expanded
 
     def _trello_query_aliases(self, query: str) -> List[str]:
@@ -12052,7 +12389,9 @@ exit 1
                             workflow_id=resolved_workflow_id,
                             timeout_s=effective_timeout_s,
                         )
-                        return await fn(client)
+                        result = await fn(client)
+                        await self._reset_flow_profile_agent_try_again_errors(profile)
+                        return result
                     except HTTPException:
                         raise
                     except Exception as exc:
@@ -12064,6 +12403,24 @@ exit 1
                                 self._active_flow_profile_index = next_profile.index
                                 continue
                             raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail()) from exc
+                        if self._is_flow_agent_try_again_error(exc):
+                            count = await self._record_flow_profile_agent_try_again_error(profile, exc)
+                            threshold = self._flow_agent_try_again_threshold()
+                            if count >= threshold:
+                                last_quota_error = exc
+                                await self._mark_flow_profile_quota_limited(profile, exc)
+                                next_profile = self._next_available_flow_profile(profile)
+                                if next_profile is not None:
+                                    self._active_flow_profile_index = next_profile.index
+                                    continue
+                                raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail()) from exc
+                            raise HTTPException(
+                                status_code=self._flow_error_status(exc),
+                                detail=(
+                                    f"{self._flow_error_detail(exc)} "
+                                    f"(Flow Agent retry error {count}/{threshold} trên {profile.label}; đủ {threshold} lần liên tiếp sẽ đổi acc.)"
+                                ),
+                            ) from exc
                         if self._is_browser_closed_error(exc):
                             await self._close_shared_browser()
                         raise HTTPException(
@@ -12238,6 +12595,16 @@ exit 1
         except ValueError:
             return 24.0 * 60.0 * 60.0
 
+    def _flow_agent_try_again_threshold(self) -> int:
+        raw = (
+            os.getenv("FLOW_AGENT_TRY_AGAIN_SWITCH_THRESHOLD", "").strip()
+            or os.getenv("FLOW_CHROME_PROFILE_TRY_AGAIN_SWITCH_THRESHOLD", "").strip()
+        )
+        try:
+            return max(1, min(100, int(raw))) if raw else 10
+        except ValueError:
+            return 10
+
     def _valid_flow_profile_quota_blocks(self, blocks: Dict[str, float] | None) -> Dict[str, float]:
         now = time.time()
         valid: Dict[str, float] = {}
@@ -12251,6 +12618,20 @@ exit 1
                 continue
             if blocked_until > now:
                 valid[safe_key] = blocked_until
+        return valid
+
+    def _valid_flow_profile_agent_retry_counts(self, counts: Dict[str, int] | None) -> Dict[str, int]:
+        valid: Dict[str, int] = {}
+        for key, value in (counts or {}).items():
+            safe_key = str(key or "").strip().lower()
+            if not safe_key:
+                continue
+            try:
+                count = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                valid[safe_key] = count
         return valid
 
     def _flow_profiles_all_quota_blocked_detail(self) -> str:
@@ -12313,16 +12694,67 @@ exit 1
             or ("daily quota" in detail and "agent" in detail)
         )
 
+    def _flow_agent_error_match_text(self, value: Exception | str) -> str:
+        detail = self._strip_accents(str(value or "")).lower()
+        detail = detail.replace("đ", "d").replace("Đ", "d")
+        return re.sub(r"\s+", " ", detail).strip()
+
+    def _is_flow_agent_try_again_error(self, exc: Exception | str) -> bool:
+        compact = self._flow_agent_error_match_text(exc)
+        return (
+            ("xay ra loi" in compact and "thu lai" in compact)
+            or ("da xay ra loi" in compact and "hay thu lai" in compact)
+            or ("an error occurred" in compact and "try again" in compact)
+            or ("something went wrong" in compact and "try again" in compact)
+        )
+
     async def _mark_flow_profile_quota_limited(self, profile: FlowBrowserProfile, exc: Exception) -> None:
         self._flow_profile_quota_blocked_until = self._valid_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
         self._flow_profile_quota_blocked_until[profile.key] = time.time() + self._flow_profile_block_seconds()
         await self.store.replace_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
+        self._flow_profile_agent_retry_error_counts.pop(profile.key, None)
+        await self.store.replace_flow_profile_agent_retry_error_counts(self._flow_profile_agent_retry_error_counts)
         if self._shared_browser_profile_key == profile.key:
             await self._close_shared_browser()
 
-    async def _raise_flow_agent_quota_if_visible(self, page: Any, *, job_id: str = "") -> None:
+    async def _record_flow_profile_agent_try_again_error(self, profile: FlowBrowserProfile, exc: Exception | str) -> int:
+        self._flow_profile_agent_retry_error_counts = self._valid_flow_profile_agent_retry_counts(
+            self._flow_profile_agent_retry_error_counts
+        )
+        next_count = int(self._flow_profile_agent_retry_error_counts.get(profile.key, 0) or 0) + 1
+        self._flow_profile_agent_retry_error_counts[profile.key] = next_count
+        await self.store.replace_flow_profile_agent_retry_error_counts(self._flow_profile_agent_retry_error_counts)
+        return next_count
+
+    async def _reset_flow_profile_agent_try_again_errors(self, profile: FlowBrowserProfile) -> None:
+        if profile.key not in self._flow_profile_agent_retry_error_counts:
+            return
+        self._flow_profile_agent_retry_error_counts.pop(profile.key, None)
+        await self.store.replace_flow_profile_agent_retry_error_counts(self._flow_profile_agent_retry_error_counts)
+
+    def _same_flow_agent_quota_message(self, left: str, right: str) -> bool:
+        left_norm = re.sub(r"\s+", " ", self._strip_accents(str(left or "")).lower()).strip()
+        right_norm = re.sub(r"\s+", " ", self._strip_accents(str(right or "")).lower()).strip()
+        if not left_norm or not right_norm:
+            return False
+        return left_norm == right_norm or left_norm in right_norm or right_norm in left_norm
+
+    async def _raise_flow_agent_quota_if_visible(
+        self,
+        page: Any,
+        *,
+        job_id: str = "",
+        ignore_message: str = "",
+    ) -> None:
         message = await self._visible_flow_agent_quota_message(page)
         if not message:
+            return
+        if ignore_message and self._same_flow_agent_quota_message(message, ignore_message):
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    "Flow Agent: bỏ qua thông báo quota đã có sẵn trong panel từ trước khi gửi prompt.",
+                )
             return
         if job_id:
             await self.store.append_log(
@@ -12330,6 +12762,25 @@ exit 1
                 f"Flow Agent profile hiện tại đã hết quota: {message[:220]}. App sẽ chuyển sang Chrome profile khác nếu có.",
             )
         raise FlowAgentQuotaError(message)
+
+    async def _raise_flow_agent_try_again_if_visible(
+        self,
+        page: Any,
+        *,
+        job_id: str = "",
+        ignore_message: str = "",
+    ) -> None:
+        message = await self._visible_flow_agent_try_again_message(page)
+        if not message:
+            return
+        if ignore_message and self._same_flow_agent_quota_message(message, ignore_message):
+            return
+        if job_id:
+            await self.store.append_log(
+                job_id,
+                f"Flow Agent báo lỗi thử lại: {message[:220]}. App sẽ đếm lỗi này; đủ {self._flow_agent_try_again_threshold()} lần liên tiếp sẽ đổi acc.",
+            )
+        raise RuntimeError(message)
 
     async def _visible_flow_agent_quota_message(self, page: Any) -> str:
         try:
@@ -12382,6 +12833,61 @@ exit 1
                 preferred.append(line)
         message = " ".join(preferred[:3] or lines[:3]).strip()
         return message[:500] or "Google Flow Agent reported a quota limit."
+
+    async def _visible_flow_agent_try_again_message(self, page: Any) -> str:
+        try:
+            text = await page.evaluate(
+                """
+                () => {
+                  const visible = (node) => {
+                    if (!node || !(node instanceof Element)) return false;
+                    const style = window.getComputedStyle(node);
+                    const rect = node.getBoundingClientRect();
+                    return style.display !== 'none'
+                      && style.visibility !== 'hidden'
+                      && style.opacity !== '0'
+                      && rect.width > 0
+                      && rect.height > 0
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight;
+                  };
+                  const nodes = [...document.querySelectorAll('[role="alert"], [role="status"], button, div, span, p')];
+                  return nodes
+                    .filter(visible)
+                    .map((node) => node.innerText || node.textContent || '')
+                    .filter(Boolean)
+                    .join('\\n');
+                }
+                """
+            )
+        except Exception:
+            return ""
+
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        normalized = self._flow_agent_error_match_text(raw)
+        if not (
+            ("xay ra loi" in normalized and "thu lai" in normalized)
+            or ("da xay ra loi" in normalized and "hay thu lai" in normalized)
+            or ("an error occurred" in normalized and "try again" in normalized)
+            or ("something went wrong" in normalized and "try again" in normalized)
+        ):
+            return ""
+
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        preferred = []
+        for line in lines:
+            line_norm = self._flow_agent_error_match_text(line)
+            if (
+                ("xay ra loi" in line_norm and "thu lai" in line_norm)
+                or ("da xay ra loi" in line_norm and "hay thu lai" in line_norm)
+                or ("an error occurred" in line_norm and "try again" in line_norm)
+                or ("something went wrong" in line_norm and "try again" in line_norm)
+            ):
+                preferred.append(line)
+        message = " ".join(preferred[:2] or lines[:2]).strip()
+        return message[:500] or "Flow Agent: Đã xảy ra lỗi. Hãy thử lại."
 
     async def _close_shared_browser(self) -> None:
         browser = self._shared_browser
@@ -16946,7 +17452,8 @@ exit 1
                 "label": "pastel fabric colorway lineup image",
                 "brief": (
                     "Make a clean white-daylight lineup of coordinated fabric colorways inspired by the supplied examples: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow. "
-                    "Show real product variants side by side only as the same physical product form as the source, preserving the source silhouette, construction, motif, embroidery/print style, fabric texture, and product shape."
+                    "Show real product variants side by side only as the same physical product form as the source, preserving the source silhouette, construction, motif, embroidery/print style, fabric texture, and product shape. "
+                    "If the variants show embroidered names or readable stitched text, each color must use different plausible text/name while preserving the same lettering style."
                 ),
                 "must_not": "Do not make a collage, grid, label card, price tag, unrelated color palette board, or derivative product such as shirts from a pillow source.",
             },
@@ -16954,7 +17461,8 @@ exit 1
                 "label": "white nursery color variation image",
                 "brief": (
                     "Make a bright white nursery, shelf, crib, or clean home scene with several soft pastel fabric variants displayed naturally. "
-                    "Use crisp white balanced daylight only, no yellow cast, and keep the exact source product object type and construction visually consistent."
+                    "Use crisp white balanced daylight only, no yellow cast, and keep the exact source product object type and construction visually consistent. "
+                    "If readable embroidered text appears on the color variants, do not repeat the same text/name on every color."
                 ),
                 "must_not": "Do not use warm golden light, beige color grading, dark shadows, a repeated hero composition, or source embroidery copied onto another product type.",
             },
@@ -16970,7 +17478,8 @@ exit 1
                 "label": "four color option ecommerce image",
                 "brief": (
                     "Make a polished ecommerce display with four natural product color options arranged as real objects, not a contact sheet. "
-                    "Use pastel fabric variety like the examples while preserving the exact source product form, source design quality, and handmade construction."
+                    "Use pastel fabric variety like the examples while preserving the exact source product form, source design quality, and handmade construction. "
+                    "If these options include embroidered names or readable stitched words, every color option must use a different plausible name/text."
                 ),
                 "must_not": "Do not create a multi-panel grid, do not change the product category, do not move the motif onto apparel/pillow/banner/hoop unless source is that type, and do not add any tag or sale badge.",
             },
@@ -16992,22 +17501,25 @@ exit 1
         )
         base = str(prompt or "").strip()
         has_base_shot_plan = "Required shot plan:" in base
-        allows_four_panel_detail_collage = bool(
-            re.search(r"(?:image|shot)\s*7[^.]{0,220}(?:four-panel|four close-up|4 close-up|collage)", base, re.IGNORECASE)
-            or re.search(r"(?:four-panel|four close-up|4 close-up)[^.]{0,220}(?:image|shot)\s*7", base, re.IGNORECASE)
+        detail_collage_match = (
+            re.search(r"(?:image|shot)\s*(\d+)[^.]{0,260}(?:four-panel|four close-up|4 close-up|collage)", base, re.IGNORECASE)
+            or re.search(r"(?:four-panel|four close-up|4 close-up)[^.]{0,260}(?:image|shot)\s*(\d+)", base, re.IGNORECASE)
         )
+        detail_collage_number = str(detail_collage_match.group(1)) if detail_collage_match else ""
+        allows_four_panel_detail_collage = bool(detail_collage_match)
+        detail_collage_label = f"image {detail_collage_number}" if detail_collage_number else "the explicitly planned close-up detail image"
         separate_output_rule = (
-            "Each requested output must be its own separate 1:1 square image file. The explicitly planned image 7 may be one 1:1 four-panel close-up collage; every other output must not be panels inside one canvas. "
+            f"Each requested output must be its own separate 1:1 square image file. The explicitly planned {detail_collage_label} may be one 1:1 four-panel close-up collage; every other output must not be panels inside one canvas. "
             if allows_four_panel_detail_collage
             else "Each output must be its own separate 1:1 square image file, not landscape, not portrait, not panels inside one canvas. "
         )
         square_frame_rule = (
-            "Every output must fit a square 1:1 frame; image 7 may contain four close-up panels inside that square, and no output may look like a UI/gallery screenshot or wide cinematic crop. "
+            f"Every output must fit a square 1:1 frame; {detail_collage_label} may contain four close-up panels inside that square, and no output may look like a UI/gallery screenshot or wide cinematic crop. "
             if allows_four_panel_detail_collage
             else "The product must sit inside a square 1:1 frame with no side-by-side contact sheet, no wide cinematic crop, and no UI/gallery screenshot look. "
         )
         no_grid_rule = (
-            f"Do NOT create a {total}-frame grid, contact sheet, storyboard, or multiple images inside one canvas; the only exception is the Required shot plan's image 7, which may be one four-panel embroidery close-up collage inside a single 1:1 image. "
+            f"Do NOT create a {total}-frame grid, contact sheet, storyboard, or multiple images inside one canvas; the only exception is the Required shot plan's {detail_collage_label}, which may be one four-panel embroidery close-up collage inside a single 1:1 image. "
             if allows_four_panel_detail_collage
             else f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
         )
@@ -17064,8 +17576,9 @@ exit 1
             "Every stitched or embroidered area in every output must look like real hand embroidery: raised thread, visible stitch direction, tactile fibers, crisp embroidered edges, and natural thread shadows; never make embroidery look flat printed, painted, digital, vinyl, or sticker-like. "
             f"{self._flow_agent_embroidery_clarity_rule()} "
             "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
-            "Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. For the explicitly planned process shot only, a round embroidery hoop may appear as a temporary tool holding the pennant fabric while stitching, not as a finished hoop product. "
-            "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Required shot plan or Trello description explicitly asks for alternate names and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
+            f"Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; for any wall-hanging banner output, {self.BANNER_VISIBLE_WALL_HOOK_RULE} Never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. For the explicitly planned process shot only, a round embroidery hoop may appear as a temporary tool holding the pennant fabric while stitching, not as a finished hoop product. "
+            "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Required shot plan, Trello description, or colorway/multi-color shot requires variants and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
+            f"{self._flow_agent_colorway_text_variant_rule()} "
             f"{no_grid_rule}"
             f"{self._flow_agent_no_tag_label_rule()} "
             "Do not add any readable name, initials, year, EST date, quote, slogan, label, or decorative text unless that readable text is visibly embroidered/printed on the source product image; for allowed name variants, keep the same product shape and motif exactly. "
@@ -17315,6 +17828,7 @@ exit 1
                 source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
                     page,
                     fallback_before,
+                    accept_stable_ready_after_attach=True,
                 )
             if job_id:
                 await self.store.append_log(
@@ -17363,6 +17877,12 @@ exit 1
                 ) from exc
             known_media_before_submit = set()
 
+        pre_submit_quota_message = ""
+        pre_submit_try_again_message = ""
+        if flow_agent_enabled:
+            pre_submit_quota_message = await self._visible_flow_agent_quota_message(page)
+            pre_submit_try_again_message = await self._visible_flow_agent_try_again_message(page)
+
         if flow_agent_enabled:
             clicked, click_detail = await self._click_flow_agent_panel_send(page)
         else:
@@ -17391,7 +17911,16 @@ exit 1
 
         if flow_agent_enabled:
             await asyncio.sleep(1.5)
-            await self._raise_flow_agent_quota_if_visible(page, job_id=job_id)
+            await self._raise_flow_agent_quota_if_visible(
+                page,
+                job_id=job_id,
+                ignore_message=pre_submit_quota_message,
+            )
+            await self._raise_flow_agent_try_again_if_visible(
+                page,
+                job_id=job_id,
+                ignore_message=pre_submit_try_again_message,
+            )
             panel_ok, panel_detail, needs_prompt = await self._ensure_flow_agent_panel_submitted(page, prompt, submit_if_needed=False)
             if job_id:
                 await self.store.append_log(
@@ -17436,7 +17965,16 @@ exit 1
                 if job_id:
                     await self.store.append_log(job_id, f"Fallback UI Flow timeout/recaptcha: {str(exc)[:300]}")
                 if flow_agent_enabled:
-                    await self._raise_flow_agent_quota_if_visible(page, job_id=job_id)
+                    await self._raise_flow_agent_quota_if_visible(
+                        page,
+                        job_id=job_id,
+                        ignore_message=pre_submit_quota_message,
+                    )
+                    await self._raise_flow_agent_try_again_if_visible(
+                        page,
+                        job_id=job_id,
+                        ignore_message=pre_submit_try_again_message,
+                    )
                     try:
                         if flow_agent_auto_approve:
                             approved, approve_detail = await self._approve_flow_agent_generation(page, timeout_s=8.0)
@@ -17616,17 +18154,11 @@ exit 1
                 try:
                     is_closed = bool(cached_page.is_closed()) if hasattr(cached_page, "is_closed") else False
                     if not is_closed:
-                        try:
-                            browser._page = cached_page
-                        except Exception:
-                            pass
-                        if target_url:
-                            await self._ensure_valid_flow_project_page(cached_page, target_url)
-                        try:
-                            await cached_page.bring_to_front()
-                        except Exception:
-                            pass
-                        return cached_page, "reused isolated project tab"
+                        # A previous Flow Agent prompt can still be rendering in this
+                        # tab even after our network wait times out or a batch moves on.
+                        # Reusing it would navigate the page and wipe the in-flight
+                        # Agent command, so leave it open and create a fresh tab below.
+                        pass
                 except Exception:
                     try:
                         browser._flow_agent_page = None
@@ -18694,11 +19226,17 @@ exit 1
                     return {
                       visible: count > 0,
                       count,
+                      ready_count: 0,
+                      busy_count: 0,
+                      composer_ready_count: 0,
+                      composer_busy_count: 0,
                       media_count: 0,
                       chip_count: 0,
                       file_input_count: count,
                       card_count: 0,
                       labels: fileInputsWithFiles.slice(0, 12),
+                      ready_labels: [],
+                      composer_ready_labels: [],
                       detail: `agent panel not found; files=${count}`,
                     };
                   }
@@ -18708,9 +19246,57 @@ exit 1
                     .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                     .sort((a, b) => b.rect.bottom - a.rect.bottom);
                   const inputBox = textboxes[0];
+                  const composerContainer = (() => {
+                    if (!inputBox) return null;
+                    const candidates = [];
+                    let node = inputBox.el;
+                    for (let depth = 0; node && node !== panel.el && depth < 14; depth += 1, node = node.parentElement) {
+                      if (!(node instanceof Element)) continue;
+                      const rect = node.getBoundingClientRect();
+                      if (rect.width < 160 || rect.height < 32) continue;
+                      if (rect.left < panelRect.left - 16 || rect.right > panelRect.right + 16) continue;
+                      if (rect.bottom < window.innerHeight * 0.55 || rect.bottom < inputBox.rect.bottom - 18) continue;
+                      if (rect.height >= panelRect.height - 52) continue;
+                      const controls = [...node.querySelectorAll('button, [role="button"], [aria-label], [data-testid]')]
+                        .filter((el) => visible(el, 18, 18)).length;
+                      const score = rect.bottom / 8
+                        + (controls ? 240 : 0)
+                        + Math.min(rect.height, 520) / 16
+                        - depth * 10
+                        - Math.abs(rect.right - panelRect.right) / 18;
+                      candidates.push({ el: node, rect, score });
+                    }
+                    candidates.sort((a, b) => b.score - a.score);
+                    return candidates[0] || null;
+                  })();
+                  const composerRect = (() => {
+                    if (composerContainer) return composerContainer.rect;
+                    if (!inputBox) {
+                      return {
+                        left: panelRect.left,
+                        right: panelRect.right,
+                        top: Math.max(panelRect.top + 44, panelRect.bottom - 280),
+                        bottom: panelRect.bottom + 12,
+                      };
+                    }
+                    const topPad = Math.min(340, Math.max(160, panelRect.height * 0.34));
+                    return {
+                      left: panelRect.left,
+                      right: panelRect.right,
+                      top: Math.max(panelRect.top + 44, inputBox.rect.top - topPad),
+                      bottom: panelRect.bottom + 12,
+                    };
+                  })();
                   const composerTop = inputBox ? Math.max(panelRect.top + 44, inputBox.rect.top - Math.max(260, panelRect.height * 0.62)) : panelRect.top + 44;
                   const composerBottom = panelRect.bottom + 12;
                   const insideTextbox = (el) => textboxes.some((box) => box.el === el || box.el.contains(el));
+                  const inCurrentComposer = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.top >= composerRect.top - 8
+                      && rect.bottom <= composerRect.bottom + 8
+                      && rect.left >= composerRect.left - 8
+                      && rect.right <= composerRect.right + 8;
+                  };
                   const inPanelAttachmentArea = (el) => {
                     const rect = el.getBoundingClientRect();
                     return rect.top >= composerTop
@@ -18745,60 +19331,201 @@ exit 1
                     .filter((item) => /upload|attached|attachment|thumbnail|preview|file|media|image|photo|picture|remove.*image|xoa.*anh|áº£nh|anh/i.test(item.label))
                     .map((item) => item.label.slice(0, 80))
                     .slice(0, 12);
-                  const labels = [...media, ...chips, ...attachmentCards, ...fileInputsWithFiles]
+                  const busyLabel = (label) => /uploading|loading|progress|spinner|pending|processing|dang\s*tai|dang\s*upload|tai\s*len|cho\s*tai|Ä‘ang\s*táº£i|Ä‘ang\s+upload|Ä‘ang\s+xá»­\s*lÃ½|ch\u1edd\s*t\u1ea3i/i.test(label || '');
+                  const busyIndicators = deepQuery('[role="progressbar"], progress, mat-spinner, [class*="spinner" i], [class*="loading" i], [aria-busy="true"]', panel.el)
+                    .filter((el) => visible(el, 12, 12))
+                    .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
+                    .map((el) => labelFor(el).slice(0, 80) || el.tagName.toLowerCase());
+                  const composerMedia = mediaCandidates
+                    .filter((el) => visible(el, 24, 24))
+                    .filter((el) => inCurrentComposer(el))
+                    .filter((el) => {
+                      const rect = el.getBoundingClientRect();
+                      return rect.width * rect.height >= 900 && !(rect.width <= 38 && rect.height <= 38);
+                    })
+                    .map((el) => labelFor(el).slice(0, 80) || 'composer image preview');
+                  const composerChips = deepQuery('span, div, p, a, button, [role="button"]', panel.el)
+                    .filter((el) => visible(el, 24, 12))
+                    .filter((el) => inCurrentComposer(el))
+                    .map((el) => labelFor(el))
+                    .filter((label) => label.length > 0 && label.length <= 220)
+                    .filter((label) => /\.jpe?g|\.png|\.webp|\.heic|trello-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label));
+                  const composerCards = deepQuery('[data-testid], [aria-label], [title], [class]', panel.el)
+                    .filter((el) => visible(el, 24, 18))
+                    .filter((el) => inCurrentComposer(el))
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      return { label: labelFor(el), area: rect.width * rect.height };
+                    })
+                    .filter((item) => item.area >= 900 && item.label.length > 0 && item.label.length <= 220)
+                    .filter((item) => /upload|attached|attachment|thumbnail|preview|file|media|image|photo|picture|remove.*image|xoa.*anh|ảnh|anh/i.test(item.label))
+                    .map((item) => item.label.slice(0, 80));
+                  const composerBusyIndicators = deepQuery('[role="progressbar"], progress, mat-spinner, [class*="spinner" i], [class*="loading" i], [aria-busy="true"]', panel.el)
+                    .filter((el) => visible(el, 12, 12))
+                    .filter((el) => inCurrentComposer(el))
+                    .map((el) => labelFor(el).slice(0, 80) || el.tagName.toLowerCase());
+                  const readyChips = chips.filter((label) => !busyLabel(label));
+                  const readyCards = attachmentCards.filter((label) => !busyLabel(label));
+                  const composerReadyChips = composerChips.filter((label) => !busyLabel(label));
+                  const composerReadyCards = composerCards.filter((label) => !busyLabel(label));
+                  const readyLabels = [...media, ...readyChips, ...readyCards]
                     .filter((label, index, arr) => label && arr.indexOf(label) === index)
                     .slice(0, 12);
-                  const count = media.length + chips.length + attachmentCards.length + fileInputsWithFiles.length;
+                  const composerReadyLabels = [...composerMedia, ...composerReadyChips, ...composerReadyCards]
+                    .filter((label, index, arr) => label && arr.indexOf(label) === index)
+                    .slice(0, 12);
+                  const labels = [...readyLabels, ...busyIndicators, ...fileInputsWithFiles]
+                    .filter((label, index, arr) => label && arr.indexOf(label) === index)
+                    .slice(0, 12);
+                  const readyCount = media.length + readyChips.length + readyCards.length;
+                  const busyCount = busyIndicators.length
+                    + chips.filter((label) => busyLabel(label)).length
+                    + attachmentCards.filter((label) => busyLabel(label)).length;
+                  const composerReadyCount = composerMedia.length + composerReadyChips.length + composerReadyCards.length;
+                  const composerBusyCount = composerBusyIndicators.length
+                    + composerChips.filter((label) => busyLabel(label)).length
+                    + composerCards.filter((label) => busyLabel(label)).length;
+                  const count = readyCount + busyCount + fileInputsWithFiles.length;
                   return {
                     visible: true,
                     count,
+                    ready_count: readyCount,
+                    busy_count: busyCount,
+                    composer_ready_count: composerReadyCount,
+                    composer_busy_count: composerBusyCount,
                     media_count: media.length,
-                    chip_count: chips.length,
+                    chip_count: readyChips.length,
                     file_input_count: fileInputsWithFiles.length,
-                    card_count: attachmentCards.length,
+                    card_count: readyCards.length,
                     labels,
-                    detail: `attachments=${count} media=${media.length} chips=${chips.length} files=${fileInputsWithFiles.length} cards=${attachmentCards.length} allMedia=${mediaCandidates.length}`,
+                    ready_labels: readyLabels,
+                    composer_ready_labels: composerReadyLabels,
+                    detail: `attachments=${count} ready=${readyCount} busy=${busyCount} composerReady=${composerReadyCount} composerBusy=${composerBusyCount} media=${media.length} chips=${readyChips.length} files=${fileInputsWithFiles.length} cards=${readyCards.length} allMedia=${mediaCandidates.length}`,
                   };
                 }
                 """
             )
         except Exception as exc:
-            return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "file_input_count": 0, "card_count": 0, "detail": humanize_flow_error(str(exc))}
+            return {
+                "visible": False,
+                "count": 0,
+                "ready_count": 0,
+                "busy_count": 0,
+                "composer_ready_count": 0,
+                "composer_busy_count": 0,
+                "media_count": 0,
+                "chip_count": 0,
+                "file_input_count": 0,
+                "card_count": 0,
+                "ready_labels": [],
+                "composer_ready_labels": [],
+                "detail": humanize_flow_error(str(exc)),
+            }
         if isinstance(result, dict):
             return result
-        return {"visible": False, "count": 0, "media_count": 0, "chip_count": 0, "file_input_count": 0, "card_count": 0, "detail": "attachment snapshot unavailable"}
+        return {
+            "visible": False,
+            "count": 0,
+            "ready_count": 0,
+            "busy_count": 0,
+            "composer_ready_count": 0,
+            "composer_busy_count": 0,
+            "media_count": 0,
+            "chip_count": 0,
+            "file_input_count": 0,
+            "card_count": 0,
+            "ready_labels": [],
+            "composer_ready_labels": [],
+            "detail": "attachment snapshot unavailable",
+        }
+
+    def _flow_agent_attachment_ready_count(self, snapshot: Dict[str, Any]) -> int:
+        if not isinstance(snapshot, dict):
+            return 0
+        if "ready_count" in snapshot:
+            try:
+                return max(0, int(snapshot.get("ready_count") or 0))
+            except Exception:
+                return 0
+        try:
+            total = int(snapshot.get("count") or 0)
+            file_inputs = int(snapshot.get("file_input_count") or 0)
+            busy = int(snapshot.get("busy_count") or 0)
+            return max(0, total - file_inputs - busy)
+        except Exception:
+            return 0
+
+    def _flow_agent_attachment_label_signature(self, snapshot: Dict[str, Any]) -> tuple[str, ...]:
+        if not isinstance(snapshot, dict):
+            return ()
+        labels = snapshot.get("ready_labels")
+        if not isinstance(labels, list):
+            labels = snapshot.get("labels")
+        if not isinstance(labels, list):
+            return ()
+        return tuple(sorted({str(label or "").strip() for label in labels if str(label or "").strip()}))
+
+    def _flow_agent_attachment_composer_ready_count(self, snapshot: Dict[str, Any]) -> int:
+        if not isinstance(snapshot, dict):
+            return 0
+        try:
+            return max(0, int(snapshot.get("composer_ready_count") or 0))
+        except Exception:
+            return 0
+
+    def _flow_agent_attachment_composer_label_signature(self, snapshot: Dict[str, Any]) -> tuple[str, ...]:
+        if not isinstance(snapshot, dict):
+            return ()
+        labels = snapshot.get("composer_ready_labels")
+        if not isinstance(labels, list):
+            return ()
+        return tuple(sorted({str(label or "").strip() for label in labels if str(label or "").strip()}))
 
     async def _wait_for_flow_agent_source_attachment(
         self,
         page: Any,
         before: Dict[str, Any] | None = None,
         *,
-        timeout_s: float = 8.0,
+        timeout_s: float = 20.0,
+        accept_stable_ready_after_attach: bool = False,
     ) -> tuple[bool, str]:
         before = before if isinstance(before, dict) else {}
-        try:
-            before_count = int(before.get("count") or 0)
-        except Exception:
-            before_count = 0
-        deadline = asyncio.get_running_loop().time() + max(1.0, float(timeout_s or 8.0))
+        before_count = self._flow_agent_attachment_ready_count(before)
+        before_labels = self._flow_agent_attachment_label_signature(before)
+        before_composer_count = self._flow_agent_attachment_composer_ready_count(before)
+        before_composer_labels = self._flow_agent_attachment_composer_label_signature(before)
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(timeout_s or 20.0))
         last_snapshot: Dict[str, Any] = before
         while asyncio.get_running_loop().time() < deadline:
             last_snapshot = await self._flow_agent_panel_attachment_snapshot(page)
+            current_count = self._flow_agent_attachment_ready_count(last_snapshot)
+            current_labels = self._flow_agent_attachment_label_signature(last_snapshot)
+            current_composer_count = self._flow_agent_attachment_composer_ready_count(last_snapshot)
+            current_composer_labels = self._flow_agent_attachment_composer_label_signature(last_snapshot)
             try:
-                current_count = int(last_snapshot.get("count") or 0)
+                busy_count = int(last_snapshot.get("busy_count") or 0)
             except Exception:
-                current_count = 0
-            if last_snapshot.get("visible") and current_count > 0:
+                busy_count = 0
+            try:
+                composer_busy_count = int(last_snapshot.get("composer_busy_count") or 0)
+            except Exception:
+                composer_busy_count = 0
+            if last_snapshot.get("visible") and current_composer_count > 0 and composer_busy_count <= 0:
+                if current_composer_count > before_composer_count:
+                    return True, f"composer attachment ready {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
+                if before_composer_count > 0 and current_composer_labels and current_composer_labels != before_composer_labels:
+                    return True, f"composer attachment changed after attach {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
+            if last_snapshot.get("visible") and current_count > 0 and busy_count <= 0:
                 if current_count > before_count:
-                    return True, f"new attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
-                if before_count > 0:
-                    return True, f"source attachment visible after attach {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+                    return True, f"new ready attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+                if before_count > 0 and current_labels and current_labels != before_labels:
+                    return True, f"ready attachment changed after attach {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+                if accept_stable_ready_after_attach and current_count >= before_count:
+                    return True, f"ready attachment stable after file attach {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
             await asyncio.sleep(0.5)
-        try:
-            current_count = int(last_snapshot.get("count") or 0)
-        except Exception:
-            current_count = 0
-        return False, f"no new attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+        current_count = self._flow_agent_attachment_ready_count(last_snapshot)
+        current_composer_count = self._flow_agent_attachment_composer_ready_count(last_snapshot)
+        return False, f"no new ready attachment visible {before_count}->{current_count}, composer {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
 
     async def _attach_flow_agent_source_file(self, page: Any, image_path: str) -> tuple[bool, str]:
         source = Path(str(image_path or "")).expanduser()

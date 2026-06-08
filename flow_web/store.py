@@ -88,6 +88,23 @@ class StateStore:
             await self._save_locked()
         return self._state.flow_profile_quota_blocked_until
 
+    async def replace_flow_profile_agent_retry_error_counts(self, counts: Dict[str, int]) -> Dict[str, int]:
+        async with self._lock:
+            normalized: Dict[str, int] = {}
+            for key, value in (counts or {}).items():
+                safe_key = str(key or "").strip().lower()
+                if not safe_key:
+                    continue
+                try:
+                    count = int(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if count > 0:
+                    normalized[safe_key] = count
+            self._state.flow_profile_agent_retry_error_counts = normalized
+            await self._save_locked()
+        return self._state.flow_profile_agent_retry_error_counts
+
     async def list_jobs(self) -> List[JobRecord]:
         return list(self._state.jobs)
 

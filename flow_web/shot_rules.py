@@ -18,8 +18,10 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('wedding_pillowcase',
  'vows_book',
  'guest_book',
  'bouquet_ribbon',
- 'fabric_cross',
+ 'drawstring_bag',
  'banner',
+ 'crown',
+ 'fabric_cross',
  'dress_baby',
  'plush')
 
@@ -263,6 +265,233 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                       'AVOID: Overlapping text, logos, watermarks, human faces, edited product designs, cluttered '
                       'backgrounds, harsh studio lighting, AI errors, plastic-looking fabrics, overly saturated '
                       'colors.'))},
+ 'crown': {'display_name': 'Crown',
+           'aliases': ('Crown',
+                       'linen crown',
+                       'fabric crown',
+                       'birthday crown',
+                       'baby crown',
+                       'child crown',
+                       'children crown',
+                       'kids crown',
+                       'party crown',
+                       'embroidered crown',
+                       'crown with pom-poms',
+                       'pom pom crown',
+                       'pompom crown',
+                       'vương miện',
+                       'vuong mien',
+                       'vương miện vải',
+                       'vuong mien vai'),
+           'lock': 'the main product must remain the same soft fabric birthday crown with the exact pointed crown '
+                   'silhouette, upright fabric band, pom-pom or felt-ball tips, linen/fabric texture, embroidery '
+                   'placement, thread colors, proportions, scale, and handcrafted birthday accessory identity from '
+                   'the source image',
+           'shots': (('Product display',
+                      'Crown upright on wood birthday table',
+                      'The crown stands upright on a wood-grained table. Mini pine cones and a small cake are placed '
+                      'around it, with a muted pastel birthday background behind the product. Shoot from a slightly '
+                      'horizontal angle with soft clean window sunlight, keeping the scene fresh, bright, and birthday '
+                      'themed. Do not add specific characters, names, or new embroidery motifs; keep the embroidery '
+                      'versatile for any occasion. 1:1 square aspect ratio. Avoid clutter, harsh studio lighting, '
+                      'plastic-looking fabric, flat machine embroidery, AI errors, text overlays, logos, and '
+                      'watermarks.'),
+                     ('Lifestyle',
+                      'Crown on white muslin blanket',
+                      'The crown rests slightly off-center on a white muslin blanket with plenty of breathing space. '
+                      'Decorate with a teddy bear, fabric book, small pillows, and soft cream or beige nursery tones. '
+                      'Use a low frontal view of the crown and natural light through thin curtains for a soft airy '
+                      'birthday lifestyle photo. Do not add specific characters, names, or new embroidery motifs. 1:1 '
+                      'square aspect ratio. Avoid clutter, harsh lighting, distorted fabric, blurry embroidery, '
+                      'text overlays, logos, and watermarks.'),
+                     ('Cận thêu tay',
+                      'Collage 4 close-ups embroidery and pom-pom',
+                      'Create one square composite image made of four small close-up photos. Each small photo focuses '
+                      'on close-up details of the crown embroidery, linen fabric texture, pom-pom or felt-ball tips, '
+                      'stitches, seams, and handcrafted construction. Keep the details sharp, tactile, and premium. '
+                      'Do not redesign the crown or add new embroidery motifs. This is a detail collage only, not a '
+                      'multi-output grid. Use clean soft natural white window light. Avoid blurry close-ups, flat '
+                      'machine embroidery, text overlays, logos, and watermarks.'),
+                     ('Product display',
+                      'Five crowns triangular pyramid colorways',
+                      'Keep the embroidery intact and show five fabric crowns arranged in a triangular pyramid shape '
+                      'on a white wood-grained table beside a window. Use different fabric colors; only if the source '
+                      'visibly has an embroidered name may the crowns use different plausible embroidered names while '
+                      'keeping the embroidery style and thread colors unchanged. Decorate with a few small '
+                      "wildflowers, dried pine cones, and children's wooden toys. Shoot from a low frontal angle in "
+                      'clean white window light. Avoid new motifs, character embroidery, clutter, text overlays, '
+                      'logos, and watermarks.'),
+                     ('Product display',
+                      'Crown on high shelf by window',
+                      'Place the crown on a high shelf next to a window without changing the embroidery or pattern. '
+                      'Turn the embroidered face toward the light so the stitching is clearly visible. Add a simple '
+                      'vase of fresh flowers, a few English storybooks, and a baby bracelet as secondary props. Shoot '
+                      'from a low horizontal or close 3/4 angle with gentle slanted morning window light and soft '
+                      'shadows. Do not add specific embroidery patterns or text. 1:1 square aspect ratio.'),
+                     ('Product display',
+                      'Three crowns on gray shelf with daffodils',
+                      'Show three crowns on a gray wooden shelf by a window, with different fabric colors but the same '
+                      'embroidery layout and thread colors. Only if the source visibly has an embroidered name may the '
+                      'crowns use different plausible names. Place a vase of yellow daffodils nearby and let clean '
+                      'white sunlight stream in from the window. Preserve the crown construction, pom-poms, fabric, '
+                      'and stitch quality. Avoid new motifs, clutter, harsh lighting, text overlays, logos, and '
+                      'watermarks.'),
+                     ('Lifestyle',
+                      'Mother hand holding crown',
+                      "A mother's hand holds the crown in front of a bright window to show the true size and delicate "
+                      'craftsmanship. The person holding the crown wears neutral knit or linen sleeves, and the '
+                      'background is softly blurred. The product should look soft, light, and meticulously crafted, '
+                      'with embroidery and pom-poms visible. Do not redesign the crown or add motifs. 1:1 square '
+                      'aspect ratio. Avoid distorted hands, extra fingers, harsh lighting, clutter, text overlays, '
+                      'logos, and watermarks.'),
+                     ('Quy trình',
+                      'Four-panel crown making process',
+                      'Create one square process collage with four small photos: 1) a hand picking white fabric from '
+                      'many rolls of multicolored linen; 2) sketching the embroidery design onto a large piece of '
+                      'fabric; 3) colorful embroidery being completed on fabric in a round embroidery hoop, one hand '
+                      'holding the hoop and the other holding a threaded needle, with embroidery thread and '
+                      'multicolored pompoms nearby; 4) sewing the crown shape with a sewing machine. Use soft clean '
+                      'window light. The hoop is only a process tool, not the final product. Avoid distorted hands, '
+                      'unrealistic needle placement, new motifs, text overlays, logos, and watermarks.'),
+                     ('Lifestyle',
+                      'Baby wearing crown outdoor birthday',
+                      'A baby wearing the crown stands at an outdoor birthday celebration with a happy bright birthday '
+                      'tone, holding a piece of cake in hand. Use a full-body shot of the baby while clearly showing '
+                      'the embroidery and crown shape. Keep the crown design, fabric color family, pom-poms, and '
+                      'stitch texture faithful to the source. Do not add new character embroidery or text. Use soft '
+                      'natural daylight, 1:1 square aspect ratio. Avoid distorted baby anatomy, clutter, harsh light, '
+                      'text overlays, logos, and watermarks.'),
+                     ('Lifestyle',
+                      'Baby wearing crown blowing candles',
+                      'A baby wearing the crown sits in front of a cake and blows out candles, surrounded by happy '
+                      'bright birthday decorations with a small amount of confetti. The embroidery on the crown must '
+                      'be clearly visible and sharp. Keep the crown exact in silhouette, fabric, pom-poms, embroidery '
+                      'placement, and handmade texture. Do not add new motifs, names, or readable text. Use soft '
+                      'natural white window light, 1:1 square aspect ratio. Avoid distorted hands or face, clutter, '
+                      'logos, watermarks, and text overlays.'),
+                     ('Product display',
+                      'Crown on cake stand',
+                      'Place the crown on a small cake stand so it sits higher than the tabletop. Put the cake slightly '
+                      'behind and off to one side, with cupcakes, pampas grass, and wooden toys as secondary birthday '
+                      'props. Shoot from a low frontal angle for an elegant product look. Use window light or '
+                      'simulated window studio light that is soft, clear, and neutral. Do not redesign the crown or '
+                      'add specific embroidery motifs. 1:1 square aspect ratio. Avoid clutter, harsh lighting, text '
+                      'overlays, logos, and watermarks.'))},
+ 'drawstring_bag': {'display_name': 'Drawstring Bag',
+                    'aliases': ('Drawstring Bag',
+                                'drawstring bag',
+                                'drawstring pouch',
+                                'linen drawstring bag',
+                                'cotton linen drawstring bag',
+                                'embroidered drawstring bag',
+                                'embroidered pouch',
+                                'linen pouch',
+                                'cotton pouch',
+                                'jewelry pouch',
+                                'gift pouch',
+                                'túi rút dây',
+                                'tui rut day',
+                                'túi dây rút',
+                                'tui day rut',
+                                'túi rút',
+                                'tui rut',
+                                'túi vải rút',
+                                'tui vai rut'),
+                    'lock': 'the main product must remain the same cotton linen drawstring bag/pouch with the exact '
+                            'soft rectangular pouch silhouette, gathered drawstring top, cotton rope cords and knots, '
+                            'linen weave, fabric color, front embroidery placement, embroidery scale, thread colors, '
+                            'natural wrinkles, seams, soft volume, and premium handmade identity from the source image; '
+                            'the drawstring cord color must match the source reference',
+                    'shots': (('Kitchen product display',
+                               'Túi đứng trong giỏ gia vị',
+                               'Show one single cotton linen drawstring bag standing naturally in the center of a '
+                               'beautiful spice basket on a clean kitchen cooking table. Use refined kitchen decor such '
+                               'as small spice jars, wooden spoons, pale wood, linen cloth, and dried herbs. The front '
+                               'embroidery must face the camera clearly, with the drawstring top, cotton cords, knots, '
+                               'linen texture, soft pouch volume, and natural wrinkles preserved exactly from the '
+                               'reference. Use clean bright white daylight and premium Etsy handmade styling.'),
+                              ('Jewelry use scene',
+                               'Miệng túi mở nhẹ có trang sức',
+                               'Place one drawstring bag in the center with the mouth gently opened just enough to show '
+                               'a few small jewelry pieces inside, such as a bracelet, ring, or pearl necklace. Use a '
+                               'white or cream linen background and a small handmade ceramic tray to suggest function. '
+                               'Shoot from a soft 45-60 degree overhead angle with clear white daylight. Keep the same '
+                               'bag shape, cord color, gathered top, embroidery position, fabric weave, and thread colors '
+                               'from the source image; jewelry is secondary and must not cover the embroidery.'),
+                              ('Flat lay',
+                               'Túi xẹp tự nhiên trên khăn linen',
+                               'Lay one drawstring bag naturally flattened on a light linen cloth in a premium flat lay. '
+                               'Let the cotton drawstrings fall softly and visibly. Add tasteful craft props such as '
+                               'small scissors, embroidery needle, fabric-covered notebook, dried flowers, and cotton '
+                               'cord. The camera must show the fabric texture, hand embroidery relief, seams, and natural '
+                               'soft wrinkles clearly. Do not redesign the bag or move the embroidery.'),
+                              ('Colorway pair',
+                               'Hai túi trên khay trang sức gỗ',
+                               'Show two drawstring bags with the same form as the reference, placed side by side on a '
+                               'wooden jewelry tray on a dressing table. The two bags may use different linen base colors, '
+                               'but the embroidery motif, thread colors, embroidery layout, cord color, drawstring '
+                               'construction, seams, and pouch proportions must stay the same as the source. Add refined '
+                               'skincare props, flowers, and a clean vanity setting without clutter.'),
+                              ('Tabletop storage set',
+                               'Ba túi đứng trong khay gỗ sáng',
+                               'Show three drawstring bags standing upright together in a shallow light wooden tray on a '
+                               'clean bright kitchen or craft table. Do not hang the bags from any hook, rail, peg, wall, '
+                               'or drawstring cord. Use soft fabric color variety only for the base fabric while '
+                               'preserving the source embroidery, cord color, cord thickness, knots, gathered top, seam '
+                               'construction, and pouch proportions. Include folded linen, small dried flowers, wicker '
+                               'texture, and soft window light; every bag must rest naturally on the tray or tabletop.'),
+                              ('Colorway group',
+                               'Bốn túi trên bàn trắng vân gỗ',
+                               'Arrange four drawstring bags as a natural group on a white wood-grain table. Each bag may '
+                               'have a different fabric color, but all must keep the exact source pouch form, same '
+                               'embroidery motif and thread palette, same drawstring cord color, same gathered top, and '
+                               'same handmade linen texture. Decorate lightly with a white ceramic vase, linen cloth, '
+                               'craft book, and dried branches.'),
+                              ('Detail collage',
+                               'Bốn ảnh nhỏ cận cảnh thêu',
+                               'Create one square detail collage made of four small close-up photos, each showing a '
+                               'different macro angle of the embroidery and cotton linen texture on the same drawstring '
+                               'bag. The panels must show raised hand stitches, thread direction, tactile thread fibers, '
+                               'linen weave, seam or drawstring-channel detail where useful, and natural fabric texture. '
+                               'This is a detail-proof collage only; do not create a product colorway grid or redesign '
+                               'the embroidery.'),
+                              ('Process lifestyle',
+                               'Tay thêu trên khung thêu nhỏ',
+                               'Show an adult woman sitting at a handmade craft table, carefully embroidering the same '
+                               'motif onto a piece of fabric matching the drawstring bag color, using a small embroidery '
+                               'hoop, needle with thread, small scissors, thread spools, folded linen, and beautiful '
+                               'window light. Hands must be natural and anatomically correct, with a realistic needle '
+                               'position. This is a making-process scene; the finished product must still be understood '
+                               'as a cotton linen drawstring bag, not a hoop product.'),
+                              ('Basket lifestyle',
+                               'Túi trong giỏ mây nhỏ',
+                               'Place one drawstring bag in a small wicker basket on a light wood table. Use refined '
+                               'decor such as linen cloth, small ceramic vase, white candle, dried flowers, and a '
+                               'fabric-covered book. The front embroidery must be visible and sharp, with clean white '
+                               'daylight and a soft premium handmade mood. Preserve the source bag shape, cords, fabric, '
+                               'embroidery scale, and natural wrinkles.'),
+                              ('Family lifestyle',
+                               'Em bé đưa túi cho mẹ',
+                               'Create a bright living-room lifestyle photo where a baby or young child hands the '
+                               'drawstring bag to the mother, with small items inside so the pouch has gentle natural '
+                               'volume. Keep the scene safe, clean, airy, and premium. Faces can be cropped or secondary. '
+                               'The bag must remain the focal product, with its front embroidery visible and not covered '
+                               'by hands; preserve cord color, gathered top, pouch form, and stitch texture.'),
+                              ('Use detail',
+                               'Tay phụ nữ bỏ đồ nhỏ vào túi',
+                               'Show an adult woman hand placing small items into the drawstring bag. Use airy premium '
+                               'light, soft neutral tabletop styling, and focus on the bag opening, cords, and embroidery. '
+                               'The bag may look slightly fuller from the contents, but the source shape, fabric weave, '
+                               'drawstring color, embroidery placement, and thread details must not change. Hands must '
+                               'be natural with no extra fingers.'),
+                              ('Gift presentation',
+                               'Túi xẹp nhẹ trong hộp quà mở',
+                               'Place one drawstring bag neatly inside a small open paper gift box. The bag should be '
+                               'slightly flattened or gently folded, not overly inflated, with the embroidered front '
+                               'facing upward and clearly visible. Use a small minimal light-colored box and very light '
+                               'decor such as linen cloth or pale paper background. Do not place anything on top of the '
+                               'bag or cover the embroidery; preserve the source fabric, cords, stitches, and handmade '
+                               'identity.'))},
  'fabric_cross': {'display_name': 'Fabric Cross',
                   'aliases': ('Fabric Cross',
                               'fabric cross',
@@ -1258,6 +1487,13 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                             'guest book',
                             'wedding guest book',
                             'embroidered guest book',
+                            'photo album',
+                            'wedding photo album',
+                            'fabric photo album',
+                            'embroidered photo album',
+                            'scrapbook',
+                            'wedding scrapbook',
+                            'memory book',
                             'sổ ký tên',
                             'so ky ten',
                             'sổ khách',
@@ -2430,6 +2666,18 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                             'toddler dress',
                             'kids dress',
                             'children dress',
+                            'child dress',
+                            "child's dress",
+                            "children's dress",
+                            'girls dress',
+                            'girl dress',
+                            'linen dress',
+                            'white linen dress',
+                            'sleeveless dress',
+                            'ruffled dress',
+                            'ruffle sleeve dress',
+                            'flutter sleeve dress',
+                            'pinafore dress',
                             'embroidered dress',
                             'váy bé',
                             'vay be',
