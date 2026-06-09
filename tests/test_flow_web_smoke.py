@@ -60,6 +60,7 @@ class TempAppPathsMixin:
             patch("flow_web.paths.DOWNLOADS_DIR", self.downloads_dir),
             patch("flow_web.store.STATE_FILE", self.state_file),
             patch("flow_web.store.ensure_app_dirs", ensure_temp_dirs),
+            patch("flow_web.service.DATA_DIR", self.data_dir),
             patch("flow_web.service.UPLOADS_DIR", self.uploads_dir),
             patch("flow_web.service.DOWNLOADS_DIR", self.downloads_dir),
             patch("flow_web.service.ensure_app_dirs", ensure_temp_dirs),
@@ -379,6 +380,226 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("baby pillowcase or cushion shape", items[0]["design_analysis"])
         self.assertIn("Hands embroidering pillowcase", items[0]["shot_labels"])
 
+    def test_trello_ai_title_description_block_preserves_existing_description(self) -> None:
+        description = "Original buyer notes.\nKeep the flower motif exact."
+
+        updated = self.service._trello_description_with_ai_title(
+            description,
+            title="Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+            product_type="Drawstring Bag",
+            embroidery_design="Lavender Sprig",
+            model="gemini-2.5-flash",
+            updated_at="2026-06-08T10:00:00+00:00",
+        )
+
+        self.assertIn(description, updated)
+        self.assertIn("AI Suggested Etsy Title:", updated)
+        self.assertIn("Personalized Linen Drawstring Bag with Lavender Embroidery", updated)
+        self.assertIn("AI Product Type:\nDrawstring Bag", updated)
+        self.assertNotIn("AI Embroidery Design:", updated)
+        self.assertNotIn("AI Title Status:", updated)
+        self.assertNotIn("AI Title Source:", updated)
+        self.assertNotIn("AI Title Updated:", updated)
+        self.assertIn(self.service.TRELLO_AI_TITLE_BEGIN_MARKER, updated)
+        self.assertIn(self.service.TRELLO_AI_TITLE_END_MARKER, updated)
+
+    def test_trello_ai_title_update_writes_backup_before_description_put(self) -> None:
+        card = {
+            "id": "card-title",
+            "name": "source product",
+            "desc": "Original card description",
+            "url": "https://trello.example/c/card-title",
+        }
+
+        with patch.object(self.service, "_trello_put_json", return_value={"desc": "updated desc"}) as put_json:
+            result = self.service._write_trello_ai_title_to_description(
+                key="key",
+                token="token",
+                card=card,
+                title_payload={
+                    "title": "Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+                    "product_type": "Drawstring Bag",
+                    "embroidery_design": "Lavender Sprig",
+                },
+            )
+
+        self.assertEqual("updated", result["status"])
+        self.assertIn("Personalized Linen Drawstring Bag", result["title"])
+        put_json.assert_called_once()
+        self.assertEqual("updated desc", card["desc"])
+        backup_path = Path(result["backup_path"])
+        self.assertTrue(backup_path.is_file())
+        payload = json.loads(backup_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(payload))
+        self.assertEqual("card-title", payload[0]["card_id"])
+        self.assertEqual("Lavender Sprig", payload[0]["embroidery_design"])
+        self.assertEqual("Original card description", payload[0]["old_description"])
+        self.assertIn("AI Suggested Etsy Title:", payload[0]["new_description"])
+
+    def test_ai_title_enforces_visible_embroidery_design_in_title(self) -> None:
+        title = self.service._title_with_embroidery_design(
+            "Personalized Linen Drawstring Bag, Handmade Jewelry Pouch",
+            "Lavender Daisy Floral",
+            "Drawstring Bag",
+        )
+
+        self.assertIn("Lavender Daisy Floral", title)
+        self.assertIn("Drawstring Bag", title)
+
+    def test_ai_title_fallback_uses_embroidery_design_from_context(self) -> None:
+        payload = self.service._fallback_trello_product_title(
+            card_name="lavender daisy drawstring bag",
+            attachment_name="pale_sage_linen_lavender_daisy_drawstring_bag.jpeg",
+            product_rule_key="drawstring_bag",
+            visible_product="linen drawstring bag with lavender daisy embroidery",
+        )
+
+        self.assertEqual("Lavender Daisy Floral", payload["embroidery_design"])
+        self.assertIn("Lavender Daisy Floral", payload["title"])
+        self.assertIn("Drawstring Bag", payload["title"])
+
+    def test_ai_title_fallback_ignores_personalized_name_as_design(self) -> None:
+        payload = self.service._fallback_trello_product_title(
+            card_name="Custom order for Emma",
+            attachment_name="emma_personalized_name_linen_drawstring_bag.jpeg",
+            product_rule_key="drawstring_bag",
+            visible_product="linen drawstring bag with embroidered name Emma",
+        )
+
+        self.assertEqual("Decorative Embroidery", payload["embroidery_design"])
+        self.assertNotIn("Emma", payload["title"])
+        self.assertNotIn("Personalized Name", payload["title"])
+        self.assertIn("Drawstring Bag", payload["title"])
+
+    def test_ai_title_scrubs_gemini_personalized_name_design(self) -> None:
+        title = self.service._title_without_personalized_text_design(
+            "Emma Hand Embroidered Linen Drawstring Bag, Handmade Jewelry Pouch Gift",
+            "Emma",
+        )
+
+        self.assertNotIn("Emma", title)
+        self.assertIn("Hand Embroidered Linen Drawstring Bag", title)
+
+    def test_auto_trello_ai_title_missing_gemini_records_error_on_item(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-no-gemini-title",
+            "shortLink": "no-gemini-title",
+            "idList": "ready",
+            "name": "embroidered drawstring pouch",
+            "desc": "Buyer note: handmade linen bag.",
+            "url": "https://trello.example/c/no-gemini-title",
+            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-title"],
+        }
+
+        with patch.object(self.service, "_gemini_api_key", return_value=""):
+            items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertIn("Gemini", card["_ai_title_error"])
+        self.assertIn("Gemini", items[0]["ai_title_error"])
+        self.assertEqual("", items[0]["ai_suggested_title"])
+        self.assertIn("Drawstring Bag category", items[0]["design_analysis"])
+
+    def test_auto_trello_enrichment_writes_ai_title_to_description(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-ai-title",
+            "shortLink": "ai-title",
+            "idList": "ready",
+            "name": "Sage_green_linen_drawstring_bag.jpeg",
+            "desc": "Buyer note: keep lavender embroidery.",
+            "url": "https://trello.example/c/ai-title",
+            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-title"],
+        }
+
+        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("trello-key", "trello-token"),
+        ), patch.object(
+            self.service,
+            "_trello_download_attachment_bytes",
+            return_value=(b"image-bytes", "image/jpeg"),
+        ), patch.object(
+            self.service,
+            "_gemini_classify_trello_source_product_rule",
+            return_value={
+                "product_rule_key": "drawstring_bag",
+                "confidence": 0.95,
+                "visible_product": "embroidered linen drawstring bag",
+                "reason": "visible pouch with cords",
+            },
+        ), patch.object(
+            self.service,
+            "_gemini_suggest_trello_product_title",
+            return_value={
+                "title": "Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+                "product_type": "Drawstring Bag",
+                "reason": "source is an embroidered pouch",
+            },
+        ) as suggest_title, patch.object(
+            self.service,
+            "_trello_put_json",
+            return_value={"desc": "Buyer note: keep lavender embroidery.\n\nAI Suggested Etsy Title:"},
+        ) as put_json:
+            self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
+
+        suggest_title.assert_called_once()
+        put_json.assert_called_once()
+        self.assertEqual("drawstring_bag", card["_visual_product_rule_key"])
+        self.assertIn("Personalized Linen Drawstring Bag", card["_ai_suggested_title"])
+        self.assertTrue(Path(card["_ai_title_backup_path"]).is_file())
+
+    def test_auto_trello_ai_title_falls_back_when_gemini_returns_no_text(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-ai-title-fallback",
+            "shortLink": "ai-title-fallback",
+            "idList": "ready",
+            "name": "Hand-embroidered_drawstring_bag_pale_sage.jpeg",
+            "desc": "",
+            "url": "https://trello.example/c/ai-title-fallback",
+            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag_pale_sage.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-title"],
+        }
+
+        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+            self.service,
+            "_trello_credentials",
+            return_value=("trello-key", "trello-token"),
+        ), patch.object(
+            self.service,
+            "_trello_download_attachment_bytes",
+            return_value=(b"image-bytes", "image/jpeg"),
+        ), patch.object(
+            self.service,
+            "_gemini_classify_trello_source_product_rule",
+            return_value={
+                "product_rule_key": "drawstring_bag",
+                "confidence": 0.95,
+                "visible_product": "embroidered linen drawstring bag",
+                "reason": "visible pouch with cords",
+            },
+        ), patch.object(
+            self.service,
+            "_gemini_suggest_trello_product_title",
+            side_effect=RuntimeError("Gemini không trả về nội dung AI product title."),
+        ), patch.object(
+            self.service,
+            "_trello_put_json",
+            return_value={"desc": "AI Suggested Etsy Title:"},
+        ) as put_json:
+            self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
+
+        put_json.assert_called_once()
+        self.assertIn("Hand Embroidered", card["_ai_suggested_title"])
+        self.assertIn("Drawstring Bag", card["_ai_suggested_title"])
+        self.assertIn("_ai_title_fallback_reason", card)
+        self.assertTrue(Path(card["_ai_title_backup_path"]).is_file())
+
     def test_auto_trello_pennant_card_keeps_banner_category(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
@@ -577,6 +798,38 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("not a hoop product", item["prompt"])
         self.assertNotIn("Banner category", item["design_analysis"])
 
+    def test_auto_trello_uses_havi_passport_cover_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        cards = [
+            {
+                "id": "card-passport-cover",
+                "shortLink": "passport-cover",
+                "idList": "ready",
+                "name": "Bọc passport",
+                "url": "https://trello.example/c/passport-cover",
+                "_image_attachments": [{"id": "att-passport", "name": "doi_Cozy_Lodge_thanh_ten_202606060853.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-passport"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("passport_cover")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Passport Cover category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Passport Cover", item["prompt"])
+        self.assertIn("Travel desk with phone and boarding pass", item["shot_labels"][0])
+        self.assertIn("Place the passport cover beside a phone, boarding pass, earbuds, and a small wallet", item["prompt"])
+        self.assertIn("Create one square detail collage made of four small close-up photos", item["prompt"])
+        self.assertIn("Place one passport cover neatly inside a small open light-colored paper gift box", item["prompt"])
+        self.assertIn("same passport cover/passport holder form", item["prompt"])
+        self.assertIn("The explicitly numbered close-up detail collage shot is the only allowed four-panel image", item["prompt"])
+        self.assertNotIn("Drawstring Bag category", item["design_analysis"])
+        self.assertNotIn("Show one single cotton linen drawstring bag standing naturally", item["prompt"])
+
     def test_auto_trello_visual_product_rule_overrides_random_card_name(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
         cards = [
@@ -605,6 +858,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(item["shot_labels"][0].startswith("Dress Baby image 1 "))
         self.assertIn("mannequin", item["prompt"])
         self.assertIn("HAVI product shot rule lock: Dress Baby", item["prompt"])
+        self.assertIn("back placket must show exactly two", item["prompt"])
+        self.assertIn("no third button", item["prompt"])
+        self.assertIn("Do not add any text overlay or caption", item["prompt"])
+        self.assertNotIn("This lovely cotton linen children's dress", item["prompt"])
         self.assertNotIn("Pastel fabric colorway lineup", item["shot_labels"])
 
     def test_auto_trello_uses_havi_vows_book_active_rules_only(self) -> None:
@@ -695,7 +952,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("not as a new set starting at image 1", prompt)
         self.assertIn("does not reset the numbered shot range", prompt)
 
-    def test_auto_trello_generic_tao_filename_stops_without_product_rule(self) -> None:
+    def test_auto_trello_generic_tao_filename_skips_without_product_rule(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         card = {
             "id": "card-generic",
@@ -710,8 +967,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         signals = self.service._flow_operator_card_product_signals(request, card)
 
         self.assertFalse(signals["is_shirt"])
-        with self.assertRaisesRegex(RuntimeError, "HAVI product shot rule"):
-            self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual([], items)
+        self.assertEqual("missing_product_rule", card["_auto_trello_skip_code"])
+        self.assertIn("HAVI product shot rule", card["_auto_trello_skip_reason"])
+        self.assertIn("bo qua card nay", card["_auto_trello_skip_reason"])
 
     def test_auto_trello_skips_unknown_rule_card_when_later_card_is_valid(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -739,6 +1000,43 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, len(items))
         self.assertEqual("card-dress", items[0]["trello_card_id"])
         self.assertIn("HAVI product shot rule lock: Dress Baby", items[0]["prompt"])
+
+    def test_auto_trello_scan_reports_skipped_unknown_rule_card_without_failing(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            trello_board_id="board123",
+            trello_list_id="ready-list",
+        )
+        generic_card = {
+            "id": "card-generic",
+            "shortLink": "generic",
+            "idList": "ready-list",
+            "name": "tao_hinh_image_202605161423.jpeg",
+            "url": "https://trello.example/c/generic",
+            "_image_attachments": [{"id": "att-generic", "name": "image.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-generic"],
+        }
+
+        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_trello_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_trello_image_cards_on_board",
+            return_value=[generic_card],
+        ), patch.object(
+            self.service,
+            "_trello_list_name",
+            return_value="Ready for AI",
+        ):
+            items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 1)
+
+        self.assertEqual([], items)
+        self.assertEqual(1, discovery["skipped_missing_product_rule_cards"])
+        self.assertEqual(["card-generic"], discovery["skipped_missing_product_rule_card_ids"])
+        self.assertIn("HAVI product shot rule", discovery["skipped_missing_product_rule_details"][0])
 
     def test_auto_trello_generic_card_uses_visual_product_rule_instead_of_fallback(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -829,6 +1127,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "vows_book": "small fabric covered booklet for personal vows with embroidered cover lettering",
             "guest_book": "fabric covered sign in album for wedding guests with embroidered cover",
             "bouquet_ribbon": "long fabric strip tied to a bridal bouquet with stitched lettering",
+            "passport_cover": "cotton linen passport cover holder with hand embroidered travel motif beside a boarding pass",
             "drawstring_bag": "cotton linen drawstring pouch with rope cords, gathered top, and hand embroidered lavender motif",
             "banner": "flat triangular nursery wall hanging with top wooden dowel cord hanger and pointed V bottom",
             "crown": "soft fabric birthday crown made of linen with pom-pom tips and embroidered details for a baby party",
@@ -877,7 +1176,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertNotEqual("dress_baby", parsed["product_rule_key"])
 
-    def test_auto_trello_partial_card_generates_missing_image_set(self) -> None:
+    def test_auto_trello_partial_card_generates_full_twelve_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
@@ -895,11 +1194,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
-        self.assertEqual(9, items[0]["flow_agent_image_count"])
+        self.assertEqual(12, items[0]["flow_agent_image_count"])
         self.assertEqual(3, items[0]["flow_agent_existing_output_count"])
         self.assertEqual(["source-att"], items[0]["trello_attachment_ids"])
         self.assertIn("already has 3/12 Flow output", items[0]["prompt"])
-        self.assertIn("Continue the same set by creating exactly 9 new missing image", items[0]["prompt"])
+        self.assertIn("fresh full 12-image set", items[0]["prompt"])
+        self.assertIn("do not subtract any existing output attachments", items[0]["prompt"])
+        self.assertNotIn("Continue the same set by creating exactly 9 new missing image", items[0]["prompt"])
 
     def test_auto_trello_fresh_ready_card_generates_full_twelve_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -951,7 +1252,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             items[0]["shot_labels"],
         )
 
-    def test_auto_trello_eight_output_card_generates_only_four_colorway_images(self) -> None:
+    def test_auto_trello_eight_output_card_generates_full_twelve_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
@@ -969,13 +1270,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
-        self.assertEqual(4, items[0]["flow_agent_image_count"])
+        self.assertEqual(12, items[0]["flow_agent_image_count"])
         self.assertEqual(8, items[0]["flow_agent_existing_output_count"])
-        self.assertNotIn("Auto was started again", items[0]["prompt"])
         self.assertIn("already has 8/12 Flow output", items[0]["prompt"])
-        self.assertIn("Continue the same set by creating exactly 4 new missing image", items[0]["prompt"])
+        self.assertIn("fresh full 12-image set", items[0]["prompt"])
+        self.assertNotIn("Continue the same set by creating exactly 4 new missing image", items[0]["prompt"])
         self.assertEqual(
             [
+                "Embroidery craft proof",
+                "Nursery hero arrangement",
+                "Lifestyle baby room scene",
+                "Gift box presentation",
+                "Flat lay motif story",
+                "Collection variation scene",
+                "Hands embroidering pillowcase",
+                "Personalized detail vignette",
                 "Pastel fabric colorway lineup",
                 "Crib colorway trio",
                 "Pastel swatch flat lay",
@@ -988,7 +1297,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("never repeat the exact same readable name/text across all color variants", items[0]["prompt"])
         self.assertIn("otherwise all options must remain nameless", items[0]["prompt"])
 
-    def test_auto_trello_ten_output_card_generates_exactly_two_missing_images(self) -> None:
+    def test_auto_trello_ten_output_card_generates_full_twelve_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
@@ -1006,18 +1315,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
-        self.assertEqual(2, items[0]["flow_agent_image_count"])
+        self.assertEqual(12, items[0]["flow_agent_image_count"])
         self.assertEqual(10, items[0]["flow_agent_existing_output_count"])
         self.assertIn("already has 10/12 Flow output", items[0]["prompt"])
-        self.assertIn("Continue the same set by creating exactly 2 new missing image", items[0]["prompt"])
+        self.assertIn("fresh full 12-image set", items[0]["prompt"])
+        self.assertNotIn("Continue the same set by creating exactly 2 new missing image", items[0]["prompt"])
         self.assertIn("source image is not a generated output", items[0]["prompt"])
-        self.assertEqual(
-            [
-                "Pastel swatch flat lay",
-                "Color option display",
-            ],
-            items[0]["shot_labels"],
-        )
+        self.assertEqual(12, len(items[0]["shot_labels"]))
+        self.assertEqual("Embroidery craft proof", items[0]["shot_labels"][0])
+        self.assertEqual("Color option display", items[0]["shot_labels"][-1])
 
     def test_auto_trello_hoop_uses_name_variants_instead_of_colorways(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
@@ -2016,7 +2322,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             self.assertEqual(["Ideas"], self.service._default_trello_extra_source_list_names())
 
-    def test_trello_image_card_scan_skips_complete_cards_and_keeps_partial_outputs(self) -> None:
+    def test_trello_image_card_scan_includes_complete_cards_for_fresh_rerun(self) -> None:
         cards_payload = [
             {"id": "done-card", "name": "Done", "idList": "ready-list"},
             {"id": "partial-card", "name": "Partial", "idList": "ready-list"},
@@ -2050,13 +2356,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual(["partial-card", "fresh-card"], [card["id"] for card in cards])
-        self.assertEqual("partial-source", cards[0]["_image_attachments"][0]["id"])
-        self.assertEqual(["partial-source"], cards[0]["_selected_attachment_ids"])
-        self.assertEqual(1, cards[0]["_flow_output_count"])
-        self.assertEqual("fresh-source", cards[1]["_image_attachments"][0]["id"])
-        self.assertEqual(["fresh-source"], cards[1]["_selected_attachment_ids"])
-        self.assertEqual(0, cards[1]["_flow_output_count"])
+        self.assertEqual(["done-card", "partial-card", "fresh-card"], [card["id"] for card in cards])
+        self.assertEqual("source", cards[0]["_image_attachments"][0]["id"])
+        self.assertEqual(["source"], cards[0]["_selected_attachment_ids"])
+        self.assertEqual(12, cards[0]["_flow_output_count"])
+        self.assertEqual("partial-source", cards[1]["_image_attachments"][0]["id"])
+        self.assertEqual(["partial-source"], cards[1]["_selected_attachment_ids"])
+        self.assertEqual(1, cards[1]["_flow_output_count"])
+        self.assertEqual("fresh-source", cards[2]["_image_attachments"][0]["id"])
+        self.assertEqual(["fresh-source"], cards[2]["_selected_attachment_ids"])
+        self.assertEqual(0, cards[2]["_flow_output_count"])
 
     def test_trello_image_card_scan_uses_single_generated_image_name_as_source(self) -> None:
         cards_payload = [{"id": "generated-card", "name": "Generated source", "idList": "ready-list"}]
@@ -2272,8 +2581,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
 
-        self.assertEqual(["partial-card"], [card["id"] for card in cards])
+        self.assertEqual(["partial-card", "done-card"], [card["id"] for card in cards])
         self.assertEqual(2, cards[0]["_flow_output_count"])
+        self.assertEqual(12, cards[1]["_flow_output_count"])
 
     def test_trello_single_numbered_output_with_source_can_continue_missing_set(self) -> None:
         cards_payload = [{"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"}]
@@ -2350,8 +2660,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             summary = self.service._auto_trello_ready_for_ai_summary(request)
 
         self.assertIn("Ready for AI co 4 card", summary)
-        self.assertIn("1 card da du 12 anh output nen Auto se bo qua", summary)
-        self.assertIn("2 card chua du output va se tao tiep den du 12 anh", summary)
+        self.assertIn("1 card da co du 12 anh output nhung phien Auto moi van co the tao moi 12 anh", summary)
+        self.assertIn("2 card co anh nguon va khi chay se tao moi 12 anh", summary)
         self.assertIn("1 card chua co anh nguon", summary)
 
     def test_reset_ready_trello_outputs_deletes_only_generated_images(self) -> None:

@@ -31,7 +31,7 @@ from xml.etree import ElementTree as ET
 from fastapi import HTTPException, UploadFile
 
 from .messages import humanize_flow_error
-from .paths import DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
+from .paths import DATA_DIR, DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
 from .shot_rules import PRODUCT_SHOT_RULE_PRIORITY, PRODUCT_SHOT_RULES
 from .schemas import (
     AppConfig,
@@ -158,6 +158,9 @@ class FlowWebService:
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
     TRELLO_TIMEOUT_S = 30
     TRELLO_UPSCALE_LONG_EDGE_PX = 2048
+    TRELLO_AI_TITLE_BACKUP_FILE_NAME = "trello-title-description-backups.json"
+    TRELLO_AI_TITLE_BEGIN_MARKER = "<!-- FLOW_AI_TITLE_START -->"
+    TRELLO_AI_TITLE_END_MARKER = "<!-- FLOW_AI_TITLE_END -->"
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
     DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ()
     DEFAULT_TRELLO_REVIEW_LIST_NAME = "Content Review"
@@ -2709,6 +2712,18 @@ class FlowWebService:
                     if uses_flow_agent
                     else f"Đang chạy prompt {index + 1}/{total}: {child_request.title}",
                 )
+                ai_title = str(item.get("ai_suggested_title") or "").strip()
+                ai_title_error = str(item.get("ai_title_error") or "").strip()
+                if uses_flow_agent and ai_title:
+                    await self.store.append_log(
+                        batch_id,
+                        f"Da ghi AI title vao mo ta Trello cho card {index + 1}/{total}: {ai_title}",
+                    )
+                elif uses_flow_agent and ai_title_error:
+                    await self.store.append_log(
+                        batch_id,
+                        f"Chua ghi AI title vao mo ta Trello cho card {index + 1}/{total}: {ai_title_error}",
+                    )
 
                 await self._run_flow_job(child_job.id, child_request)
                 saved_child = self.store.get_job(child_job.id)
@@ -3250,13 +3265,11 @@ class FlowWebService:
 
         parts = [f"{scope_label} co {len(cards)} card"]
         if complete:
-            parts.append(f"{complete} card da du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh output nen Auto se bo qua")
+            parts.append(f"{complete} card da co du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh output nhung phien Auto moi van co the tao moi {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         if no_output:
-            parts.append(f"{no_output} card chua du output va se tao tiep den du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
+            parts.append(f"{no_output} card co anh nguon va khi chay se tao moi {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         if no_source:
             parts.append(f"{no_source} card chua co anh nguon hop le")
-        if not eligible and complete:
-            parts.append(f"Auto dang cho card moi hoac card duoc reset de tao lai du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         return "; ".join(parts) + "."
 
     async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
@@ -3352,6 +3365,30 @@ class FlowWebService:
                         continue
                     raise
 
+                skipped_missing_rule_ids = [
+                    self._normalize_trello_card_id(str(item or ""))
+                    for item in discovery.get("skipped_missing_product_rule_card_ids", [])
+                    if self._normalize_trello_card_id(str(item or ""))
+                ]
+                skipped_missing_rule_count = int(
+                    discovery.get("skipped_missing_product_rule_cards") or len(skipped_missing_rule_ids)
+                )
+                if skipped_missing_rule_ids:
+                    seen_card_ids.update(skipped_missing_rule_ids)
+                if skipped_missing_rule_count:
+                    skipped_details = discovery.get("skipped_missing_product_rule_details")
+                    detail_text = ""
+                    if isinstance(skipped_details, list) and skipped_details:
+                        detail_text = str(skipped_details[0] or "").strip()
+                    await self.store.append_log(
+                        batch_id,
+                        (
+                            f"Bo qua {skipped_missing_rule_count} card chua xac dinh duoc HAVI product shot rule"
+                            + (f": {detail_text[:220]}" if detail_text else ".")
+                            + " App tiep tuc quet/chay card khac."
+                        ),
+                    )
+
                 fresh_items: List[Dict[str, Any]] = []
                 skipped_seen = 0
                 for item_offset, item in enumerate(items):
@@ -3431,6 +3468,18 @@ class FlowWebService:
                         detail=f"Đang chạy card mới {item_index}/{planned_total}: {child_request.title}",
                     )
                     await self.store.append_log(batch_id, f"Đang chạy card mới {item_index}/{planned_total}: {child_request.title}")
+                    ai_title = str(item.get("ai_suggested_title") or "").strip()
+                    ai_title_error = str(item.get("ai_title_error") or "").strip()
+                    if ai_title:
+                        await self.store.append_log(
+                            batch_id,
+                            f"Da ghi AI title vao mo ta Trello cho card {item_index}/{planned_total}: {ai_title}",
+                        )
+                    elif ai_title_error:
+                        await self.store.append_log(
+                            batch_id,
+                            f"Chua ghi AI title vao mo ta Trello cho card {item_index}/{planned_total}: {ai_title_error}",
+                        )
 
                     await self._run_flow_job(child_job.id, child_request)
                     saved_child = self.store.get_job(child_job.id)
@@ -7941,6 +7990,589 @@ exit 1
             }
         }
 
+    def _trello_ai_title_backup_path(self) -> Path:
+        return DATA_DIR / self.TRELLO_AI_TITLE_BACKUP_FILE_NAME
+
+    def _trello_description_has_ai_title_block(self, description: str) -> bool:
+        text = str(description or "")
+        return self.TRELLO_AI_TITLE_BEGIN_MARKER in text and self.TRELLO_AI_TITLE_END_MARKER in text
+
+    def _trello_should_write_ai_title_description(self, card: Dict[str, Any]) -> bool:
+        if not isinstance(card, dict):
+            return False
+        return not self._trello_description_has_ai_title_block(str(card.get("desc") or ""))
+
+    def _sanitize_ai_product_title(self, title: str, *, max_length: int = 140) -> str:
+        cleaned = re.sub(r"\s+", " ", str(title or "")).strip().strip('"').strip("'").strip()
+        cleaned = re.sub(r"^[\-:;\s]+", "", cleaned)
+        cleaned = re.sub(r"\s+[\-|]\s+AI\s*$", "", cleaned, flags=re.IGNORECASE)
+        if len(cleaned) <= max_length:
+            return cleaned
+        trimmed = cleaned[:max_length].rstrip()
+        if " " in trimmed:
+            trimmed = trimmed.rsplit(" ", 1)[0].rstrip(" ,;:-")
+        return trimmed or cleaned[:max_length].rstrip()
+
+    def _trello_description_with_ai_title(
+        self,
+        description: str,
+        *,
+        title: str,
+        product_type: str = "",
+        embroidery_design: str = "",
+        model: str = "",
+        updated_at: str = "",
+    ) -> str:
+        existing = str(description or "").strip()
+        if self._trello_description_has_ai_title_block(existing):
+            return existing
+        safe_title = self._sanitize_ai_product_title(title)
+        if not safe_title:
+            return existing
+        safe_product_type = re.sub(r"\s+", " ", str(product_type or "").strip())
+        block_lines = [
+            self.TRELLO_AI_TITLE_BEGIN_MARKER,
+            "AI Suggested Etsy Title:",
+            safe_title,
+            "",
+            "AI Product Type:",
+            safe_product_type or "Unknown",
+            self.TRELLO_AI_TITLE_END_MARKER,
+        ]
+        block = "\n".join(block_lines)
+        return f"{existing}\n\n{block}".strip() if existing else block
+
+    def _write_trello_ai_title_description_backup(
+        self,
+        *,
+        card_id: str,
+        card_name: str,
+        card_url: str,
+        old_description: str,
+        new_description: str,
+        title: str,
+        product_type: str,
+        embroidery_design: str = "",
+    ) -> str:
+        ensure_app_dirs()
+        backup_path = self._trello_ai_title_backup_path()
+        entries: List[Dict[str, Any]] = []
+        if backup_path.is_file():
+            try:
+                raw = json.loads(backup_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    entries = [item for item in raw if isinstance(item, dict)]
+            except Exception:
+                entries = []
+        backup_id = uuid.uuid4().hex
+        entries.append(
+            {
+                "backup_id": backup_id,
+                "created_at": utc_now(),
+                "card_id": str(card_id or "").strip(),
+                "card_name": str(card_name or "").strip(),
+                "card_url": str(card_url or "").strip(),
+                "title": self._sanitize_ai_product_title(title),
+                "product_type": str(product_type or "").strip(),
+                "embroidery_design": str(embroidery_design or "").strip(),
+                "old_description": str(old_description or ""),
+                "new_description": str(new_description or ""),
+            }
+        )
+        entries = entries[-1000:]
+        temp_path = backup_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(backup_path)
+        return str(backup_path)
+
+    def _fallback_title_context_tokens(self, *values: str) -> List[str]:
+        raw = " ".join(str(value or "") for value in values).lower()
+        raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+        raw = re.sub(r"\.(?:jpe?g|png|webp|gif|bmp|heic)\b", " ", raw)
+        raw = re.sub(r"[_\-]+", " ", raw)
+        raw = re.sub(r"\b20\d{10,}\b", " ", raw)
+        stopwords = {
+            "image",
+            "photo",
+            "source",
+            "product",
+            "professional",
+            "photography",
+            "hand",
+            "handmade",
+            "handcrafted",
+            "embroidered",
+            "embroidery",
+            "drawstring",
+            "bag",
+            "pouch",
+            "jpeg",
+            "jpg",
+            "png",
+            "tui",
+            "rut",
+            "day",
+            "small",
+            "large",
+            "medium",
+            "with",
+            "and",
+            "for",
+            "buyer",
+            "client",
+            "customer",
+            "custom",
+            "customized",
+            "initial",
+            "initials",
+            "letter",
+            "letters",
+            "monogram",
+            "name",
+            "named",
+            "names",
+            "order",
+            "personalized",
+            "personalised",
+            "text",
+            "word",
+            "words",
+        }
+        tokens: List[str] = []
+        for token in re.findall(r"[a-z]+", raw):
+            if len(token) <= 1 or token in stopwords:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+        return tokens
+
+    def _fallback_title_phrases(self, *values: str) -> Dict[str, str]:
+        tokens = self._fallback_title_context_tokens(*values)
+        token_set = set(tokens)
+        color_or_material_terms = {
+            "beige",
+            "blue",
+            "brown",
+            "canvas",
+            "cotton",
+            "cream",
+            "dusty",
+            "felt",
+            "green",
+            "grey",
+            "gray",
+            "ivory",
+            "light",
+            "linen",
+            "muslin",
+            "natural",
+            "oatmeal",
+            "pale",
+            "pink",
+            "sage",
+            "silk",
+            "soft",
+            "teal",
+            "velvet",
+            "white",
+            "wool",
+        }
+        material_tokens: List[str] = []
+        for token in tokens:
+            if token in color_or_material_terms:
+                material_tokens.append(token)
+            if len(material_tokens) >= 4:
+                break
+        material = " ".join(word.capitalize() for word in material_tokens)
+
+        motif_checks = [
+            ("Lavender Daisy Floral", {"lavender", "daisy"}),
+            ("Lavender Floral", {"lavender"}),
+            ("Daisy Floral", {"daisy"}),
+            ("Sunflower Floral", {"sunflower"}),
+            ("Rose Floral", {"rose"}),
+            ("Floral Wreath", {"floral", "wreath"}),
+            ("Autumn Leaf Wreath", {"autumn", "wreath"}),
+            ("Leaf Wreath", {"leaf", "wreath"}),
+            ("Berry Wreath", {"berry", "wreath"}),
+            ("Goose Floral", {"goose"}),
+            ("Rabbit Floral", {"rabbit"}),
+            ("Bunny Floral", {"bunny"}),
+            ("Bear Floral", {"bear"}),
+            ("Fox Floral", {"fox"}),
+            ("Bird Floral", {"bird"}),
+            ("Butterfly Floral", {"butterfly"}),
+            ("Moon Star", {"moon", "star"}),
+            ("Crown Floral", {"crown", "flower"}),
+            ("Floral", {"floral"}),
+            ("Flower", {"flower"}),
+            ("Bouquet", {"bouquet"}),
+            ("Wreath", {"wreath"}),
+            ("Leaf", {"leaf"}),
+            ("Berry", {"berry"}),
+        ]
+        embroidery_design = ""
+        for phrase, required in motif_checks:
+            if required.issubset(token_set):
+                embroidery_design = phrase
+                break
+        if not embroidery_design:
+            design_theme_terms = {
+                "animal",
+                "autumn",
+                "bear",
+                "berry",
+                "bird",
+                "botanical",
+                "bouquet",
+                "bow",
+                "bunny",
+                "butterfly",
+                "crown",
+                "daisy",
+                "decorative",
+                "fern",
+                "floral",
+                "flower",
+                "forest",
+                "fox",
+                "garden",
+                "goose",
+                "heart",
+                "herb",
+                "leaf",
+                "lavender",
+                "moon",
+                "mushroom",
+                "nature",
+                "petal",
+                "plant",
+                "rabbit",
+                "rose",
+                "sprig",
+                "star",
+                "sunflower",
+                "travel",
+                "wreath",
+            }
+            motif_terms = [
+                token
+                for token in tokens
+                if token in design_theme_terms
+            ]
+            if motif_terms:
+                embroidery_design = " ".join(word.capitalize() for word in motif_terms[:3])
+        return {
+            "material": material,
+            "embroidery_design": embroidery_design or "Decorative Embroidery",
+        }
+
+    def _embroidery_design_has_theme_signal(self, embroidery_design: str) -> bool:
+        tokens = set(self._tokenize_match_words(embroidery_design))
+        if not tokens:
+            return False
+        theme_terms = {
+            "animal",
+            "autumn",
+            "bear",
+            "berry",
+            "bird",
+            "botanical",
+            "bouquet",
+            "bow",
+            "bunny",
+            "butterfly",
+            "crown",
+            "daisy",
+            "decorative",
+            "fern",
+            "floral",
+            "flower",
+            "forest",
+            "fox",
+            "garden",
+            "goose",
+            "heart",
+            "herb",
+            "leaf",
+            "lavender",
+            "moon",
+            "motif",
+            "mushroom",
+            "nature",
+            "petal",
+            "plant",
+            "rabbit",
+            "rose",
+            "sprig",
+            "star",
+            "sunflower",
+            "theme",
+            "themed",
+            "travel",
+            "wreath",
+        }
+        return bool(tokens & theme_terms)
+
+    def _personalized_text_only_embroidery_design(self, embroidery_design: str) -> bool:
+        tokens = set(self._tokenize_match_words(embroidery_design))
+        if not tokens:
+            return False
+        text_terms = {
+            "custom",
+            "customized",
+            "initial",
+            "initials",
+            "letter",
+            "letters",
+            "monogram",
+            "name",
+            "names",
+            "personalized",
+            "personalised",
+            "text",
+            "word",
+            "words",
+        }
+        if tokens & text_terms:
+            return not self._embroidery_design_has_theme_signal(embroidery_design)
+        return len(tokens) == 1 and not self._embroidery_design_has_theme_signal(embroidery_design)
+
+    def _title_without_personalized_text_design(self, title: str, embroidery_design: str) -> str:
+        cleaned = self._sanitize_ai_product_title(title)
+        design = self._sanitize_ai_product_title(embroidery_design, max_length=60)
+        if not cleaned or not design:
+            return cleaned
+        pattern = re.compile(rf"\b{re.escape(design)}\b", flags=re.IGNORECASE)
+        without_design = pattern.sub("", cleaned)
+        without_design = re.sub(r"\s{2,}", " ", without_design)
+        without_design = re.sub(r"\s+([,;:])", r"\1", without_design).strip(" ,;:-")
+        return self._sanitize_ai_product_title(without_design or cleaned)
+
+    def _title_contains_embroidery_design(self, title: str, embroidery_design: str) -> bool:
+        normalized_title = self._normalize_skill_token(title)
+        normalized_design = self._normalize_skill_token(embroidery_design)
+        if not normalized_design:
+            return True
+        design_tokens = [token for token in normalized_design.split("_") if len(token) > 2]
+        if not design_tokens:
+            return True
+        return any(token in normalized_title.split("_") for token in design_tokens)
+
+    def _title_with_embroidery_design(self, title: str, embroidery_design: str, product_type: str) -> str:
+        safe_title = self._sanitize_ai_product_title(title)
+        safe_design = self._sanitize_ai_product_title(embroidery_design, max_length=60)
+        if not safe_title or not safe_design or self._title_contains_embroidery_design(safe_title, safe_design):
+            return safe_title
+        normalized_type = str(product_type or "").strip()
+        if normalized_type and normalized_type.lower() in safe_title.lower():
+            return self._sanitize_ai_product_title(
+                re.sub(
+                    re.escape(normalized_type),
+                    f"{safe_design} Embroidered {normalized_type}",
+                    safe_title,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+            )
+        return self._sanitize_ai_product_title(f"{safe_design} Embroidered {safe_title}")
+
+    def _fallback_trello_product_title(
+        self,
+        *,
+        card_name: str,
+        attachment_name: str,
+        product_rule_key: str,
+        visible_product: str = "",
+    ) -> Dict[str, str]:
+        product_rule = PRODUCT_SHOT_RULES.get(str(product_rule_key or "").strip()) or {}
+        product_type = self._sanitize_ai_product_title(
+            str(product_rule.get("display_name") or visible_product or product_rule_key or "Handmade Embroidered Product"),
+            max_length=80,
+        )
+        phrases = self._fallback_title_phrases(attachment_name, visible_product, card_name)
+        material = phrases["material"]
+        embroidery_design = phrases["embroidery_design"]
+        design_prefix = (
+            embroidery_design.replace("Embroidery", "Hand Embroidered")
+            if "embroidery" in embroidery_design.lower()
+            else f"{embroidery_design} Hand Embroidered"
+        )
+        normalized_type = product_type.lower()
+        if "drawstring" in normalized_type or "pouch" in normalized_type:
+            material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
+            title = f"{design_prefix} {material} Drawstring Bag, Handmade Jewelry Pouch Gift"
+            fallback_product_type = "Drawstring Bag"
+        elif "crown" in normalized_type:
+            material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
+            title = f"{design_prefix} {material} Crown, Personalized Birthday Crown Gift"
+            fallback_product_type = "Crown"
+        else:
+            title = f"{design_prefix} {material + ' ' if material else ''}{product_type}, Personalized Handmade Gift"
+            fallback_product_type = product_type
+        return {
+            "title": self._sanitize_ai_product_title(title),
+            "product_type": self._sanitize_ai_product_title(fallback_product_type, max_length=80),
+            "embroidery_design": self._sanitize_ai_product_title(embroidery_design, max_length=80),
+            "reason": "Fallback title from HAVI product rule and Trello card context.",
+        }
+
+    def _gemini_suggest_trello_product_title(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        card_name: str,
+        attachment_name: str,
+        card_description: str,
+        product_rule_key: str,
+        visible_product: str = "",
+    ) -> Dict[str, str]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Gemini is not configured for AI product title generation.")
+        product_rule = PRODUCT_SHOT_RULES.get(str(product_rule_key or "").strip()) or {}
+        display_name = str(product_rule.get("display_name") or visible_product or product_rule_key or "").strip()
+        prompt = "\n".join(
+            [
+                "You write Etsy-ready product titles for handmade embroidered products from one source image.",
+                "Look at SOURCE_IMAGE and the card context. Write exactly one polished English Etsy product title.",
+                "First identify the exact visible embroidery motif, visual theme, or decorative design on the product itself, such as lavender sprigs, daisy bouquet, floral wreath, autumn leaves, goose, rabbit, crown, bow, heart, animal motif, travel motif, or decorative border.",
+                "Base the title on that visual motif/theme/design from the image, not on a customer's personalized name, initials, monogram letters, or readable stitched words.",
+                "Never use the actual personalized name or initials as the title's design hook and never set embroidery_design to a personal name, initials, monogram, Custom Name, Personalized Name, Initial Letter, or readable stitched text.",
+                "The title must directly mention the visible motif/theme/design when one is identifiable. Do not write only generic phrases like handmade embroidery, custom embroidery, or personalized unless no visual theme can be identified.",
+                "The title must describe the visible product category, material/fabric, exact embroidery motif/theme/design, use case, and gift/search keywords when accurate.",
+                "Do not invent a different product category. Do not mention AI, Google Flow, Trello, Nano Banana, image generation, mockup, or photo.",
+                "If readable personalized text/name is visible on the product, treat it only as a customization detail; at most use 'personalized' or 'custom' as a secondary keyword, but do not include the actual name/initials.",
+                "If the embroidery motif/theme cannot be identified beyond text personalization, set embroidery_design to Decorative Embroidery or Themed Embroidery instead of using the name/initials.",
+                "Keep the title natural, ecommerce-ready, and at most 140 characters.",
+                'Return JSON only: {"title":"...","product_type":"...","embroidery_design":"...","reason":"..."}',
+                f"Known HAVI product rule: {display_name or product_rule_key or 'unknown'}",
+                f"Card name: {card_name}",
+                f"Attachment name: {attachment_name}",
+                f"Card description: {card_description[:1200]}",
+            ]
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {"text": "SOURCE_IMAGE"},
+                        self._inline_gemini_image_part(image_bytes, mime_type or "image/jpeg"),
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API returned HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Could not call Gemini for AI product title generation: {exc.reason}") from exc
+
+        text = self._extract_gemini_text(body)
+        parsed = self._parse_json_candidate(text, context="AI product title")
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini did not return a valid AI product title object.")
+        title = self._sanitize_ai_product_title(str(parsed.get("title") or ""))
+        if not title:
+            raise RuntimeError("Gemini did not return a usable AI product title.")
+        product_type = self._sanitize_ai_product_title(
+            str(parsed.get("product_type") or display_name or visible_product or product_rule_key or ""),
+            max_length=80,
+        )
+        embroidery_design = self._sanitize_ai_product_title(str(parsed.get("embroidery_design") or ""), max_length=80)
+        if embroidery_design and self._personalized_text_only_embroidery_design(embroidery_design):
+            title = self._title_without_personalized_text_design(title, embroidery_design)
+            embroidery_design = ""
+        if not embroidery_design:
+            phrases = self._fallback_title_phrases(
+                str(parsed.get("reason") or ""),
+                title,
+                visible_product,
+                attachment_name,
+                card_name,
+                card_description,
+            )
+            embroidery_design = phrases["embroidery_design"]
+        title = self._title_with_embroidery_design(title, embroidery_design, product_type)
+        reason = re.sub(r"\s+", " ", str(parsed.get("reason") or "").strip())[:300]
+        return {
+            "title": title,
+            "product_type": product_type,
+            "embroidery_design": embroidery_design,
+            "reason": reason,
+        }
+
+    def _write_trello_ai_title_to_description(
+        self,
+        *,
+        key: str,
+        token: str,
+        card: Dict[str, Any],
+        title_payload: Dict[str, str],
+    ) -> Dict[str, str]:
+        card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+        if not card_id:
+            raise RuntimeError("Missing Trello card id for AI title description update.")
+        old_description = str(card.get("desc") or "")
+        if self._trello_description_has_ai_title_block(old_description):
+            return {"status": "exists", "title": "", "backup_path": ""}
+        title = self._sanitize_ai_product_title(str(title_payload.get("title") or ""))
+        if not title:
+            raise RuntimeError("Missing AI title for Trello description update.")
+        product_type = str(title_payload.get("product_type") or "").strip()
+        new_description = self._trello_description_with_ai_title(
+            old_description,
+            title=title,
+            product_type=product_type,
+            embroidery_design=str(title_payload.get("embroidery_design") or "").strip(),
+            model=self._gemini_model(),
+        )
+        backup_path = self._write_trello_ai_title_description_backup(
+            card_id=card_id,
+            card_name=str(card.get("name") or ""),
+            card_url=str(card.get("url") or ""),
+            old_description=old_description,
+            new_description=new_description,
+            title=title,
+            product_type=product_type,
+            embroidery_design=str(title_payload.get("embroidery_design") or "").strip(),
+        )
+        payload = self._trello_put_json(
+            f"cards/{quote(card_id, safe='')}",
+            key,
+            token,
+            fields={"desc": new_description},
+        )
+        if isinstance(payload, dict):
+            card["desc"] = str(payload.get("desc") or new_description)
+        else:
+            card["desc"] = new_description
+        return {"status": "updated", "title": title, "backup_path": backup_path}
+
     async def _artifact_validation_image_bytes(
         self,
         job_id: str,
@@ -9273,7 +9905,12 @@ exit 1
 
         if not items:
             expanded = self._trello_ai_prompt_items_for_image_cards(cards, request, max_items)
-            if not expanded:
+            skipped_missing_rule_cards = [
+                card
+                for card in cards
+                if str(card.get("_auto_trello_skip_code") or "").strip() == "missing_product_rule"
+            ]
+            if not expanded and not skipped_missing_rule_cards:
                 raise RuntimeError(
                     "Auto Trello chưa tìm thấy card ảnh phù hợp để gửi Tác nhân Flow. "
                     "Hãy chọn card trong trợ lý, dán link card Trello, hoặc điền Lọc sản phẩm rõ hơn."
@@ -9291,6 +9928,19 @@ exit 1
             }
             if skipped_seen_cards:
                 discovery["skipped_seen_cards"] = skipped_seen_cards
+            if skipped_missing_rule_cards:
+                skipped_missing_rule_ids = [
+                    self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+                    for card in skipped_missing_rule_cards
+                ]
+                skipped_missing_rule_ids = [card_id for card_id in skipped_missing_rule_ids if card_id]
+                discovery["skipped_missing_product_rule_cards"] = len(skipped_missing_rule_cards)
+                discovery["skipped_missing_product_rule_card_ids"] = skipped_missing_rule_ids
+                discovery["skipped_missing_product_rule_details"] = [
+                    str(card.get("_auto_trello_skip_reason") or "").strip()
+                    for card in skipped_missing_rule_cards[:5]
+                    if str(card.get("_auto_trello_skip_reason") or "").strip()
+                ]
             return expanded, discovery
 
         for card in cards:
@@ -9603,6 +10253,39 @@ exit 1
                 "context": ("bouquet", "bridal bouquet", "wedding", "stitched lettering", "embroidered message", "draped"),
                 "exclude": ("book", "pillow", "cushion", "banner", "dress"),
             },
+            "passport_cover": {
+                "main": (
+                    "passport cover",
+                    "passport holder",
+                    "passport sleeve",
+                    "passport case",
+                    "travel document cover",
+                    "travel document holder",
+                    "boc passport",
+                    "bọc passport",
+                    "vo passport",
+                    "bia passport",
+                    "boc ho chieu",
+                    "vo boc ho chieu",
+                    "bia ho chieu",
+                    "vi ho chieu",
+                ),
+                "context": (
+                    "passport",
+                    "boarding pass",
+                    "travel",
+                    "airport",
+                    "travel document",
+                    "linen",
+                    "cotton linen",
+                    "embroidered",
+                    "hand embroidered",
+                    "cover",
+                    "holder",
+                    "sleeve",
+                ),
+                "exclude": ("guest book", "vow book", "photo album", "pillow", "cushion", "banner", "hoop", "dress", "shirt", "crown", "cross", "plush"),
+            },
             "drawstring_bag": {
                 "main": (
                     "drawstring bag",
@@ -9806,6 +10489,7 @@ exit 1
                 "Use the image as the authority. Treat card names and attachment filenames as weak clues only; they are often random or wrong.",
                 "Return an empty product_rule_key when the product is not clearly one of the allowed rules.",
                 "Do not guess from motif text, filename, or background props. Classify only the main physical product form visible in the image.",
+                "In visible_product, describe both the physical product form and the visible embroidery motif/design on the product, for example 'linen drawstring bag with lavender daisy embroidery'.",
                 "Allowed product_rule_key values:",
                 self._flow_operator_visual_product_rule_options(),
                 'Return JSON only with this exact shape: {"product_rule_key": string, "confidence": number, "visible_product": string, "reason": string}.',
@@ -9868,12 +10552,18 @@ exit 1
         if card.get("_visual_product_rule_checked"):
             return
         card["_visual_product_rule_checked"] = True
-        if self._flow_operator_card_visual_product_rule_key(card):
+        existing_rule_key = self._flow_operator_card_visual_product_rule_key(card)
+        needs_ai_title = self._trello_should_write_ai_title_description(card)
+        if existing_rule_key and not needs_ai_title:
             return
         if not self._gemini_api_key():
+            if needs_ai_title:
+                card["_ai_title_error"] = "Gemini chua cau hinh nen chua viet AI title vao mo ta Trello."
             return
         key, token = self._trello_credentials()
         if not key or not token:
+            if needs_ai_title:
+                card["_ai_title_error"] = "Trello credentials chua cau hinh nen chua viet AI title vao mo ta Trello."
             return
 
         card_id = self._normalize_trello_card_id(
@@ -9885,6 +10575,8 @@ exit 1
             if isinstance(item, dict) and self._trello_attachment_is_image(item)
         ]
         if not card_id or not image_attachments:
+            if needs_ai_title:
+                card["_ai_title_error"] = "Khong co card id hoac attachment anh nguon nen chua viet AI title vao mo ta Trello."
             return
 
         selected_ids = set(self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids))
@@ -9896,38 +10588,110 @@ exit 1
             ),
             image_attachments[0],
         )
+        text_rule_key = self._flow_operator_product_rule_key_from_text(
+            " ".join(
+                [
+                    str(card.get("name") or ""),
+                    str(attachment.get("name") or ""),
+                    self._flow_operator_trello_card_description_note(card),
+                ]
+            )
+        )
         cache_key = self._flow_operator_visual_rule_cache_key(card_id, attachment)
         cached = self._trello_visual_product_rule_cache.get(cache_key)
         if cached is not None:
             card.update(cached)
-            return
+            if not needs_ai_title:
+                return
 
+        image_bytes: bytes | None = None
+        mime = ""
         try:
             image_bytes, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
-            raw_payload = self._gemini_classify_trello_source_product_rule(
-                image_bytes=image_bytes,
-                mime_type=mime,
-                card_name=str(card.get("name") or ""),
-                attachment_name=str(attachment.get("name") or ""),
-                card_description=self._flow_operator_trello_card_description_note(card),
-            )
-            parsed = self._flow_operator_product_rule_from_visual_payload(raw_payload)
-            metadata = {
-                "_visual_product_rule_key": parsed.get("product_rule_key") or "",
-                "_visual_product_rule_confidence": parsed.get("confidence") or 0.0,
-                "_visual_product_rule_visible_product": parsed.get("visible_product") or "",
-                "_visual_product_rule_reason": parsed.get("reason") or "",
-                "_visual_product_rule_inferred": bool(parsed.get("inferred_from_visual_text")),
-            }
         except Exception as exc:
-            metadata = {
-                "_visual_product_rule_key": "",
-                "_visual_product_rule_confidence": 0.0,
-                "_visual_product_rule_visible_product": "",
-                "_visual_product_rule_reason": "",
-                "_visual_product_rule_inferred": False,
-                "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
-            }
+            detail = humanize_flow_error(str(exc)) or str(exc)
+            if existing_rule_key:
+                metadata = {"_ai_title_error": detail}
+            else:
+                metadata = {
+                    "_visual_product_rule_key": "",
+                    "_visual_product_rule_confidence": 0.0,
+                    "_visual_product_rule_visible_product": "",
+                    "_visual_product_rule_reason": "",
+                    "_visual_product_rule_inferred": False,
+                    "_visual_product_rule_error": detail,
+                }
+            self._trello_visual_product_rule_cache[cache_key] = metadata
+            card.update(metadata)
+            return
+
+        metadata: Dict[str, Any] = {}
+        if cached is not None:
+            metadata.update(cached)
+        elif not existing_rule_key:
+            try:
+                raw_payload = self._gemini_classify_trello_source_product_rule(
+                    image_bytes=image_bytes,
+                    mime_type=mime,
+                    card_name=str(card.get("name") or ""),
+                    attachment_name=str(attachment.get("name") or ""),
+                    card_description=self._flow_operator_trello_card_description_note(card),
+                )
+                parsed = self._flow_operator_product_rule_from_visual_payload(raw_payload)
+                metadata.update(
+                    {
+                        "_visual_product_rule_key": parsed.get("product_rule_key") or "",
+                        "_visual_product_rule_confidence": parsed.get("confidence") or 0.0,
+                        "_visual_product_rule_visible_product": parsed.get("visible_product") or "",
+                        "_visual_product_rule_reason": parsed.get("reason") or "",
+                        "_visual_product_rule_inferred": bool(parsed.get("inferred_from_visual_text")),
+                    }
+                )
+            except Exception as exc:
+                metadata.update(
+                    {
+                        "_visual_product_rule_key": "",
+                        "_visual_product_rule_confidence": 0.0,
+                        "_visual_product_rule_visible_product": "",
+                        "_visual_product_rule_reason": "",
+                        "_visual_product_rule_inferred": False,
+                        "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
+                    }
+                )
+        if needs_ai_title and image_bytes is not None:
+            try:
+                resolved_rule_key = str(
+                    metadata.get("_visual_product_rule_key") or existing_rule_key or text_rule_key or ""
+                ).strip()
+                try:
+                    title_payload = self._gemini_suggest_trello_product_title(
+                        image_bytes=image_bytes,
+                        mime_type=mime,
+                        card_name=str(card.get("name") or ""),
+                        attachment_name=str(attachment.get("name") or ""),
+                        card_description=self._flow_operator_trello_card_description_note(card),
+                        product_rule_key=resolved_rule_key,
+                        visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
+                    )
+                except Exception as title_exc:
+                    metadata["_ai_title_fallback_reason"] = humanize_flow_error(str(title_exc)) or str(title_exc)
+                    title_payload = self._fallback_trello_product_title(
+                        card_name=str(card.get("name") or ""),
+                        attachment_name=str(attachment.get("name") or ""),
+                        product_rule_key=resolved_rule_key,
+                        visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
+                    )
+                title_result = self._write_trello_ai_title_to_description(
+                    key=key,
+                    token=token,
+                    card=card,
+                    title_payload=title_payload,
+                )
+                metadata["_ai_suggested_title"] = title_result.get("title") or title_payload.get("title") or ""
+                metadata["_ai_title_backup_path"] = title_result.get("backup_path") or ""
+                metadata["_ai_title_status"] = title_result.get("status") or ""
+            except Exception as exc:
+                metadata["_ai_title_error"] = humanize_flow_error(str(exc)) or str(exc)
         self._trello_visual_product_rule_cache[cache_key] = metadata
         card.update(metadata)
 
@@ -10112,7 +10876,7 @@ exit 1
         source = ", ".join(part for part in (card_name, attachment_names, card_url) if part) or "unknown Trello card"
         return (
             "Auto AI Trello chua xac dinh duoc HAVI product shot rule cho anh nguon, "
-            "nen app da dung truoc khi gui Flow Agent de tranh tao bo anh sai rule. "
+            "nen app bo qua card nay truoc khi gui Flow Agent de tranh tao bo anh sai rule. "
             f"Nguon: {source}. {reason}"
         )
 
@@ -10755,30 +11519,25 @@ exit 1
         target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
         target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
         existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
-        rerun_full_set = existing_flow_count >= target_output_count and target_count >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
         all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-        shot_start = 0 if rerun_full_set else existing_flow_count
+        shot_start = 0
         shots = all_shots[shot_start : shot_start + target_count]
         if len(shots) < target_count and all_shots:
             shots = [*shots, *all_shots[: target_count - len(shots)]]
         shots = shots or all_shots[:target_count]
         shot_summary = "; ".join(
-            f"{(0 if rerun_full_set else shot_start) + position + 1}. {item.get('label')}: {item.get('brief')}"
+            f"{shot_start + position + 1}. {item.get('label')}: {item.get('brief')}"
             for position, item in enumerate(shots)
             if item.get("label") or item.get("brief")
         )
-        if rerun_full_set:
+        if existing_flow_count:
             resume_note = (
-                f"This Trello card already has {existing_flow_count} Flow output image(s), but Auto was started again. "
-                f"Create a fresh full {target_count}-image set from the Ready for AI source image; do not reuse old outputs."
-            )
-        elif existing_flow_count:
-            resume_note = (
-                f"This Trello card already has {existing_flow_count}/{target_output_count} Flow output image(s). "
-                f"Continue the same set by creating exactly {target_count} new missing image(s), starting after the existing outputs; do not remake, reuse, or reinterpret the old outputs."
+                f"This Trello card already has {existing_flow_count}/{target_output_count} Flow output image(s), but Auto now creates a fresh full {target_count}-image set by default. "
+                "Do not create only the missing images, do not continue from the old output numbering, and do not reuse or reinterpret old outputs."
             )
         else:
             resume_note = ""
+        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover"})
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             self._flow_agent_fresh_context_rule(),
@@ -10793,7 +11552,7 @@ exit 1
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
                 "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, drawstring bag, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, drawstring bag, passport cover, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
@@ -10814,7 +11573,7 @@ exit 1
             ) if signals.get("is_pennant") else "",
             resume_note,
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
-            f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The full target is {target_output_count} generated output images plus the 1 source image; create only the missing generated outputs for this run.",
+            f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The default target for this run is always a fresh full set of {target_output_count} generated output images plus the 1 source image; do not subtract any existing output attachments from this run.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
             "Lighting and color rule for every output: clean clear white neutral daylight, accurate whites, crisp bright product color, no yellow/orange/golden/tungsten/sepia/beige cast, and no warm color grading.",
@@ -10828,15 +11587,19 @@ exit 1
             ) if card_description_note else "",
             self._flow_agent_reference_prompt_style_guide(
                 target_count,
-                allow_detail_collage=bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag"}),
+                allow_detail_collage=allows_product_detail_collage,
             ),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is apparel, it must remain the same apparel form.",
+            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is apparel, it must remain the same apparel form.",
             (
                 "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
                 if signals.get("is_pennant")
-                else "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas."
+                else (
+                    "All outputs must be true 1:1 square product photos. The explicitly numbered close-up detail collage shot is the only allowed four-panel image inside one square; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
+                    if allows_product_detail_collage
+                    else "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas."
+                )
             ),
             "Do not use Google Sheet prompts; do not ask the local app AI to write the final prompt.",
         ]
@@ -10869,7 +11632,6 @@ exit 1
                 else:
                     return []
         expanded: List[Dict[str, Any]] = []
-        missing_rule_errors: List[str] = []
         for card in matched_cards:
             if len(expanded) >= max_items:
                 break
@@ -10883,14 +11645,16 @@ exit 1
             self._flow_operator_enrich_card_with_visual_product_rule(request, card)
             signals = self._flow_operator_card_product_signals(request, card)
             if not self._flow_operator_has_product_rule_or_category_signal(signals):
-                missing_rule_errors.append(self._flow_operator_missing_product_rule_detail(card, signals))
+                card["_auto_trello_skip_code"] = "missing_product_rule"
+                card["_auto_trello_skip_reason"] = self._flow_operator_missing_product_rule_detail(card, signals)
                 continue
+            card.pop("_auto_trello_skip_code", None)
+            card.pop("_auto_trello_skip_reason", None)
             existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
-            rerun_full_set = existing_flow_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT
-            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT if rerun_full_set else max(1, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - existing_flow_count)
+            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-            shot_start = 0 if rerun_full_set else existing_flow_count
+            shot_start = 0
             shots = all_shots[shot_start : shot_start + image_count]
             if len(shots) < image_count and all_shots:
                 shots = [*shots, *all_shots[: image_count - len(shots)]]
@@ -10925,6 +11689,10 @@ exit 1
                     "trello_source_attachment_ids": selected_attachment_ids,
                     "trello_card_name": card_name,
                     "trello_card_url": card_url,
+                    "ai_suggested_title": str(card.get("_ai_suggested_title") or "").strip(),
+                    "ai_title_status": str(card.get("_ai_title_status") or "").strip(),
+                    "ai_title_error": str(card.get("_ai_title_error") or "").strip(),
+                    "ai_title_backup_path": str(card.get("_ai_title_backup_path") or "").strip(),
                     "trello_match_mode": "flow_agent",
                     "trello_search_query": query,
                     "shot_label": "Flow Agent image set",
@@ -10937,8 +11705,6 @@ exit 1
                     "generated_by_flow_agent": True,
                 }
             )
-        if not expanded and missing_rule_errors:
-            raise RuntimeError(missing_rule_errors[0])
         return expanded
 
     def _trello_query_aliases(self, query: str) -> List[str]:
@@ -11168,8 +11934,6 @@ exit 1
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
             source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
-            if len(flow_outputs) >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
-                continue
             if source_attachments:
                 card["_image_attachments"] = source_attachments
                 card["_selected_attachment_ids"] = [

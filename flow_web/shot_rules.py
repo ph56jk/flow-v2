@@ -18,6 +18,7 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('wedding_pillowcase',
  'vows_book',
  'guest_book',
  'bouquet_ribbon',
+ 'passport_cover',
  'drawstring_bag',
  'banner',
  'crown',
@@ -2685,7 +2686,10 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                             'vay em be'),
                 'lock': 'the main product must remain the same baby/child dress with the exact dress silhouette, '
                         'sleeves/ruffles/ties/hem, fabric color, embroidery placement, garment scale, and construction '
-                        'from the source image',
+                        'from the source image; in every back-facing view, the back placket must show exactly two '
+                        'small natural wooden buttons, vertically aligned and evenly spaced like the reference photo, '
+                        'with no third button, no extra button row, no snaps, no zipper, no bow closure, and no added '
+                        'decorative back closures',
                 'shots': (('Product display',
                            '4 con manocanh',
                            'The product photos feature four dresses in different colors, based on the provided '
@@ -2758,7 +2762,9 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                            'manocanh 2 mặt',
                            'Use the dress in the reference image as the main product. Create a neat, Etsy-style '
                            "product photo, displaying two dresses on a child's mannequin, one in the front and one in "
-                           'the back (with two small wooden buttons evenly spaced at the back). Place the dress in an '
+                           'the back. The back-facing dress must show exactly two small natural wooden buttons, '
+                           'vertically aligned and evenly spaced on the back placket; do not add a third button, extra '
+                           'button row, snaps, zipper, bow closure, or decorative back closures. Place the dress in an '
                            'outdoor garden setting with soft, natural flowers and greenery in the background. Ensure '
                            'the dress retains its shape, color, texture, and details as in the reference image. Do not '
                            'edit, redesign, or alter the dress itself.\n'
@@ -2856,11 +2862,10 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                            'em bé',
                            'Use the dresses in the reference photos as the main product. Photograph the children '
                            'wearing the dresses against a white background: one child facing forward, one child facing '
-                           'backward (the back of the dress has two small wooden buttons spaced evenly apart). Add the '
-                           "following text to the photo: 'This lovely cotton linen children's dress is meticulously "
-                           'handcrafted by skilled artisans from a traditional Vietnamese embroidery village. Each '
-                           "dress is a work of art made with love, and we hope you love it as much as we do!' - Ensure "
-                           'the image is legible, logical, and visually appealing. Maintain the original shape, '
+                           'backward. The back-facing dress must show exactly two small natural wooden buttons, '
+                           'vertically aligned and evenly spaced on the back placket, matching the reference detail; '
+                           'do not add a third button, extra button row, snaps, zipper, bow closure, or decorative back '
+                           'closures. Do not add any text overlay or caption to the image. Maintain the original shape, '
                            'material, color, and details of each dress. Do not alter, redesign, embroider, or add any '
                            'decorative details. \n'
                            '\n'
@@ -4154,4 +4159,118 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                        'bright minimalist Etsy aesthetic, premium gift presentation, 1:1 square aspect ratio.\n'
                        '\n'
                        'AVOID: making the banner look puffy like a pillow, cluttered gift box styling, harsh lighting, '
-                       'distracting objects covering the embroidery, AI errors, overlays, logos, watermarks.'))}}
+                       'distracting objects covering the embroidery, AI errors, overlays, logos, watermarks.'))},
+ 'passport_cover': {'display_name': 'Passport Cover',
+                    'aliases': ('Passport Cover',
+                                'passport cover',
+                                'passport holder',
+                                'passport sleeve',
+                                'passport case',
+                                'travel document cover',
+                                'linen passport cover',
+                                'cotton linen passport cover',
+                                'embroidered passport cover',
+                                'hand embroidered passport cover',
+                                'boc passport',
+                                'bọc passport',
+                                'vo passport',
+                                'bia passport',
+                                'boc ho chieu',
+                                'vo boc ho chieu',
+                                'bia ho chieu',
+                                'vi ho chieu'),
+                    'lock': 'the main product must remain the same hand-embroidered cotton linen passport cover or '
+                            'passport holder from the source image, with the exact sleeve/pouch silhouette, fabric '
+                            'weave, base fabric color, closure or drawstring/cord if present, seams or edges, '
+                            'embroidery placement, motif scale, raised thread texture, natural wrinkles, and premium '
+                            'handmade travel-accessory identity; never turn it into a book, generic pouch, tote, '
+                            'wallet, passport booklet, or different travel accessory',
+                    'shots': (('Travel flat lay',
+                               'Travel desk with phone and boarding pass',
+                               'Place the passport cover beside a phone, boarding pass, earbuds, and a small wallet on '
+                               'a clean white tabletop. Add one white paper coffee cup, sunglasses, and a small keychain '
+                               'as light travel props, but do not cover the embroidery. Shoot from a 45-degree overhead '
+                               'angle with crisp modern white travel-lifestyle daylight. Keep the exact source cover '
+                               'shape, fabric weave, base color, stitch relief, embroidery position, and any closure or '
+                               'cord details unchanged.'),
+                              ('Handheld scale',
+                               'Hand holding cover front to camera',
+                               'One adult hand holds the passport cover from the lower edge, with the embroidered front '
+                               'facing the camera so the real size is clear. Use soft white natural light, natural skin '
+                               'tone, and a lightly blurred airport, white curtain, or bright wall background. Shoot '
+                               'straight-on at a close medium distance. The hand must not hide the embroidery, seams, '
+                               'edges, cord, or fabric texture.'),
+                              ('Airplane lifestyle',
+                               'Cover by airplane window',
+                               'Hold or place the passport cover beside an airplane window with a boarding pass as the '
+                               'only secondary prop. The embroidery should be clear in the foreground, lit by white '
+                               'natural window light without backlighting the product into darkness. Use a slight angled '
+                               'view and keep the passport cover as the visual center. Do not add clutter or extra travel '
+                               'items.'),
+                              ('Travel prep flat lay',
+                               'Checklist passport ticket phone charger',
+                               'Place the passport cover on a bright table beside a simple travel checklist, pen, '
+                               'passport, and small wallet. The checklist may contain short generic lines such as '
+                               'passport, ticket, phone, and charger, but it must stay secondary and not make the image '
+                               'busy. Shoot from a 60-75 degree overhead angle with clean white daylight, keeping the '
+                               'cover embroidery and cotton linen texture sharp.'),
+                              ('Colorway group',
+                               'Three to five linen color covers on journal',
+                               'Arrange three to five passport covers with the same embroidery layout and motif as the '
+                               'source, but with different linen base colors, in a horizontal row or lightly layered on '
+                               'an open travel journal over a white wood-grain table. Add a few small travel photos, '
+                               'pale washi tape, blue-white postcard, and simple faux travel stamps. If the source '
+                               'visibly contains a personalized name or initials, each color variant may use different '
+                               'plausible names or initials while preserving the same lettering and stitch style; if the '
+                               'source has no name, do not invent readable text.'),
+                              ('Colorway pair',
+                               'Two covers on bright balcony table',
+                               'Place two passport covers on a white table near a bright balcony window, using different '
+                               'linen base colors while keeping the embroidery motif, thread colors, cover shape, '
+                               'construction, and any closure or cord details identical to the source. Add a baseball '
+                               'cap, sunglasses, and linen tote as summer travel props. Use white natural shade light, '
+                               'no harsh sun and no yellow cast, from a 30-45 degree angle.'),
+                              ('Detail collage',
+                               'Four-panel edge embroidery and name macro',
+                               'Create one square detail collage made of four small close-up photos showing the passport '
+                               'cover edge finish, embroidery motif, any stitched name or initials from the source, '
+                               'fabric weave, raised thread texture, seams, corners, and closure or cord detail if '
+                               'present. Use soft white light sharp enough to prove the cotton linen fibers and '
+                               'handmade finish. No decor; this is a quality-proof close-up collage only.'),
+                              ('Airport lifestyle',
+                               'Traveler with cabin suitcase',
+                               'Frame a person from shoulders down, one hand pulling a cabin suitcase and the other hand '
+                               'holding the passport cover naturally at their side. Use a bright airport entrance or '
+                               'airport hallway background, white outdoor shade or bright indoor light, and a slightly '
+                               'low horizontal angle for a travel lifestyle feel. The passport cover must remain clear, '
+                               'properly scaled, and not hidden by fingers or luggage.'),
+                              ('Travel outfit lifestyle',
+                               'Woman holding cover near suitcase',
+                               'A woman in a minimal travel outfit stands near a bright window, holding the passport '
+                               'cover in front of her chest or beside a suitcase. Use natural white light, soft '
+                               'background blur, a light trench coat, tote bag, suitcase, and a white hotel or bright '
+                               'room background. Shoot half-body from a three-quarter angle while keeping the embroidery '
+                               'and product color bright and readable.'),
+                              ('Couple travel cafe',
+                               'Couple holding two cover colorways',
+                               'A woman and a man in minimal travel outfits sit at a cafe table, each holding a passport '
+                               'cover. The two covers may use different linen base colors, but the embroidery motif, '
+                               'thread palette, product silhouette, closure, edges, and handmade texture must remain '
+                               'consistent with the source. Shoot from the front so their faces and both product fronts '
+                               'are visible, with coffee cups, phone, and earbuds on the table as secondary props.'),
+                              ('Process lifestyle',
+                               'Woman embroidering matching fabric',
+                               'Show a woman sitting at a clean handmade craft table, holding the passport cover with '
+                               'one hand while carefully embroidering the same motif onto fabric matching the product '
+                               'color in a small embroidery hoop. Include a realistic threaded needle, small scissors, '
+                               'thread spools, folded linen, and beautiful window light. Hands must be natural and '
+                               'anatomically correct, with realistic needle placement and a genuine hand-embroidery '
+                               'feel, not flat machine embroidery.'),
+                              ('Gift presentation',
+                               'Cover flattened in small open gift box',
+                               'Place one passport cover neatly inside a small open light-colored paper gift box. The '
+                               'cover should be slightly flattened or gently folded, not puffed up too large; if the '
+                               'source is a soft pouch-style passport holder, let it sit naturally collapsed in the box. '
+                               'The embroidered front faces upward and remains clearly visible. Use only very light decor '
+                               'such as linen cloth or pale paper around the box, with nothing placed on top of the '
+                               'product or covering the embroidery.'))}}
