@@ -18,6 +18,7 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('wedding_pillowcase',
  'vows_book',
  'guest_book',
  'bouquet_ribbon',
+ 'hair_bow',
  'passport_cover',
  'drawstring_bag',
  'banner',
@@ -4160,6 +4161,118 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                        '\n'
                        'AVOID: making the banner look puffy like a pillow, cluttered gift box styling, harsh lighting, '
                        'distracting objects covering the embroidery, AI errors, overlays, logos, watermarks.'))},
+ 'hair_bow': {'display_name': 'Hair Bow',
+              'aliases': ('Hair Bow',
+                          'hair bow',
+                          'bow hair clip',
+                          'hair bow clip',
+                          'hair clip bow',
+                          'barrette bow',
+                          'bow barrette',
+                          'hair tie bow',
+                          'bow hair tie',
+                          'hair bow scrunchie',
+                          'bow scrunchie',
+                          'scrunchie bow',
+                          'scrunchie',
+                          'embroidered hair bow',
+                          'embroidered bow',
+                          'linen hair bow',
+                          'cotton linen hair bow',
+                          'hair accessory bow',
+                          'ribbon hair bow',
+                          'long tail hair bow',
+                          'no kep toc',
+                          'kep toc no',
+                          'no buoc toc',
+                          'no cot toc',
+                          'no chun buoc toc',
+                          'chun buoc toc no',
+                          'chun cot toc no'),
+              'lock': 'the main product must remain the same hand-embroidered cotton linen hair bow, bow hair clip, '
+                      'bow hair tie, or scrunchie-bow hair accessory from the source image, with the exact bow-loop '
+                      'silhouette, center knot or wrap, long ribbon tails and pointed ends if present, elastic scrunchie '
+                      'ring or clip/barrette/hair-tie hardware if visible, fabric weave, base fabric color, embroidery '
+                      'placement, motif scale, thread colors, raised stitch texture, seams, natural wrinkles, soft drape, '
+                      'and premium handmade identity; never turn it into a scarf, headband, bow tie, ribbon strip, dress, '
+                      'pouch, generic decoration, or different hair accessory type',
+              'shots': (('Flat lay product display',
+                         'Bow in wooden tray with linen props',
+                         'Place one hand-embroidered cotton linen hair bow naturally in a rectangular light wooden tray. '
+                         'Let the bow loops, center knot, elastic scrunchie ring or clip/hair-tie construction, and long '
+                         'ribbon tails rest softly without distortion. Add refined handmade props such as a wooden comb, '
+                         'light linen cloth, dried flowers, and white art paper. The embroidery, fabric weave, seams, '
+                         'tail points, and natural wrinkles must be crisp in clean white daylight.'),
+                        ('Colorway pair',
+                         'Two bows on bright vanity table',
+                         'Show two hair bows with the same source construction and embroidery layout, each using a '
+                         'different linen base color. Place them as a natural pair on a bright vanity table with a small '
+                         'hand mirror, wooden comb, dried flowers, and pale linen ribbon as secondary decor. Preserve the '
+                         'same bow-loop shape, center knot, tail length, elastic or clip hardware type, stitch placement, '
+                         'thread colors, and handmade cotton linen texture from the source.'),
+                        ('Tabletop colorway trio',
+                         'Three bows arranged on vanity table',
+                         'Arrange three coordinated hair bows flat on a bright light-wood vanity table or pale linen tabletop. '
+                         'Every bow must rest fully on the table, not hang from a rack, hook, string, peg, or clothesline. Each '
+                         'bow may have a different fabric color, but the embroidery motif, stitch colors, bow proportions, '
+                         'center knot, tail drape, and scrunchie/clip construction must match the source. Use a clean feminine '
+                         'handmade tabletop display with a wooden comb and dried flowers as secondary decor that does not cover the embroidery.'),
+                        ('Tabletop colorway collection',
+                         'Four bows laid on bright tabletop',
+                         'Display four hair bows as a neat colorway collection laid flat or softly resting on a bright light-wood '
+                         'tabletop in soft white daylight. Do not clip, pin, hang, peg, suspend, or attach the bows to any line, '
+                         'rack, hook, wall, or clothesline. Keep every bow in the same source style with identical embroidery '
+                         'placement, tail shape, bow-loop volume, center knot, hardware type, and cotton linen weave while '
+                         'varying only the fabric base color. Use a clean airy tabletop composition with natural light and no busy background.'),
+                        ('Lifestyle hair use',
+                         'Bow worn on low ponytail from back',
+                         'Show one hair bow worn on a low ponytail, photographed from the back or rear three-quarter angle '
+                         'so the face is not the focus. The bow is the main subject, the embroidery faces the camera, and '
+                         'the hair must not hide the stitches, center knot, tail drape, elastic/scrunchie ring, or clip '
+                         'placement. Use soft window light, neat hair, and a bright minimal background.'),
+                        ('Child hair lifestyle',
+                         'Bow worn in child hair from back',
+                         'Show one hair bow worn in the hair of a girl or female model, cropped from the back at a close '
+                         'medium distance. Use a pale wall or white curtain background. Keep the bow fully visible and '
+                         'correctly scaled, with embroidery sharp and not covered by hair. Preserve the exact source fabric '
+                         'color family, stitch colors, bow shape, center knot, tail length, and elastic or clip construction.'),
+                        ('Detail collage',
+                         'Four-panel embroidery fabric hardware macro',
+                         'Create one square detail collage made of four small close-up photos of the same hair bow. The '
+                         'panels must show raised hand embroidery, cotton linen weave, the gathered scrunchie ring or '
+                         'clip/barrette/hair-tie hardware if visible, seam finish, center knot wrap, and soft tail drape. '
+                         'This is a detail-proof collage only; do not create a colorway grid or redesign the embroidery.'),
+                        ('Process lifestyle',
+                         'Hands embroidering matching bow fabric',
+                         'Show an adult woman at a clean handmade craft table carefully embroidering the same motif onto '
+                         'matching cotton linen fabric for the hair bow, using a small embroidery hoop, realistic needle '
+                         'with thread, small scissors, thread spools, folded linen, and beautiful window light. Hands must '
+                         'be anatomically natural with realistic needle placement. The scene should clearly suggest the '
+                         'finished product is a hair bow or bow hair tie, not an embroidery hoop product.'),
+                        ('Group lifestyle',
+                         'Three girls wearing coordinated bows',
+                         'Create a bright lifestyle photo of three girls or female models from the back or rear side, each '
+                         'wearing one coordinated hair bow in a different linen base color. The bows must stay the focus, '
+                         'with the same source embroidery layout, thread colors, bow shape, tail drape, and hair attachment '
+                         'construction. Keep faces secondary or cropped and use clean white natural daylight.'),
+                        ('Basket accessory scene',
+                         'Bow in small wicker basket with hair props',
+                         'Place one hair bow in a small wicker basket with a few simple secondary hair accessories, pale '
+                         'linen cloth, and dried flowers. The embroidered face of the bow must point upward and remain '
+                         'uncovered. Use a bright premium handmade Etsy composition and preserve the exact source bow '
+                         'silhouette, center knot, tail ends, fabric texture, stitch relief, and elastic or clip hardware.'),
+                        ('Handheld scale',
+                         'Woman hand holding bow front visible',
+                         'One adult woman hand holds the hair bow gently from the lower edge or center so the size is clear. '
+                         'The embroidery, bow loops, tails, center knot, linen weave, and elastic/scrunchie ring or clip '
+                         'detail must remain visible and not be hidden by fingers. Use soft white daylight, natural hand '
+                         'anatomy, and a bright minimal background.'),
+                        ('Gift presentation',
+                         'Bow in small open gift box',
+                         'Place one hair bow neatly inside a small open light-colored paper gift box that fits the product. '
+                         'The bow should be arranged gently, not flattened too much, with embroidery facing upward and '
+                         'visible. Do not place anything on top of the bow. Use very light decor such as linen cloth or '
+                         'pale paper around the box, clean white daylight, and premium handmade gift styling.'))},
  'passport_cover': {'display_name': 'Passport Cover',
                     'aliases': ('Passport Cover',
                                 'passport cover',

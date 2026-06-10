@@ -99,6 +99,17 @@ class FlowBrowserProfile:
         return str(self.path.resolve()).lower()
 
 
+@dataclass(frozen=True)
+class ImageUpscaleResult:
+    bytes: Optional[bytes] = None
+    mime_type: str = ""
+    source: str = ""
+    source_size: tuple[int, int] = (0, 0)
+    target_size: tuple[int, int] = (0, 0)
+    used_flow: bool = False
+    failure_reason: str = ""
+
+
 class FlowAgentQuotaError(RuntimeError):
     """Raised when the current Google Flow Agent browser profile hits its quota."""
 
@@ -8880,11 +8891,10 @@ exit 1
                         set_cover and index == 0,
                     )
                 else:
-                    upscaled_bytes: Optional[bytes] = None
-                    upscaled_mime = ""
+                    upscale_result = ImageUpscaleResult()
                     if upscale_2k:
                         try:
-                            upscaled_bytes, upscaled_mime = await self._upsample_artifact_bytes(
+                            upscale_result = await self._upsample_artifact_bytes(
                                 artifact,
                                 artifact_url,
                             )
@@ -8893,18 +8903,42 @@ exit 1
                                 job_id,
                                 f"Không nâng được ảnh {index + 1} lên 2K (giữ bản gốc): {humanize_flow_error(str(up_exc))}",
                             )
-                            upscaled_bytes = None
+                            upscale_result = ImageUpscaleResult()
                         else:
-                            if upscaled_bytes and not upscale_announced:
+                            if upscale_result.bytes and upscale_result.source == "flow_2k" and not upscale_announced:
                                 await self.store.append_log(
                                     job_id,
-                                    "Đã nâng cấp ảnh lên 2K trước khi upload lên Trello.",
+                                    "Da dung Flow 2K that truoc khi upload len Trello.",
                                 )
                                 upscale_announced = True
+                            if upscale_result.bytes and upscale_result.source == "flow_2k":
+                                await self._persist_flow_2k_artifact_file(job_id, artifact, index, upscale_result)
+                            elif upscale_result.bytes and upscale_result.source == "local_resize":
+                                await self.store.append_log(
+                                    job_id,
+                                    (
+                                        f"Flow 2K khong tra duoc anh 2K that; da resize cuc bo anh {index + 1} "
+                                        f"({upscale_result.source_size[0]}x{upscale_result.source_size[1]} -> "
+                                        f"{upscale_result.target_size[0]}x{upscale_result.target_size[1]}) vi TRELLO_FAKE_2K_RESIZE_ENABLED dang bat."
+                                    ),
+                                )
+                            elif upscale_result.source == "flow_unavailable":
+                                detail = (
+                                    f" ({upscale_result.failure_reason})"
+                                    if upscale_result.failure_reason
+                                    else ""
+                                )
+                                await self.store.append_log(
+                                    job_id,
+                                    (
+                                        f"Flow 2K chua tra anh 2K that cho anh {index + 1}; "
+                                        f"giu anh goc va khong resize gia 2K{detail}."
+                                    ),
+                                )
                     try:
-                        if upscaled_bytes:
-                            source_bytes = upscaled_bytes
-                            source_mime = upscaled_mime or artifact.mime_type or "image/jpeg"
+                        if upscale_result.bytes:
+                            source_bytes = upscale_result.bytes
+                            source_mime = upscale_result.mime_type or artifact.mime_type or "image/jpeg"
                         else:
                             source_bytes, source_mime = await self._trello_artifact_file_bytes(
                                 job_id,
@@ -8912,7 +8946,7 @@ exit 1
                                 index,
                                 artifact_url,
                             )
-                            if upscale_2k:
+                            if upscale_2k and self._trello_fake_2k_resize_enabled():
                                 ensured_bytes, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
                                     self._ensure_image_long_edge_2k,
                                     source_bytes,
@@ -10253,6 +10287,47 @@ exit 1
                 "context": ("bouquet", "bridal bouquet", "wedding", "stitched lettering", "embroidered message", "draped"),
                 "exclude": ("book", "pillow", "cushion", "banner", "dress"),
             },
+            "hair_bow": {
+                "main": (
+                    "hair bow",
+                    "bow hair clip",
+                    "hair bow clip",
+                    "hair clip bow",
+                    "barrette bow",
+                    "bow barrette",
+                    "hair tie bow",
+                    "bow hair tie",
+                    "hair bow scrunchie",
+                    "bow scrunchie",
+                    "scrunchie bow",
+                    "scrunchie",
+                    "fabric bow",
+                    "ribbon bow",
+                    "no kep toc",
+                    "no buoc toc",
+                    "no cot toc",
+                    "chun buoc toc no",
+                ),
+                "context": (
+                    "hair",
+                    "hair accessory",
+                    "clip",
+                    "barrette",
+                    "scrunchie",
+                    "elastic",
+                    "hair tie",
+                    "ponytail",
+                    "bun",
+                    "girl hair",
+                    "linen",
+                    "cotton linen",
+                    "embroidered",
+                    "hand embroidered",
+                    "long tails",
+                    "center knot",
+                ),
+                "exclude": ("bouquet", "bridal bouquet", "dress", "headband", "bow tie", "pouch", "bag", "scarf", "ribbon strip", "pillow", "cushion", "banner", "book", "passport"),
+            },
             "passport_cover": {
                 "main": (
                     "passport cover",
@@ -11537,7 +11612,7 @@ exit 1
             )
         else:
             resume_note = ""
-        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover"})
+        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover", "hair_bow"})
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             self._flow_agent_fresh_context_rule(),
@@ -11552,7 +11627,7 @@ exit 1
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
                 "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, drawstring bag, passport cover, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, drawstring bag, passport cover, hair bow, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
@@ -11591,7 +11666,7 @@ exit 1
             ),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is apparel, it must remain the same apparel form.",
+            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is a hair bow, bow hair clip, or hair tie bow, it must remain the same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware; if it is apparel, it must remain the same apparel form.",
             (
                 "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
                 if signals.get("is_pennant")
@@ -12271,14 +12346,327 @@ exit 1
         return payload if isinstance(payload, dict) else {}
 
     # ── Flow image upsampler (POST /v1/flow/upsampleImage) ──────────────────
-    # This endpoint has changed schema more than once. Keep it opt-in so Trello
-    # upload does not spend time on a broken helper before falling back locally.
+    # Match Flow's current 2K image upsample request first. Local resize is
+    # opt-in only because it increases pixel count without adding real detail.
 
     def _flow_upsample_api_enabled(self) -> bool:
         value = os.getenv("FLOW_UPSAMPLE_API_ENABLED", "").strip().lower()
+        if not value:
+            return True
+        return value not in {"0", "false", "no", "off"}
+
+    def _trello_fake_2k_resize_enabled(self) -> bool:
+        value = os.getenv("TRELLO_FAKE_2K_RESIZE_ENABLED", "").strip().lower()
         return value in {"1", "true", "yes", "on"}
 
-    async def _upsample_image_via_flow(self, client: Any, jpeg_bytes: bytes) -> bytes:
+    def _flow_upsample_payloads(
+        self,
+        media_id: str,
+        *,
+        client_context: Dict[str, Any] | None = None,
+    ) -> List[Dict[str, Any]]:
+        payload: Dict[str, Any] = {
+            "mediaId": media_id,
+            "targetResolution": "UPSAMPLE_IMAGE_RESOLUTION_2K",
+        }
+        if client_context:
+            payload["clientContext"] = client_context
+        return [payload]
+
+    def _flow_media_redirect_url(self, media_name: str) -> str:
+        media = str(media_name or "").strip()
+        if not media:
+            return ""
+        return f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name={quote(media)}"
+
+    def _normal_flow_media_name(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw or raw.startswith(("http://", "https://")):
+            return ""
+        match = re.search(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            raw,
+        )
+        return match.group(0) if match else ""
+
+    def _extract_flow_media_names(self, payload: Any) -> List[str]:
+        names: List[str] = []
+        seen: set[str] = set()
+
+        def visit(value: Any, parent_key: str = "") -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    key_text = str(key or "")
+                    if key_text in {"mediaId", "mediaName", "name", "primaryMediaId"}:
+                        if isinstance(child, str):
+                            media_name = self._normal_flow_media_name(child)
+                            if media_name and media_name not in seen:
+                                seen.add(media_name)
+                                names.append(media_name)
+                        elif isinstance(child, dict):
+                            visit(child, key_text)
+                            for nested_key in ("mediaName", "name"):
+                                media_name = self._normal_flow_media_name(child.get(nested_key))
+                                if media_name and media_name not in seen:
+                                    seen.add(media_name)
+                                    names.append(media_name)
+                    else:
+                        visit(child, key_text)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item, parent_key)
+
+        visit(payload)
+        return names
+
+    def _extract_image_urls(self, payload: Any) -> List[str]:
+        urls: List[str] = []
+        seen: set[str] = set()
+        url_keys = {"fifeUrl", "downloadUrl", "imageUrl", "url", "fifeUri", "uri"}
+
+        def visit(value: Any, parent_key: str = "") -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    key_text = str(key or "")
+                    if key_text in url_keys and "thumb" not in key_text.lower() and isinstance(child, str):
+                        url = child.strip()
+                        if url.startswith("/"):
+                            url = f"https://labs.google{url}"
+                        if url.startswith(("http://", "https://")) and url not in seen:
+                            seen.add(url)
+                            urls.append(url)
+                    else:
+                        visit(child, key_text)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item, parent_key)
+
+        visit(payload)
+        return urls
+
+    async def _download_flow_image_bytes(self, client: Any, url: str) -> tuple[bytes, str]:
+        target = str(url or "").strip()
+        if not target:
+            return b"", ""
+        try:
+            response = await client._bm.context.request.get(target)
+            status = int(getattr(response, "status", 0) or 0)
+            if status and status != 200:
+                log.warning("Flow 2K image download failed HTTP %s: %s", status, target)
+                return b"", ""
+            body = await response.body()
+            headers = getattr(response, "headers", {}) or {}
+            mime = str(headers.get("content-type") or "").split(";", 1)[0].strip()
+            return bytes(body or b""), mime or mimetypes.guess_type(target)[0] or "image/jpeg"
+        except Exception as exc:
+            log.warning("Flow 2K image download failed: %s", self._flow_error_detail(exc))
+            return b"", ""
+
+    async def _flow_upsample_response_bytes(
+        self,
+        client: Any,
+        payload: Any,
+        *,
+        fallback_media_id: str = "",
+    ) -> tuple[bytes, str]:
+        import base64 as _b64
+
+        encoded_out = self._extract_encoded_image(payload)
+        if encoded_out:
+            try:
+                return _b64.b64decode(encoded_out), "image/jpeg"
+            except Exception as exc:
+                log.warning("flow/upsampleImage: base64 decode failed: %s", exc)
+
+        for url in self._extract_image_urls(payload):
+            downloaded, mime = await self._download_flow_image_bytes(client, url)
+            if downloaded:
+                return downloaded, mime
+
+        media_names = self._extract_flow_media_names(payload)
+        fallback = self._normal_flow_media_name(fallback_media_id)
+        if fallback and fallback not in media_names:
+            media_names.append(fallback)
+        for media_name in media_names:
+            downloaded, mime = await self._download_flow_image_bytes(
+                client,
+                self._flow_media_redirect_url(media_name),
+            )
+            if downloaded:
+                return downloaded, mime
+
+        return b"", ""
+
+    async def _flow_ui_click_text(
+        self,
+        page: Any,
+        *,
+        contains: tuple[str, ...] = (),
+        startswith: tuple[str, ...] = (),
+    ) -> bool:
+        rect = await page.evaluate(
+            """
+            ({ contains, startswith }) => {
+              const normalize = (value) => (value || '')
+                .normalize('NFD')
+                .replace(/[\\u0300-\\u036f]/g, '')
+                .toLowerCase()
+                .replace(/\\s+/g, ' ')
+                .trim();
+              const containsNeedles = contains.map(normalize).filter(Boolean);
+              const startsWithNeedles = startswith.map(normalize).filter(Boolean);
+              const visible = (el) => {
+                if (!el || !(el instanceof Element)) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                  && style.visibility !== 'hidden'
+                  && style.opacity !== '0'
+                  && rect.width > 0
+                  && rect.height > 0
+                  && rect.bottom > 0
+                  && rect.right > 0
+                  && rect.top < window.innerHeight
+                  && rect.left < window.innerWidth;
+              };
+              const nodes = [...document.querySelectorAll('button, [role="menuitem"], [role="option"], [role="button"]')];
+              for (const node of nodes) {
+                if (!visible(node)) continue;
+                const text = normalize(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
+                if (!text) continue;
+                const matched = containsNeedles.some((needle) => text.includes(needle))
+                  || startsWithNeedles.some((needle) => text.startsWith(needle));
+                if (!matched) continue;
+                const rect = node.getBoundingClientRect();
+                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+              }
+              return null;
+            }
+            """,
+            {"contains": list(contains), "startswith": list(startswith)},
+        )
+        if not isinstance(rect, dict):
+            return False
+        await page.mouse.click(float(rect["x"]), float(rect["y"]))
+        return True
+
+    async def _flow_ui_image_rect_for_media(self, page: Any, media_id: str) -> Dict[str, float]:
+        media = self._normal_flow_media_name(media_id)
+        if not media:
+            return {}
+        deadline = time.monotonic() + 45.0
+        last_rect: Dict[str, float] = {}
+        while time.monotonic() < deadline:
+            rect = await page.evaluate(
+                """
+                (mediaId) => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none'
+                      && style.visibility !== 'hidden'
+                      && rect.width >= 80
+                      && rect.height >= 80
+                      && rect.bottom > 0
+                      && rect.right > 0
+                      && rect.top < window.innerHeight
+                      && rect.left < window.innerWidth;
+                  };
+                  const all = [...document.querySelectorAll('img[src], img[srcset]')]
+                    .filter((img) => {
+                      const src = img.currentSrc || img.src || img.getAttribute('src') || img.getAttribute('srcset') || '';
+                      return src.includes(`name=${mediaId}`) || src.includes(`name%3D${mediaId}`);
+                    });
+                  if (!all.length) return null;
+                  const scored = all
+                    .filter(visible)
+                    .map((img) => {
+                      const rect = img.getBoundingClientRect();
+                      return { img, area: rect.width * rect.height };
+                    })
+                    .sort((a, b) => b.area - a.area);
+                  const chosen = scored.length ? scored[0].img : all[0];
+                  chosen.scrollIntoView({ block: 'center', inline: 'center' });
+                  const rect = chosen.getBoundingClientRect();
+                  return {
+                    x: rect.left,
+                    y: rect.top,
+                    width: rect.width,
+                    height: rect.height,
+                    visible: visible(chosen),
+                  };
+                }
+                """,
+                media,
+            )
+            if isinstance(rect, dict):
+                last_rect = {
+                    "x": float(rect.get("x") or 0),
+                    "y": float(rect.get("y") or 0),
+                    "width": float(rect.get("width") or 0),
+                    "height": float(rect.get("height") or 0),
+                }
+                if rect.get("visible") and last_rect["width"] > 0 and last_rect["height"] > 0:
+                    return last_rect
+            await asyncio.sleep(1.0)
+        return last_rect
+
+    async def _upsample_image_via_flow_ui_download(self, client: Any, media_id: str) -> bytes:
+        media = self._normal_flow_media_name(media_id)
+        if not media:
+            return b""
+        page = await client._bm.page()
+        project_id = str(getattr(client._api, "project_id", "") or "").strip()
+        target_url = self._project_url(project_id) if project_id else str(getattr(client, "_project_url", "") or "")
+        if target_url and target_url not in str(page.url or ""):
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+            await asyncio.sleep(2.0)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+        except Exception:
+            pass
+
+        rect = await self._flow_ui_image_rect_for_media(page, media)
+        if not rect:
+            log.warning("Flow UI 2K download skipped: media tile not found for %s", media)
+            return b""
+
+        menu_x = rect["x"] + rect["width"] - 28
+        menu_y = rect["y"] + 28
+        await page.mouse.move(menu_x, menu_y)
+        await asyncio.sleep(0.4)
+        await page.mouse.click(menu_x, menu_y)
+        await asyncio.sleep(0.5)
+        if not await self._flow_ui_click_text(page, contains=("Tải xuống", "Tai xuong", "Download")):
+            log.warning("Flow UI 2K download skipped: download menu item not found")
+            return b""
+        await asyncio.sleep(0.5)
+
+        target_dir = DOWNLOADS_DIR / "_flow_2k_downloads"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / f"{media}-{uuid.uuid4().hex}.jpg"
+        try:
+            async with page.expect_download(timeout=120_000) as download_info:
+                clicked = await self._flow_ui_click_text(page, startswith=("2K",))
+                if not clicked:
+                    raise RuntimeError("2K download option not found")
+            download = await download_info.value
+            await download.save_as(str(target_path))
+            return await asyncio.to_thread(target_path.read_bytes)
+        except Exception as exc:
+            log.warning("Flow UI 2K download failed: %s", self._flow_error_detail(exc))
+            return b""
+
+    async def _upsample_image_via_flow(
+        self,
+        client: Any,
+        jpeg_bytes: bytes,
+        *,
+        media_generation_id: str = "",
+        workflow_id: str = "",
+        prompt: str = "",
+    ) -> bytes:
         """Call POST /v1/flow/upsampleImage and return the upscaled JPEG bytes.
 
         Returns the original bytes on any failure so the caller can still
@@ -12286,46 +12674,107 @@ exit 1
         """
         if not jpeg_bytes:
             return jpeg_bytes
-        try:
-            import base64 as _b64
-            encoded_in = _b64.b64encode(jpeg_bytes).decode("ascii")
-            data = await client._api._fetch(
-                "POST",
-                "flow/upsampleImage",
-                {"encodedImage": encoded_in},
-            )
-        except Exception as exc:
-            log.warning("flow/upsampleImage failed: %s", self._flow_error_detail(exc))
+        media_id = self._normal_flow_media_name(media_generation_id)
+        if not media_id:
+            log.warning("flow/upsampleImage skipped: missing Flow media id")
             return jpeg_bytes
-        encoded_out = self._extract_encoded_image(data)
-        if not encoded_out:
+        try:
+            client_context = await client._api._client_context()
+        except Exception as exc:
+            log.warning("flow/upsampleImage client context failed: %s", self._flow_error_detail(exc))
+            client_context = {}
+
+        payloads = self._flow_upsample_payloads(media_id, client_context=client_context)
+        for attempt, payload in enumerate(payloads, start=1):
+            try:
+                data = await client._api._fetch(
+                    "POST",
+                    "flow/upsampleImage",
+                    payload,
+                )
+            except Exception as exc:
+                log.warning(
+                    "flow/upsampleImage attempt %s media=%s failed: %s",
+                    attempt,
+                    media_id,
+                    self._flow_error_detail(exc),
+                )
+                continue
+            decoded, _mime = await self._flow_upsample_response_bytes(
+                client,
+                data,
+                fallback_media_id=media_id,
+            )
+            if not decoded:
+                log.warning(
+                    "flow/upsampleImage: response missing image bytes/url/media field (keys=%s)",
+                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                )
+                continue
+            if decoded == jpeg_bytes:
+                log.warning(
+                    "flow/upsampleImage attempt %s media=%s returned original bytes",
+                    attempt,
+                    media_id,
+                )
+                continue
+            decoded_size = self._image_size_from_bytes(decoded)
+            if decoded_size and max(decoded_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+                return decoded
             log.warning(
-                "flow/upsampleImage: response missing encodedImage field (keys=%s)",
-                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                "flow/upsampleImage attempt %s media=%s returned non-2K bytes (%sx%s)",
+                attempt,
+                media_id,
+                decoded_size[0] if decoded_size else 0,
+                decoded_size[1] if decoded_size else 0,
             )
-            return jpeg_bytes
-        try:
-            return _b64.b64decode(encoded_out)
-        except Exception as exc:
-            log.warning("flow/upsampleImage: base64 decode failed: %s", exc)
-            return jpeg_bytes
+        ui_downloaded = await self._upsample_image_via_flow_ui_download(client, media_id)
+        if ui_downloaded and ui_downloaded != jpeg_bytes:
+            ui_size = self._image_size_from_bytes(ui_downloaded)
+            if ui_size and max(ui_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+                return ui_downloaded
+            log.warning(
+                "Flow UI 2K download returned non-2K bytes (%sx%s)",
+                ui_size[0] if ui_size else 0,
+                ui_size[1] if ui_size else 0,
+            )
+        return jpeg_bytes
 
     def _extract_encoded_image(self, payload: Any) -> str:
-        """Recursively find the first ``encodedImage`` string in a JSON tree."""
+        """Recursively find the first encoded image string in a JSON tree."""
+        return self._extract_image_bytes_field(payload, {"encodedImage", "rawBytes", "imageBytes"})
+
+    def _extract_image_bytes_field(self, payload: Any, field_names: set[str]) -> str:
         if isinstance(payload, dict):
-            candidate = payload.get("encodedImage")
-            if isinstance(candidate, str) and candidate:
-                return candidate
+            for key in field_names:
+                candidate = payload.get(key)
+                if isinstance(candidate, str) and candidate:
+                    return candidate
             for value in payload.values():
-                found = self._extract_encoded_image(value)
+                found = self._extract_image_bytes_field(value, field_names)
                 if found:
                     return found
         elif isinstance(payload, list):
             for item in payload:
-                found = self._extract_encoded_image(item)
+                found = self._extract_image_bytes_field(item, field_names)
                 if found:
                     return found
         return ""
+
+    def _image_size_from_bytes(self, image_bytes: bytes) -> tuple[int, int]:
+        if not image_bytes:
+            return (0, 0)
+        try:
+            from PIL import Image, ImageOps
+        except Exception:
+            return (0, 0)
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as opened:
+                image = ImageOps.exif_transpose(opened)
+                return tuple(int(part) for part in image.size)
+        except Exception:
+            return (0, 0)
 
     def _ensure_image_long_edge_2k(
         self,
@@ -12334,9 +12783,9 @@ exit 1
     ) -> tuple[bytes, str, bool, tuple[int, int], tuple[int, int]]:
         """Return JPEG bytes whose long edge is at least 2048px.
 
-        This local pass guarantees the Trello file itself is not a
-        low-resolution thumbnail when Flow's optional upsample API is disabled
-        or unavailable.
+        This local pass only changes the pixel dimensions. It is kept as an
+        explicit opt-in fallback for users who want 2048px files even when Flow
+        does not return true 2K image detail.
         """
         if not image_bytes:
             return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
@@ -12380,12 +12829,11 @@ exit 1
         self,
         artifact: JobArtifact,
         artifact_url: str,
-    ) -> tuple[Optional[bytes], str]:
-        """Fetch an artifact and upsample it via flow/upsampleImage.
+    ) -> ImageUpscaleResult:
+        """Fetch an artifact and prepare 2K bytes for Trello upload.
 
-        Returns ``(upscaled_bytes, mime)`` on success, or ``(None, "")`` if the
-        source bytes could not be fetched. JPEG is preferred since the Flow
-        upsampler expects an encoded JPEG payload.
+        Flow's own 2K upsampler is tried first. Local resize is disabled by
+        default because it creates a larger but still blurry file.
         """
         local_path = str(artifact.local_path or "").strip()
         source_bytes: bytes = b""
@@ -12403,12 +12851,21 @@ exit 1
             )
             source_mime = source_mime or detected_mime or "image/jpeg"
         if not source_bytes:
-            return None, ""
+            return ImageUpscaleResult()
 
         workflow_id = str(artifact.workflow_id or "").strip()
+        media_generation_id = str(artifact.media_name or "").strip()
+        source_size = await asyncio.to_thread(self._image_size_from_bytes, source_bytes)
+        if source_size and max(source_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+            return ImageUpscaleResult()
 
         async def _go(client: Any) -> bytes:
-            return await self._upsample_image_via_flow(client, source_bytes)
+            return await self._upsample_image_via_flow(
+                client,
+                source_bytes,
+                media_generation_id=media_generation_id,
+                workflow_id=workflow_id,
+            )
 
         flow_upscaled: bytes = b""
         if self._flow_upsample_api_enabled():
@@ -12417,20 +12874,93 @@ exit 1
             except Exception as exc:
                 log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
 
-        candidate_bytes = flow_upscaled if flow_upscaled and flow_upscaled != source_bytes else source_bytes
-        candidate_mime = "image/jpeg" if flow_upscaled and flow_upscaled != source_bytes else source_mime
-        ensured, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
-            self._ensure_image_long_edge_2k,
-            candidate_bytes,
-            candidate_mime,
+        flow_changed = bool(flow_upscaled and flow_upscaled != source_bytes)
+        candidate_bytes = flow_upscaled if flow_changed else source_bytes
+        candidate_mime = "image/jpeg" if flow_changed else source_mime
+        candidate_size = await asyncio.to_thread(self._image_size_from_bytes, candidate_bytes)
+        if flow_changed and candidate_size and max(candidate_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+            return ImageUpscaleResult(
+                bytes=flow_upscaled,
+                mime_type="image/jpeg",
+                source="flow_2k",
+                source_size=source_size,
+                target_size=candidate_size,
+                used_flow=True,
+            )
+
+        if self._trello_fake_2k_resize_enabled():
+            ensured, ensured_mime, changed, resize_source_size, resize_target_size = await asyncio.to_thread(
+                self._ensure_image_long_edge_2k,
+                candidate_bytes,
+                candidate_mime,
+            )
+            if changed:
+                log.info("Locally resized Trello image from %sx%s to %sx%s", *resize_source_size, *resize_target_size)
+                return ImageUpscaleResult(
+                    bytes=ensured,
+                    mime_type=ensured_mime,
+                    source="local_resize",
+                    source_size=resize_source_size,
+                    target_size=resize_target_size,
+                    used_flow=flow_changed,
+                )
+
+        reason = "Flow returned original bytes"
+        if flow_changed:
+            reason = (
+                f"Flow returned {candidate_size[0]}x{candidate_size[1]} bytes"
+                if candidate_size
+                else "Flow returned unreadable image bytes"
+            )
+        elif not self._flow_upsample_api_enabled():
+            reason = "Flow upsample API disabled"
+        return ImageUpscaleResult(
+            source="flow_unavailable",
+            source_size=source_size,
+            target_size=candidate_size or source_size,
+            used_flow=flow_changed,
+            failure_reason=reason,
         )
-        if changed:
-            log.info("Upscaled Trello image from %sx%s to %sx%s", *source_size, *target_size)
-            return ensured, ensured_mime
-        if flow_upscaled and flow_upscaled != source_bytes:
-            # The Flow upsampler returns JPEG bytes regardless of input mime.
-            return ensured, ensured_mime or "image/jpeg"
-        return None, ""
+
+    async def _persist_flow_2k_artifact_file(
+        self,
+        job_id: str,
+        artifact: JobArtifact,
+        artifact_index: int,
+        upscale: ImageUpscaleResult,
+    ) -> None:
+        if not upscale.bytes or upscale.source != "flow_2k":
+            return
+        try:
+            job = self.store.get_job(job_id)
+            if job is not None:
+                file_name = self._download_name(job, artifact, artifact_index)
+            else:
+                file_name = f"{job_id}-{artifact_index + 1}.jpg"
+            base_name = Path(file_name).name or f"{job_id}-{artifact_index + 1}.jpg"
+            base_path = Path(base_name)
+            destination = self._download_root() / f"{base_path.stem}-2k.jpg"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(destination.write_bytes, upscale.bytes)
+
+            artifact.local_path = str(destination)
+            artifact.public_url = self._public_download_url(str(destination))
+            artifact.mime_type = upscale.mime_type or "image/jpeg"
+            if upscale.target_size and max(upscale.target_size) > 0:
+                dimensions = dict(artifact.dimensions or {})
+                dimensions.update(
+                    {
+                        "width": upscale.target_size[0],
+                        "height": upscale.target_size[1],
+                        "upscale_source": upscale.source,
+                    }
+                )
+                artifact.dimensions = dimensions
+
+            if job is not None and any(existing is artifact for existing in job.artifacts):
+                await self.store.replace_artifacts(job_id, job.artifacts)
+        except Exception as exc:
+            log.warning("Could not persist Flow 2K artifact file: %s", exc)
 
     def _read_remote_file(self, url: str) -> tuple[bytes, str]:
         request = Request(url, headers={"User-Agent": "FlowWebUI/0.1"})

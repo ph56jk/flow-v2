@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import io
 import json
@@ -34,7 +35,7 @@ from flow_web.schemas import (
     TrelloConfigUpdateRequest,
     UserAssistantRequest,
 )
-from flow_web.service import FlowAgentQuotaError, FlowBrowserProfile, FlowWebService
+from flow_web.service import FlowAgentQuotaError, FlowBrowserProfile, FlowWebService, ImageUpscaleResult
 from flow_web.shot_rules import PRODUCT_SHOT_RULES
 from flow_web.store import StateStore
 
@@ -830,6 +831,45 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Drawstring Bag category", item["design_analysis"])
         self.assertNotIn("Show one single cotton linen drawstring bag standing naturally", item["prompt"])
 
+    def test_auto_trello_uses_havi_hair_bow_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        cards = [
+            {
+                "id": "card-hair-bow",
+                "shortLink": "hair-bow",
+                "idList": "ready",
+                "name": "no_buoc_toc_theu_tay_linen_202606090812.jpeg",
+                "url": "https://trello.example/c/hair-bow",
+                "_image_attachments": [{"id": "att-hair-bow", "name": "embroidered_hair_tie_bow.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-hair-bow"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("hair_bow")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Hair Bow category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Hair Bow", item["prompt"])
+        self.assertIn("Bow in wooden tray with linen props", item["shot_labels"][0])
+        self.assertIn("Three bows arranged on vanity table", item["prompt"])
+        self.assertIn("Four bows laid on bright tabletop", item["prompt"])
+        self.assertIn("Every bow must rest fully on the table", item["prompt"])
+        self.assertIn("Do not clip, pin, hang, peg, suspend, or attach the bows", item["prompt"])
+        self.assertIn("Place one hand-embroidered cotton linen hair bow naturally", item["prompt"])
+        self.assertIn("elastic scrunchie ring or clip/hair-tie construction", item["prompt"])
+        self.assertIn("Create one square detail collage made of four small close-up photos", item["prompt"])
+        self.assertIn("Place one hair bow neatly inside a small open light-colored paper gift box", item["prompt"])
+        self.assertIn("same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware", item["prompt"])
+        self.assertIn("The explicitly numbered close-up detail collage shot is the only allowed four-panel image", item["prompt"])
+        self.assertNotIn("Four bows clipped on clothesline", item["prompt"])
+        self.assertNotIn("wooden hair accessory rack", item["prompt"])
+        self.assertNotIn("Passport Cover category", item["design_analysis"])
+        self.assertNotIn("Drawstring Bag category", item["design_analysis"])
+
     def test_auto_trello_visual_product_rule_overrides_random_card_name(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
         cards = [
@@ -1127,6 +1167,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "vows_book": "small fabric covered booklet for personal vows with embroidered cover lettering",
             "guest_book": "fabric covered sign in album for wedding guests with embroidered cover",
             "bouquet_ribbon": "long fabric strip tied to a bridal bouquet with stitched lettering",
+            "hair_bow": "cotton linen embroidered hair bow scrunchie with center knot and long tails for a ponytail",
             "passport_cover": "cotton linen passport cover holder with hand embroidered travel motif beside a boarding pass",
             "drawstring_bag": "cotton linen drawstring pouch with rope cords, gathered top, and hand embroidered lavender motif",
             "banner": "flat triangular nursery wall hanging with top wooden dowel cord hanger and pointed V bottom",
@@ -1795,6 +1836,134 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("source-card", result["source_card_id"])
         self.assertEqual(["source-att"], result["source_attachment_ids"])
 
+    def test_flow_upsample_payload_requests_2k_resolution(self) -> None:
+        from PIL import Image
+
+        calls: list[tuple[str, str, dict[str, Any]]] = []
+        output_image = io.BytesIO()
+        Image.new("RGB", (2048, 2048), (120, 160, 200)).save(output_image, format="JPEG")
+        flow_2k_bytes = output_image.getvalue()
+        encoded_output = base64.b64encode(flow_2k_bytes).decode("ascii")
+
+        class FakeApi:
+            async def _client_context(self) -> dict[str, Any]:
+                return {
+                    "projectId": "pid",
+                    "tool": "PINHOLE",
+                    "sessionId": ";123",
+                    "recaptchaContext": {"token": "abc", "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB"},
+                }
+
+            async def _fetch(self, method: str, path: str, payload: dict[str, Any]) -> dict[str, str]:
+                calls.append((method, path, payload))
+                return {"encodedImage": encoded_output}
+
+        client = SimpleNamespace(_api=FakeApi())
+        result = asyncio.run(
+            self.service._upsample_image_via_flow(
+                client,
+                b"source-bytes",
+                media_generation_id="00000000-1111-2222-3333-444444444444",
+                workflow_id="workflow-456",
+                prompt="product prompt",
+            )
+        )
+
+        self.assertEqual(flow_2k_bytes, result)
+        self.assertEqual(1, len(calls))
+        method, path, payload = calls[0]
+        self.assertEqual("POST", method)
+        self.assertEqual("flow/upsampleImage", path)
+        self.assertEqual("00000000-1111-2222-3333-444444444444", payload["mediaId"])
+        self.assertEqual("UPSAMPLE_IMAGE_RESOLUTION_2K", payload["targetResolution"])
+        self.assertEqual("pid", payload["clientContext"]["projectId"])
+        self.assertEqual("PINHOLE", payload["clientContext"]["tool"])
+        self.assertEqual("abc", payload["clientContext"]["recaptchaContext"]["token"])
+
+    def test_flow_upsample_downloads_media_response_when_no_encoded_bytes(self) -> None:
+        from PIL import Image
+
+        source_image = io.BytesIO()
+        Image.new("RGB", (1024, 1024), (210, 180, 140)).save(source_image, format="JPEG")
+        source_bytes = source_image.getvalue()
+        flow_image = io.BytesIO()
+        Image.new("RGB", (2048, 2048), (120, 160, 200)).save(flow_image, format="JPEG")
+        flow_2k_bytes = flow_image.getvalue()
+        calls: list[dict[str, Any]] = []
+        downloads: list[str] = []
+
+        class FakeApi:
+            async def _client_context(self) -> dict[str, Any]:
+                return {"projectId": "pid"}
+
+            async def _fetch(self, method: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+                calls.append(payload)
+                return {"media": {"name": "11111111-2222-3333-4444-555555555555"}}
+
+        class FakeResponse:
+            status = 200
+            headers = {"content-type": "image/jpeg"}
+
+            async def body(self) -> bytes:
+                return flow_2k_bytes
+
+        class FakeRequest:
+            async def get(self, url: str) -> FakeResponse:
+                downloads.append(url)
+                return FakeResponse()
+
+        client = SimpleNamespace(_api=FakeApi(), _bm=SimpleNamespace(context=SimpleNamespace(request=FakeRequest())))
+        result = asyncio.run(
+            self.service._upsample_image_via_flow(
+                client,
+                source_bytes,
+                media_generation_id="00000000-1111-2222-3333-444444444444",
+            )
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual(flow_2k_bytes, result)
+        self.assertEqual(
+            ["https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=11111111-2222-3333-4444-555555555555"],
+            downloads,
+        )
+
+    def test_flow_upsample_uses_ui_download_when_direct_api_returns_original(self) -> None:
+        from PIL import Image
+
+        source_image = io.BytesIO()
+        Image.new("RGB", (1024, 1024), (210, 180, 140)).save(source_image, format="JPEG")
+        source_bytes = source_image.getvalue()
+        flow_image = io.BytesIO()
+        Image.new("RGB", (2048, 2048), (120, 160, 200)).save(flow_image, format="JPEG")
+        flow_2k_bytes = flow_image.getvalue()
+        encoded_source = base64.b64encode(source_bytes).decode("ascii")
+
+        class FakeApi:
+            async def _client_context(self) -> dict[str, Any]:
+                return {"projectId": "pid"}
+
+            async def _fetch(self, method: str, path: str, payload: dict[str, Any]) -> dict[str, str]:
+                return {"encodedImage": encoded_source}
+
+        client = SimpleNamespace(_api=FakeApi())
+
+        with patch.object(
+            self.service,
+            "_upsample_image_via_flow_ui_download",
+            new=AsyncMock(return_value=flow_2k_bytes),
+        ) as ui_download:
+            result = asyncio.run(
+                self.service._upsample_image_via_flow(
+                    client,
+                    source_bytes,
+                    media_generation_id="00000000-1111-2222-3333-444444444444",
+                )
+            )
+
+        self.assertEqual(flow_2k_bytes, result)
+        ui_download.assert_awaited_once_with(client, "00000000-1111-2222-3333-444444444444")
+
     def test_trello_archive_upsamples_image_to_2k_before_file_upload(self) -> None:
         asyncio.run(
             self.service.update_trello_config(
@@ -1825,7 +1994,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ), patch.object(
             self.service,
             "_upsample_artifact_bytes",
-            new=AsyncMock(return_value=(b"upscaled-jpeg-bytes", "image/jpeg")),
+            new=AsyncMock(
+                return_value=ImageUpscaleResult(
+                    bytes=b"upscaled-jpeg-bytes",
+                    mime_type="image/jpeg",
+                    source="flow_2k",
+                    source_size=(1024, 1024),
+                    target_size=(2048, 2048),
+                    used_flow=True,
+                )
+            ),
         ) as upsample, patch.object(
             self.service,
             "_trello_attach_file_bytes",
@@ -1848,7 +2026,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_locally_forces_2k_when_flow_upsample_keeps_original(self) -> None:
+    def test_trello_archive_keeps_original_when_flow_upsample_keeps_original(self) -> None:
         from PIL import Image
 
         source_image = io.BytesIO()
@@ -1889,13 +2067,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         attach_bytes.assert_called_once()
         uploaded_bytes = attach_bytes.call_args.args[3]
         with Image.open(io.BytesIO(uploaded_bytes)) as uploaded:
-            self.assertEqual((2048, 2048), uploaded.size)
+            self.assertEqual((512, 512), uploaded.size)
         self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
+        saved = self.store.get_job(job.id)
+        self.assertTrue(any("khong resize gia 2K" in entry.message for entry in saved.logs))
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_forces_2k_after_flow_upsample_failure(self) -> None:
+    def test_trello_archive_keeps_original_after_flow_upsample_failure(self) -> None:
         from PIL import Image
 
         source_file = self.downloads_dir / "flow-small.jpg"
@@ -1930,7 +2110,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         attach_bytes.assert_called_once()
         uploaded_bytes = attach_bytes.call_args.args[3]
         with Image.open(io.BytesIO(uploaded_bytes)) as uploaded:
-            self.assertEqual(2048, max(uploaded.size))
+            self.assertEqual((640, 480), uploaded.size)
         self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
@@ -2036,7 +2216,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         with patch.object(
             self.service,
             "_upsample_artifact_bytes",
-            new=AsyncMock(return_value=(b"upscaled-jpeg-bytes", "image/jpeg")),
+            new=AsyncMock(
+                return_value=ImageUpscaleResult(
+                    bytes=b"upscaled-jpeg-bytes",
+                    mime_type="image/jpeg",
+                    source="flow_2k",
+                    source_size=(1024, 1024),
+                    target_size=(2048, 2048),
+                    used_flow=True,
+                )
+            ),
         ) as upsample, patch.object(
             self.service,
             "_trello_attach_url",
