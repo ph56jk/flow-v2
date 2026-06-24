@@ -7,6 +7,7 @@ const FALLBACK_VIDEO_MODELS = [
   { value: "Veo 2 - Quality", label: "Veo 2 - Quality" },
 ];
 const FALLBACK_IMAGE_MODELS = [
+  { value: "GEMINI_3_PRO_IMAGE", label: "Nano Banana Pro" },
   { value: "NARWHAL", label: "Nano Banana 2" },
   { value: "IMAGEN_3", label: "Imagen 3" },
 ];
@@ -705,7 +706,7 @@ const state = {
   },
   drafts: {
     video: { prompt: "", model: "Veo 3.1 - Fast", aspect: "landscape", count: 1, inputMode: "prompt" },
-    image: { prompt: "", model: "NARWHAL", aspect: "square", count: 2 },
+    image: { prompt: "", model: "GEMINI_3_PRO_IMAGE", aspect: "square", count: 2 },
     edit: { prompt: "", model: "", aspect: "landscape", count: 1 },
   },
   promptAiDrafts: {
@@ -1281,6 +1282,9 @@ function modelLabelForMode(mode, value) {
     return matched.label;
   }
   if (mode === "image") {
+    if (raw === "GEMINI_3_PRO_IMAGE") {
+      return "Nano Banana Pro";
+    }
     if (raw === "NARWHAL") {
       return "Nano Banana 2";
     }

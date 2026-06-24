@@ -141,6 +141,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         base = CreateJobRequest(
             type="image",
             prompt="",
+            model="NARWHAL",
             trello_board_id="board123",
             trello_card_id="shirt-card",
             trello_list_id="shirt-list",
@@ -200,6 +201,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["ready-att"], child.trello_source_attachment_ids)
         self.assertEqual("square", child.aspect)
         self.assertEqual(12, child.count)
+        self.assertEqual("GEMINI_3_PRO_IMAGE", child.model)
         self.assertTrue(child.flow_agent_enabled)
         self.assertTrue(child.flow_agent_auto_approve)
         graph = child.automation_graph.model_dump(mode="json")
@@ -211,6 +213,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
         self.assertEqual("square", flow_module["settings"]["imageAspect"])
         self.assertEqual(12, flow_module["settings"]["imageCount"])
+        self.assertEqual("GEMINI_3_PRO_IMAGE", flow_module["settings"]["imageModel"])
         self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
         self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
 
@@ -266,6 +269,22 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         resolved = self.service._resolve_job_request(request, config)
 
         self.assertEqual("NARWHAL", resolved.model)
+
+    def test_resolve_job_request_uses_nano_banana_pro_by_default(self) -> None:
+        config = AppConfig(project_id="pid", generation_timeout_s=420)
+        request = CreateJobRequest(type="image", prompt="run", model="")
+
+        resolved = self.service._resolve_job_request(request, config)
+
+        self.assertEqual("GEMINI_3_PRO_IMAGE", resolved.model)
+
+    def test_resolve_job_request_normalizes_nano_banana_pro_model(self) -> None:
+        config = AppConfig(project_id="pid", generation_timeout_s=420)
+        request = CreateJobRequest(type="image", prompt="run", model="Nano Banana Pro")
+
+        resolved = self.service._resolve_job_request(request, config)
+
+        self.assertEqual("GEMINI_3_PRO_IMAGE", resolved.model)
 
     def test_flow_image_call_validation_requires_selected_source(self) -> None:
         good_call = SimpleNamespace(
@@ -684,15 +703,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("Banner image 12 Cờ trong hộp quà mở", item["shot_labels"][-1])
 
     def test_havi_product_shot_rules_supply_twelve_safe_shots_for_each_product(self) -> None:
-        for product_key in PRODUCT_SHOT_RULES:
+        for product_key, rule in PRODUCT_SHOT_RULES.items():
             with self.subTest(product_key=product_key):
                 shots = self.service._flow_operator_product_rule_shot_suite(product_key)
+                target_count = int(rule.get("target_count") or self.service.FLOW_AGENT_TARGET_OUTPUT_COUNT)
                 joined = " ".join(
                     f"{shot.get('label', '')} {shot.get('brief', '')}".lower()
                     for shot in shots
                 )
 
-                self.assertGreaterEqual(len(shots), 12)
+                self.assertGreaterEqual(len(shots), target_count)
                 self.assertNotIn("inactive", joined)
                 self.assertIn("Product/category lock", shots[0]["brief"])
                 self.assertIn("white daylight", joined)
@@ -735,6 +755,78 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Three stuffed animals", item["prompt"])
         self.assertIn("HAVI product shot rule lock", item["prompt"])
         self.assertNotIn("Full doll/plush product", item["prompt"])
+
+    def test_auto_trello_uses_havi_tooth_fairy_pillow_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=10, prompt="goi rang")
+        cards = [
+            {
+                "id": "card-tooth-pillow",
+                "shortLink": "tooth-pillow",
+                "idList": "ready",
+                "name": "goi rang tooth fairy pillow",
+                "url": "https://trello.example/c/tooth-pillow",
+                "_image_attachments": [{"id": "att-tooth", "name": "tooth_fairy_pillow.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-tooth"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("tooth_fairy_pillow")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(10, len(all_rule_shots))
+        self.assertEqual(10, item["flow_agent_image_count"])
+        self.assertIn("Tooth Fairy Pillow category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Tooth Fairy Pillow", item["prompt"])
+        self.assertEqual("Tooth Fairy Pillow image 1 Clean hero flat lay on beige linen", item["shot_labels"][0])
+        self.assertEqual("Tooth Fairy Pillow image 10 Open kraft gift box", item["shot_labels"][-1])
+        self.assertIn("My First Tooth", item["prompt"])
+        self.assertIn("socks color matching the embroidery thread color", item["prompt"])
+        self.assertIn("vintage brass door knob", item["prompt"])
+        self.assertIn("white crib rail", item["prompt"])
+        self.assertIn("open kraft cardboard gift box", item["prompt"])
+        self.assertIn("generate exactly 10", item["prompt"])
+        self.assertIn("10 generated output images plus the 1 source image", item["prompt"])
+        self.assertNotIn("Supplemental", " ".join(item["shot_labels"]))
+        self.assertNotIn("Baby Pillowcase category", item["design_analysis"])
+
+    def test_auto_trello_uses_havi_baby_album_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12, prompt="baby album")
+        cards = [
+            {
+                "id": "card-baby-album",
+                "shortLink": "baby-album",
+                "idList": "ready",
+                "name": "hand_embroidered_baby_album_first_birthday",
+                "url": "https://trello.example/c/baby-album",
+                "_image_attachments": [{"id": "att-album", "name": "baby_photo_album.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-album"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("baby_album")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Baby Album category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Baby Album", item["prompt"])
+        self.assertEqual("Baby Album image 1 Birthday welcome table with two display shelves", item["shot_labels"][0])
+        self.assertEqual("Baby Album image 12 Woman hands embroidering matching cover motif", item["shot_labels"][-1])
+        self.assertIn("two horizontal baby photos inside clear plastic pocket sleeves", item["prompt"])
+        self.assertIn("one small board reading \"1st Birthday\"", item["prompt"])
+        self.assertIn("Create one square detail collage made of four small close-up photos", item["prompt"])
+        self.assertIn("The explicitly numbered close-up detail collage shot is the only allowed four-panel image", item["prompt"])
+        self.assertIn("baby photo album, it must remain the same cotton linen baby album", item["prompt"])
+        self.assertIn("highlight every stitch of the exact source embroidery", item["prompt"])
+        self.assertIn("Put the exact embroidered area from the source cover at the sharp focus point", item["prompt"])
+        self.assertNotIn("source daisy or floral embroidery", item["prompt"])
+        self.assertNotIn("embroidered flower or main cover motif", item["prompt"])
+        self.assertIn("show a baby sitting on a sofa and looking through the album interior photo pages", item["prompt"])
+        self.assertNotIn("Guest Book category", item["design_analysis"])
 
     def test_auto_trello_uses_havi_crown_shot_rules(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
@@ -1158,6 +1250,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
     def test_visual_product_rule_infers_all_havi_products_from_visual_description(self) -> None:
         examples = {
             "wedding_pillowcase": "square cushion embroidered with bride and groom names for a romantic wedding keepsake",
+            "tooth_fairy_pillow": "tooth-shaped cream linen tooth fairy pillow with a white ribbon hanger and hand embroidered name for a first tooth keepsake",
             "baby_pillowcase": "soft rectangular cushion with nursery name embroidery for an infant crib",
             "linen_pillowcase": "rectangular cushion cover made from linen fabric with embroidery for home decor sofa styling",
             "ring_bearer_pillow": "small square cushion with ribbons holding wedding rings for the ceremony",
@@ -1165,6 +1258,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "wedding_hoop": "round wooden embroidery frame with floral stitched couple names for wedding decor",
             "bride_handkerchief": "embroidered bridal cloth square folded with lace edge for wedding tears keepsake",
             "vows_book": "small fabric covered booklet for personal vows with embroidered cover lettering",
+            "baby_album": "cotton linen baby photo album for a first birthday with hand embroidered cover and clear plastic photo pockets",
             "guest_book": "fabric covered sign in album for wedding guests with embroidered cover",
             "bouquet_ribbon": "long fabric strip tied to a bridal bouquet with stitched lettering",
             "hair_bow": "cotton linen embroidered hair bow scrunchie with center knot and long tails for a ponytail",
@@ -1544,6 +1638,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ],
         ) as attach_url, patch.object(
             self.service,
+            "_trello_image_card_by_id",
+            return_value={
+                "id": "abc123",
+                "name": "demo-card",
+                "_image_attachments": [{"id": "source", "name": "source.png", "mimeType": "image/png"}],
+                "_flow_output_count": 12,
+            },
+        ) as image_card, patch.object(
+            self.service,
             "_trello_card_flow_output_count",
             return_value=12,
         ) as output_count, patch.object(
@@ -1558,7 +1661,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
 
         self.assertEqual(12, attach_url.call_count)
-        output_count.assert_called_once_with("key", "token", "abc123")
+        image_card.assert_called_once_with("key", "token", "abc123")
+        output_count.assert_not_called()
         review_list.assert_called_once_with("key", "token", "board123", "Content Review")
         move_card.assert_called_once_with("key", "token", "abc123", "review-list")
         self.assertEqual(12, result["sent"])
@@ -1605,6 +1709,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ],
         ), patch.object(
             self.service,
+            "_trello_image_card_by_id",
+            return_value={
+                "id": "abc123",
+                "name": "demo-card",
+                "_image_attachments": [{"id": "source", "name": "source.png", "mimeType": "image/png"}],
+                "_flow_output_count": 12,
+            },
+        ) as image_card, patch.object(
+            self.service,
             "_trello_card_flow_output_count",
             return_value=12,
         ) as output_count, patch.object(
@@ -1618,7 +1731,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ) as move_card:
             result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
 
-        output_count.assert_called_once_with("key", "token", "abc123")
+        image_card.assert_called_once_with("key", "token", "abc123")
+        output_count.assert_not_called()
         move_card.assert_called_once_with("key", "token", "abc123", "review-list")
         self.assertEqual(4, result["sent"])
         self.assertTrue(result["content_review"]["moved"])
@@ -2849,8 +2963,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             summary = self.service._auto_trello_ready_for_ai_summary(request)
 
         self.assertIn("Ready for AI co 4 card", summary)
-        self.assertIn("1 card da co du 12 anh output nhung phien Auto moi van co the tao moi 12 anh", summary)
-        self.assertIn("2 card co anh nguon va khi chay se tao moi 12 anh", summary)
+        self.assertIn("1 card da co du anh output theo rule nhung phien Auto moi van co the tao moi du bo", summary)
+        self.assertIn("2 card co anh nguon va khi chay se tao moi du bo theo rule", summary)
         self.assertIn("1 card chua co anh nguon", summary)
 
     def test_reset_ready_trello_outputs_deletes_only_generated_images(self) -> None:
@@ -4336,6 +4450,33 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         with self.assertRaises(FlowAgentQuotaError):
             await self.service._raise_flow_agent_quota_if_visible(FakePage(), ignore_message="")
+
+    async def test_generate_images_with_retry_falls_back_to_ui_when_image_model_rejected(self) -> None:
+        request = CreateJobRequest(type="image", prompt="run", model="Nano Banana Pro", count=1)
+        fake_client = SimpleNamespace()
+        fake_images = [SimpleNamespace(media_name="img-1")]
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch.object(
+            self.service,
+            "_generate_images_once",
+            AsyncMock(side_effect=RuntimeError("invalid imageModelName GEMINI_3_PRO_IMAGE")),
+        ) as generate_once, patch.object(
+            self.service,
+            "_reload_flow_project_page",
+            AsyncMock(),
+        ) as reload_page, patch.object(
+            self.service,
+            "_generate_images_via_ui",
+            AsyncMock(return_value=fake_images),
+        ) as via_ui:
+            result = await self.service._generate_images_with_retry(fake_client, job.id, request, [])
+
+        self.assertEqual(fake_images, result)
+        generate_once.assert_awaited_once_with(fake_client, request, [])
+        reload_page.assert_awaited_once_with(fake_client)
+        via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
 
     async def test_wait_for_flow_agent_source_attachment_accepts_replaced_chip_count(self) -> None:
         class FakePage:

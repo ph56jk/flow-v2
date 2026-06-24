@@ -178,12 +178,14 @@ class FlowWebService:
     DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
     DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
-    DEFAULT_IMAGE_MODEL = "NARWHAL"
+    DEFAULT_IMAGE_MODEL = "GEMINI_3_PRO_IMAGE"
     IMAGE_MODEL_LABELS = {
+        "GEMINI_3_PRO_IMAGE": "Nano Banana Pro",
         "NARWHAL": "Nano Banana 2",
         "IMAGEN_3": "Imagen 3",
     }
     IMAGE_MODEL_EDIT_VALUES = {
+        "GEMINI_3_PRO_IMAGE": "GEMINI_3_PRO_IMAGE",
         "NARWHAL": "GEM_PIX_2",
         "IMAGEN_3": "IMAGEN_3",
     }
@@ -199,6 +201,10 @@ class FlowWebService:
         "veo 3.1 - fast [lower priority]": "Veo 3.1 - Fast [Lower Priority]",
     }
     IMAGE_MODEL_ALIASES = {
+        "gemini 3 pro image": "GEMINI_3_PRO_IMAGE",
+        "gemini-3-pro-image-preview": "GEMINI_3_PRO_IMAGE",
+        "gemini_3_pro_image": "GEMINI_3_PRO_IMAGE",
+        "nano banana pro": "GEMINI_3_PRO_IMAGE",
         "narwhal": "NARWHAL",
         "gem_pix_2": "NARWHAL",
         "nano banana": "NARWHAL",
@@ -2020,10 +2026,17 @@ class FlowWebService:
             validation_payload["prompt"] = items[0]["prompt"]
             self._validate_job_request(CreateJobRequest(**validation_payload))
 
+            flow_agent_counts = {
+                int(item.get("flow_agent_image_count") or 0)
+                for item in items
+                if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent")
+            }
+            flow_agent_counts.discard(0)
+            flow_agent_count_label = str(next(iter(flow_agent_counts))) if len(flow_agent_counts) == 1 else "đủ bộ theo rule"
             title = (
                 str(request.title or "").strip()
                 or (
-                    f"Auto Trello Flow Agent: tạo {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh cho {len(items)} card"
+                    f"Auto Trello Flow Agent: tạo {flow_agent_count_label} ảnh cho {len(items)} card"
                     if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
                     else f"Auto Trello Flow Agent: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
                     if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
@@ -2279,6 +2292,7 @@ class FlowWebService:
         )
 
     def _force_auto_trello_flow_agent_policy(self, payload: Dict[str, Any]) -> None:
+        payload["model"] = self.DEFAULT_IMAGE_MODEL
         payload["aspect"] = "square"
         payload["count"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
         payload["flow_agent_enabled"] = True
@@ -2298,6 +2312,7 @@ class FlowWebService:
                 module["settings"] = settings
             settings["imageAspect"] = "square"
             settings["imageCount"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+            settings["imageModel"] = self.DEFAULT_IMAGE_MODEL
             settings["flowAgentEnabled"] = True
             settings["flowAgentAutoApprove"] = True
 
@@ -3038,7 +3053,12 @@ class FlowWebService:
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
             output_count = len(outputs)
-            target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+            card["_image_attachments"] = sources
+            card["_flow_output_count"] = output_count
+            target_output_count = self._flow_operator_target_count_for_card(
+                CreateJobRequest(type="image", title="", count=self.FLOW_AGENT_TARGET_OUTPUT_COUNT),
+                card,
+            )
             status = "no_source"
             if sources and output_count >= target_output_count:
                 complete += 1
@@ -3057,6 +3077,7 @@ class FlowWebService:
                     "status": status,
                     "source_count": len(sources),
                     "output_count": output_count,
+                    "target_output_count": target_output_count,
                     "missing_count": max(0, target_output_count - output_count) if sources else 0,
                 }
             )
@@ -3266,7 +3287,13 @@ class FlowWebService:
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(images)
             output_count = len(outputs)
-            if sources and output_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
+            card["_image_attachments"] = sources
+            card["_flow_output_count"] = output_count
+            target_output_count = self._flow_operator_target_count_for_card(
+                CreateJobRequest(type="image", title="", count=self.FLOW_AGENT_TARGET_OUTPUT_COUNT),
+                card,
+            )
+            if sources and output_count >= target_output_count:
                 complete += 1
             elif sources:
                 eligible += 1
@@ -3276,9 +3303,9 @@ class FlowWebService:
 
         parts = [f"{scope_label} co {len(cards)} card"]
         if complete:
-            parts.append(f"{complete} card da co du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh output nhung phien Auto moi van co the tao moi {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
+            parts.append(f"{complete} card da co du anh output theo rule nhung phien Auto moi van co the tao moi du bo")
         if no_output:
-            parts.append(f"{no_output} card co anh nguon va khi chay se tao moi {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
+            parts.append(f"{no_output} card co anh nguon va khi chay se tao moi du bo theo rule")
         if no_source:
             parts.append(f"{no_source} card chua co anh nguon hop le")
         return "; ".join(parts) + "."
@@ -9044,7 +9071,15 @@ exit 1
     ) -> Dict[str, Any]:
         target_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
         try:
-            output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
+            card = await asyncio.to_thread(self._trello_image_card_by_id, key, token, card_id)
+            if card:
+                target_count = self._flow_operator_target_count_for_card(
+                    CreateJobRequest(type="image", title="", count=target_count),
+                    card,
+                )
+                output_count = int(card.get("_flow_output_count") or 0)
+            else:
+                output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
             if output_count < target_count:
                 await self.store.append_log(
                     job_id,
@@ -10228,6 +10263,32 @@ exit 1
                 "context": ("wedding", "bride", "groom", "couple", "romantic", "keepsake", "anniversary"),
                 "exclude": ("ring bearer", "wedding rings", "ring holder", "vow book", "guest book"),
             },
+            "tooth_fairy_pillow": {
+                "main": (
+                    "tooth fairy pillow",
+                    "tooth pillow",
+                    "tooth-shaped pillow",
+                    "tooth shaped pillow",
+                    "tooth cushion",
+                    "tooth-shaped cushion",
+                    "tooth shaped cushion",
+                    "soft tooth",
+                    "tooth shape",
+                ),
+                "context": (
+                    "tooth fairy",
+                    "first tooth",
+                    "my first tooth",
+                    "white ribbon",
+                    "ribbon hanger",
+                    "cream linen",
+                    "nursery keepsake",
+                    "baby keepsake",
+                    "embroidered name",
+                    "hand embroidered",
+                ),
+                "exclude": ("wedding", "bride", "groom", "ring bearer", "wedding rings", "passport", "hair bow", "drawstring"),
+            },
             "baby_pillowcase": {
                 "main": ("pillow", "pillowcase", "cushion", "cushion cover", "soft rectangular", "soft square"),
                 "context": ("baby", "nursery", "child", "children", "kid", "toddler", "infant", "crib", "name embroidery"),
@@ -10262,6 +10323,41 @@ exit 1
                 "main": ("book", "booklet", "notebook", "fabric cover", "covered booklet"),
                 "context": ("vow", "vows", "personal vows", "bride vows", "groom vows", "wedding promise"),
                 "exclude": ("guest", "sign in", "signature", "album", "pillow", "cushion"),
+            },
+            "baby_album": {
+                "main": (
+                    "baby album",
+                    "baby photo album",
+                    "baby memory album",
+                    "baby keepsake album",
+                    "first birthday album",
+                    "1st birthday album",
+                    "birthday photo album",
+                    "fabric baby album",
+                    "cotton linen baby album",
+                    "embroidered baby album",
+                    "clear plastic photo pocket album",
+                ),
+                "context": (
+                    "baby",
+                    "infant",
+                    "toddler",
+                    "one year old",
+                    "1 year old",
+                    "first birthday",
+                    "1st birthday",
+                    "birthday party",
+                    "baby photos",
+                    "family photos",
+                    "photo pocket",
+                    "photo pockets",
+                    "clear plastic pocket",
+                    "plastic sleeves",
+                    "cotton linen",
+                    "hand embroidered",
+                    "embroidered cover",
+                ),
+                "exclude": ("wedding", "bride", "groom", "guest", "guests", "sign in", "signature", "vow", "vows", "pillow", "cushion", "passport"),
             },
             "guest_book": {
                 "main": ("book", "album", "notebook", "fabric cover", "covered book"),
@@ -10805,6 +10901,19 @@ exit 1
             return self.BANNER_VISIBLE_WALL_HOOK_RULE
         return ""
 
+    def _flow_operator_product_rule_target_count(self, product_key: str) -> int:
+        suite = PRODUCT_SHOT_RULES.get(str(product_key or "").strip()) or {}
+        raw_count = suite.get("target_count", self.FLOW_AGENT_TARGET_OUTPUT_COUNT)
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        return max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, count))
+
+    def _flow_operator_target_count_for_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> int:
+        signals = self._flow_operator_card_product_signals(request, card)
+        return self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
+
     def _flow_operator_product_rule_shot_suite(self, product_key: str) -> List[Dict[str, str]]:
         product_key = str(product_key or "").strip()
         suite = PRODUCT_SHOT_RULES.get(product_key)
@@ -10855,7 +10964,7 @@ exit 1
                 f"Distinct lifestyle or room-context scene for {display_name}, different from the other shots, with natural interaction or display while the source design stays visible. {suffix}",
             ),
         )
-        target = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        target = self._flow_operator_product_rule_target_count(product_key)
         fill_index = 0
         while shots and len(shots) < target:
             title, brief = supplemental[fill_index % len(supplemental)]
@@ -11591,8 +11700,8 @@ exit 1
         ]
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
-        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
-        target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        target_output_count = self._flow_operator_product_rule_target_count(product_rule_key)
+        target_count = max(1, min(target_output_count, int(image_count or target_output_count)))
         existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
         all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
         shot_start = 0
@@ -11612,7 +11721,7 @@ exit 1
             )
         else:
             resume_note = ""
-        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover", "hair_bow"})
+        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover", "hair_bow", "baby_album"})
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             self._flow_agent_fresh_context_rule(),
@@ -11627,7 +11736,7 @@ exit 1
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
                 "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, drawstring bag, passport cover, hair bow, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not turn the source into a tooth fairy pillow, pillow, cushion, blanket, hoop, dress, apron, banner, baby photo album, drawstring bag, passport cover, hair bow, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
@@ -11666,7 +11775,7 @@ exit 1
             ),
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is a hair bow, bow hair clip, or hair tie bow, it must remain the same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware; if it is apparel, it must remain the same apparel form.",
+            "Do not change the source product into a different category; if the source is a tooth fairy pillow, it must remain the same tooth-shaped tooth fairy pillow with its ribbon; if the source is a pillow, it must remain a pillow; if it is a baby photo album, it must remain the same cotton linen baby album with its embroidered cover, book construction, and photo-pocket pages when open; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is a hair bow, bow hair clip, or hair tie bow, it must remain the same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware; if it is apparel, it must remain the same apparel form.",
             (
                 "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
                 if signals.get("is_pennant")
@@ -11725,10 +11834,11 @@ exit 1
                 continue
             card.pop("_auto_trello_skip_code", None)
             card.pop("_auto_trello_skip_reason", None)
-            existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
-            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
+            target_output_count = self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
+            existing_flow_count = max(0, min(target_output_count, int(card.get("_flow_output_count") or 0)))
+            image_count = target_output_count
             shot_start = 0
             shots = all_shots[shot_start : shot_start + image_count]
             if len(shots) < image_count and all_shots:
@@ -15396,7 +15506,7 @@ exit 1
             client_self: Any,
             prompt: str,
             *,
-            model: str = "Nano Banana 2",
+            model: str = "Nano Banana Pro",
             aspect: str = "landscape",
             count: int = 1,
             reference_images: Optional[list[str]] = None,
@@ -18399,18 +18509,29 @@ exit 1
         try:
             return await self._generate_images_once(client, request, reference_media_names)
         except Exception as exc:
-            if not self._is_recaptcha_error(exc):
+            if self._is_recaptcha_error(exc):
+                await self.store.append_log(
+                    job_id,
+                    "Flow API tu choi luot gui tu dong. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
+                )
+                await self._set_job_progress(
+                    job_id,
+                    "sending_request",
+                    "Flow API tu choi luot gui truc tiep. Em dang tai lai project va gui lai bang giao dien Flow.",
+                )
+            elif self._is_image_model_error(exc):
+                await self.store.append_log(
+                    job_id,
+                    "Flow API chua nhan model anh da chon. Em dang chuyen sang giao dien Flow de chon model bang ten hien thi.",
+                )
+                await self._set_job_progress(
+                    job_id,
+                    "sending_request",
+                    "Flow API chua nhan model anh da chon. Em dang tai lai project va gui lai bang giao dien Flow.",
+                )
+            else:
                 raise
 
-            await self.store.append_log(
-                job_id,
-                "Flow API tu choi luot gui tu dong. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
-            )
-            await self._set_job_progress(
-                job_id,
-                "sending_request",
-                "Flow API tu choi luot gui truc tiep. Em dang tai lai project va gui lai bang giao dien Flow.",
-            )
             await self._reload_flow_project_page(client)
             return await self._generate_images_via_ui(client, request, reference_media_names, job_id=job_id)
 
@@ -21302,6 +21423,12 @@ exit 1
     def _is_recaptcha_error(self, exc: Exception) -> bool:
         detail = str(exc or "").lower()
         return "recaptcha" in detail and "failed" in detail
+
+    def _is_image_model_error(self, exc: Exception) -> bool:
+        detail = str(exc or "").lower()
+        model_markers = ("model", "imagemodelname", "modelnametype")
+        problem_markers = ("invalid", "unknown", "unsupported", "not supported", "unrecognized", "not found")
+        return any(marker in detail for marker in model_markers) and any(marker in detail for marker in problem_markers)
 
     def _parse_images_from_flow_payload(
         self,

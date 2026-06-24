@@ -9,6 +9,7 @@ ShotTuple = Tuple[str, str, str]
 # Generated from C:/Users/HAVI GROUP/Downloads/HAVI_Shot_Types_All_Products ok.xlsx.
 # Keep only active workbook rows; rows marked '(inactive)' are intentionally omitted.
 PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('wedding_pillowcase',
+ 'tooth_fairy_pillow',
  'baby_pillowcase',
  'linen_pillowcase',
  'ring_bearer_pillow',
@@ -16,6 +17,7 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('wedding_pillowcase',
  'wedding_hoop',
  'bride_handkerchief',
  'vows_book',
+ 'baby_album',
  'guest_book',
  'bouquet_ribbon',
  'hair_bow',
@@ -27,8 +29,99 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('wedding_pillowcase',
  'dress_baby',
  'plush')
 
+_TOOTH_FAIRY_PILLOW_LOCK = (
+    "Keep the original product design 100% unchanged in every image: same tooth shape, same cream linen fabric "
+    "texture, same soft stuffed form, same white ribbon, same hand-embroidered name/text, same floral or decorative "
+    "motifs, same thread colors, same stitch placement, same embroidery scale, and same handmade details. Do not "
+    "redesign the pillow, do not change the embroidered text, do not add or remove embroidery, do not change the "
+    "fabric color, and do not cover the embroidery."
+)
 
-PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấu bông',
+_TOOTH_FAIRY_PILLOW_STYLE = (
+    "Overall style: bright clean white natural daylight, soft shadows, airy premium nursery aesthetic, realistic "
+    "handmade product photography, soft neutral colors, cozy baby keepsake mood, high-detail linen texture, visible "
+    "raised hand embroidery stitches, elegant Etsy listing quality, no harsh yellow light, no dark background, no "
+    "clutter, no CGI look, no watermark, no logo, no duplicate pillows in one image, no random text on the product."
+)
+
+
+def _tooth_fairy_pillow_brief(scene: str) -> str:
+    return (
+        "Use the uploaded product reference image as the exact product. Create one separate square 1:1 high-end "
+        f"handmade Etsy product photo: {scene} {_TOOTH_FAIRY_PILLOW_LOCK} {_TOOTH_FAIRY_PILLOW_STYLE}"
+    )
+
+
+_BABY_ALBUM_LOCK = (
+    "Keep the original baby photo album design 100% unchanged: same rectangular album/book shape, same cotton linen "
+    "cover fabric and color family, same spine and edge construction, same cover embroidery motif, stitched name or "
+    "lettering placement if present, same thread colors, same stitch scale, same handmade texture, and the same baby "
+    "keepsake identity. The album may be shown closed, partly open, or open to clear plastic photo-pocket pages, but "
+    "do not redesign the cover, change the embroidery layout, change the material, or turn it into a wedding guest "
+    "book, vow book, hoop, pillow, banner, dress, or generic scrapbook."
+)
+
+_BABY_ALBUM_STYLE = (
+    "Overall style for every output: bright clear airy natural daylight, clean white balanced tones, soft shadows, "
+    "premium handmade Etsy product photography, visible cotton linen texture, visible raised hand-embroidery stitches, "
+    "gentle first-birthday baby keepsake mood, uncluttered props, no watermark, no logo, no UI text, no random tags, "
+    "no harsh yellow/orange cast."
+)
+
+
+def _baby_album_brief(scene: str) -> str:
+    return (
+        "Use the uploaded baby album reference image as the exact product. Create one separate square 1:1 high-end "
+        f"handmade Etsy product photo: {scene} {_BABY_ALBUM_LOCK} {_BABY_ALBUM_STYLE}"
+    )
+
+
+PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display_name': 'Tooth Fairy Pillow',
+                         'aliases': ('Tooth Fairy Pillow',
+                                     'tooth fairy pillow',
+                                     'tooth pillow',
+                                     'tooth shaped pillow',
+                                     'tooth-shaped pillow',
+                                     'tooth fairy cushion',
+                                     'first tooth pillow',
+                                     'my first tooth pillow',
+                                     'goi rang',
+                                     'goi hinh rang',
+                                     'goi tien rang',
+                                     'goi tooth fairy'),
+                         'target_count': 10,
+                         'lock': 'the main product must remain the same hand-embroidered tooth fairy pillow with the exact tooth-shaped silhouette, cream linen fabric texture, soft stuffed form, white ribbon hanger, hand-embroidered name/text, floral or decorative motifs, thread colors, stitch placement, embroidery scale, seams, and handmade details from the source image',
+                         'shots': (('Hero flat lay',
+                                    'Clean hero flat lay on beige linen',
+                                    _tooth_fairy_pillow_brief('a clean hero flat lay on natural beige linen fabric, with the tooth fairy pillow centered and the white ribbon tied neatly above. Decorate around the pillow with dried baby\'s breath, small dried pink rosebuds, and one small wooden star charm. Keep the embroidery fully visible and uncovered.')),
+                                   ('Nursery lifestyle',
+                                    'Bright nursery bed lifestyle',
+                                    _tooth_fairy_pillow_brief('a bright nursery bed lifestyle scene with the tooth fairy pillow placed on a soft cream linen bed. Add a children\'s bedtime book and a pastel wooden stacking toy nearby, with a light wooden bed frame and soft curtains in the softly blurred background. Keep the embroidery facing forward, sharp, readable, and uncovered.')),
+                                   ('Cozy close-up',
+                                    'Upright close-up on quilt',
+                                    _tooth_fairy_pillow_brief('a cozy close-up on a cream quilted blanket, with the tooth fairy pillow standing upright and slightly leaning. Place a soft knitted blanket beside it, small metallic star confetti around the pillow, and softly blurred fairy lights in the background. Keep the embroidery sharply focused, readable, and uncovered.')),
+                                   ('Angled lifestyle',
+                                    'Angled quilted bed lifestyle',
+                                    _tooth_fairy_pillow_brief('an angled lifestyle shot on a cream quilted bed, with the tooth fairy pillow placed slightly off-center and leaning naturally. Put a chunky cream knit blanket in the foreground, with a pastel wooden toy and dried baby\'s breath softly blurred in the background. Keep the embroidery visible, sharp, and uncovered.')),
+                                   ('Keepsake flat lay',
+                                    'My First Tooth flat lay',
+                                    _tooth_fairy_pillow_brief('a newborn keepsake flat lay on beige linen cloth, with the tooth fairy pillow centered. Place a round wooden milestone disc engraved "My First Tooth" on the left and small knitted baby socks on the right, with the socks color matching the embroidery thread color on the pillow, styled as a clean minimal gift set. Do not let props touch or cover the embroidery.')),
+                                   ('Hanging lifestyle',
+                                    'Hanging from brass door knob',
+                                    _tooth_fairy_pillow_brief('the tooth fairy pillow hanging naturally by its white ribbon from a vintage brass door knob on a white wooden door near a bright window. The embroidery must face forward clearly, with a minimal airy interior background and soft depth of field. Keep the ribbon shape and product scale realistic.')),
+                                   ('Tooth Fairy card flat lay',
+                                    'Card and tiny bottle flat lay',
+                                    _tooth_fairy_pillow_brief('a flat lay on a cream chunky knitted blanket, with the tooth fairy pillow placed on the right side. On the left, include a small Tooth Fairy themed card with cute tooth, moon, star, and pastel fairy illustration, plus a tiny clear glass bottle and white baby\'s breath. Keep the card as a separate prop only; no new text or mark may appear on the product itself. Keep the embroidery fully visible and uncovered.')),
+                                   ('Close-up lifestyle',
+                                    'Letter card close-up',
+                                    _tooth_fairy_pillow_brief('a close-up lifestyle photo on a soft cream knitted blanket, with the tooth fairy pillow large in frame and slightly angled. Keep the embroidery tack-sharp and readable. Add a small Tooth Fairy letter card standing beside it as a secondary prop, with a soft blurred background. The card must not touch or cover the pillow embroidery.')),
+                                   ('Crib hanging',
+                                    'Hanging from crib rail',
+                                    _tooth_fairy_pillow_brief('the tooth fairy pillow hanging from a white crib rail or white bedpost using its ribbon. Keep the embroidery centered, facing forward, sharp, visible, and uncovered. The softly blurred background includes teddy bears, pastel bedding, and subtle fairy lights.')),
+                                   ('Gift packaging',
+                                    'Open kraft gift box',
+                                    _tooth_fairy_pillow_brief('a premium gift packaging shot with the tooth fairy pillow placed inside an open kraft cardboard gift box lined with white tissue paper. Arrange the white ribbon neatly and place small white baby\'s breath stems around the pillow without covering the embroidery. Use a clean white tabletop background.')))},
+ 'plush': {'display_name': 'Gấu bông',
            'aliases': ('Gấu bông',
                        'gau bong',
                        'gaubong',
@@ -1484,6 +1577,64 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'plush': {'display_name': 'Gấ
                                    'colors, altered ring pillow designs, altered embroidery patterns, mass-produced '
                                    'images, harsh studio lighting, cluttered backgrounds, distracting props, AI '
                                    'errors, text overlaying images, watermarks.'))},
+ 'baby_album': {'display_name': 'Baby Album',
+                'aliases': ('Baby Album',
+                            'baby album',
+                            'baby photo album',
+                            'baby memory album',
+                            'baby keepsake album',
+                            'first birthday album',
+                            '1st birthday album',
+                            'birthday photo album',
+                            'embroidered baby album',
+                            'fabric baby album',
+                            'cotton linen baby album',
+                            'so album be',
+                            'so anh be',
+                            'album em be',
+                            'album sinh nhat',
+                            'album thoi noi'),
+                'lock': 'the main product must remain the same hand-embroidered baby photo album or first birthday '
+                        'keepsake album with the exact rectangular album/book shape, cotton linen cover, spine and '
+                        'edge construction, cover embroidery motif/name placement, stitch scale, thread colors, fabric '
+                        'color family, clear plastic photo-pocket pages when open, and premium handmade baby keepsake '
+                        'identity from the source image',
+                'shots': (('Product display',
+                           'Birthday welcome table with two display shelves',
+                           _baby_album_brief('place the album on two small display shelves on a guest welcome table at a baby first birthday party. Show two copies of the same album: one closed or softly folded so the cover embroidery is fully visible, and one fully open so the inside photo pages are visible. Each open page holds two horizontal baby photos inside clear plastic pocket sleeves, showing sweet one-year-old baby moments with friends and family. Add a small faux goose figure, tiny star decorations, a few small neutral decorative pieces, and a soft sunbeam coming into the room. Keep the embroidery and the open photo pockets clear, with no prop covering the album.')),
+                          ('Product display',
+                           'Leaf-shadow sunlight on cover and open pages',
+                           _baby_album_brief('place the album under clean natural sunlight so soft leaf shadows fall across the embroidered cover. Show one closed album with the cover embroidery clear, and one album fully open with inside pages visible. Each page holds two horizontal baby photos inside clear plastic pocket sleeves, showing one-year-old baby moments with friends and family. Highlight the raised hand embroidery, cotton linen texture, and artistic depth. Add a few loose baby photos on the table as secondary decor only, not overlapping or covering the album. Keep the light transparent, fresh, and airy.')),
+                          ('Flat lay',
+                           'White first-birthday keepsake flat lay',
+                           _baby_album_brief('create a balanced flat lay with the album on a wicker basket over a thick white voile fabric base. Surround it with tasteful first-birthday props: a birthday hat, a baby bib or romper outfit, baby boy shoes, an embroidered crown, small toys, a birthday cake with a number 1 candle, and one small board reading "1st Birthday" as the only readable prop text allowed in this shot. Keep the palette white and close to the album color, clean and cohesive.')),
+                          ('Lifestyle',
+                           'Crib bed with pastel pillows and baby photos',
+                           _baby_album_brief('place the album on a baby crib bed, surrounded by pastel animal-shaped pillows, a soft cotton blanket, and a few printed baby photos. Use warm early-morning window light, gentle shadows, and a soft airy nursery feeling. The cover embroidery, cotton linen texture, album shape, and handmade edges must remain visible and sharp.')),
+                          ('Close-up detail collage',
+                           'Four-panel hand embroidery macro proof',
+                           _baby_album_brief('Create one square detail collage made of four small close-up photos, each showing a different macro angle of the album hand embroidery. Show raised hand stitches, cotton linen weave, thread relief, stitch direction, cover edge or lettering detail, and the handmade quality. This is one single 1:1 detail-proof collage image only; do not create a full product grid.')),
+                          ('Product display',
+                           'Picnic colorway pair opened fifteen degrees',
+                           _baby_album_brief('place two albums in different fabric cover colors on a picnic blanket spread over grass. The two albums must keep the same embroidery layout, same source embroidery motif, same handmade construction, but use different personalized names only when the source album visibly has a stitched name. Each album stands upright and is opened slightly about 15 degrees so one photo per page is visible inside clear plastic pocket sleeves. Add a wicker basket, wildflowers, and fresh fruit around the blanket. Use soft clear golden sunlight without a heavy yellow cast, fresh cheerful air, and focus tightly on the albums.')),
+                          ('Product display',
+                           'Loose photos versus organized album',
+                           _baby_album_brief('compose a left-versus-right tabletop story: on the left, loose printed baby photos are scattered casually; on the right, the hand-embroidered album is neat and organized, with photos inserted inside clear plastic pocket sleeves, two horizontal photos per page. Use soft natural light with a gentle sun touch. Add a small birthday cake and baby toys as secondary decor, keeping the album as the clean focal point.')),
+                          ('Lifestyle macro',
+                           'Hands holding album before sleeping baby',
+                           _baby_album_brief('create a close-up of adult hands gently lifting the embroidered album in front of a sleeping baby. The baby is softly blurred in the background. Use a macro lens feeling to highlight every stitch of the exact source embroidery and any stitched lettering if present, with the cotton linen texture clearly visible. Keep the mood dreamy, tender, and bright.')),
+                          ('Lifestyle macro',
+                           'Baby hand touching album corner',
+                           _baby_album_brief('make an emotional macro shot of a baby hand gently holding or touching one corner of the album. Put the exact embroidered area from the source cover at the sharp focus point, showing layered thread, raised stitches, and cotton linen fibers. The baby face is softly blurred in the background, and the baby wears a beautiful bib. Use soft clear daylight and a very tender first-birthday keepsake mood.')),
+                          ('Lifestyle',
+                           'Mother and baby hands viewing cover',
+                           _baby_album_brief('show a mother holding a baby while they hold and look at the album together. Crop the scene so only hands, arms, and torso details are visible; do not show faces. The album cover embroidery must be clearly visible and the album must be the focal point. Use soft emotional daylight and a connected family feeling without clutter.')),
+                          ('Lifestyle',
+                           'Baby on sofa viewing inside photo pages',
+                           _baby_album_brief('show a baby sitting on a sofa and looking through the album interior photo pages. The album cover is not visible in this shot; focus on the inside pages only. Each page holds two horizontal photos inside clear glossy plastic pocket sleeves. Use a neutral sofa, soft daylight, shallow depth of field, and a bright airy home feeling.')),
+                          ('Process lifestyle',
+                           'Woman hands embroidering matching cover motif',
+                           _baby_album_brief('show a woman hands-only craft process scene embroidering the same cover motif onto matching cotton linen fabric stretched in an embroidery hoop. A realistic needle has thread through the needle eye and is passing through the correct stitch position. Include handmade decor such as thread spools, small scissors, folded linen, and soft natural window light. The stitching must match the album cover motif and feel authentically hand embroidered.')))},
  'guest_book': {'display_name': 'Guest Book',
                 'aliases': ('Guest Book',
                             'guest book',
