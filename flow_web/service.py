@@ -167,6 +167,7 @@ class FlowWebService:
     GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
     GEMINI_TIMEOUT_S = 30
+    GEMINI_QA_TIMEOUT_S = 600.0
     USER_ASSISTANT_CONTEXT_LIMIT = 1200
     USER_ASSISTANT_ANSWER_LIMIT = 1400
     AI_PROMPT_SUITE_SIZE = 6
@@ -9871,7 +9872,9 @@ exit 1
         body = self._gemini_post_json(
             request_obj,
             context="kiểm tra ảnh trước khi upload Trello",
-            timeout_s=max(120.0, float(self.GEMINI_TIMEOUT_S)),
+            # 12 inline 1K JPEGs are ~10 MB of base64; on this uplink that took >120 s whenever another worker
+            # was uploading 2K files to Trello (2026-09-10 18:00, worker 2 held two cards). 600 s, then chunked retry.
+            timeout_s=max(self.GEMINI_QA_TIMEOUT_S, float(self.GEMINI_TIMEOUT_S)),
         )
 
         text = self._extract_gemini_text(body)
