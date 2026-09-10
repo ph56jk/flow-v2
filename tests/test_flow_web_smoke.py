@@ -3908,6 +3908,50 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("khong co ban 2K that", str(raised.exception))
         self.assertTrue(self.service._auto_trello_should_stop_on_child_error(str(raised.exception)))
 
+    def test_trello_archive_retries_2k_upload_then_holds_instead_of_attaching_1k_url(self) -> None:
+        """Worker 2, 2026-09-10 16:50: the 2K file upload timed out and the URL fallback attached the 1K original."""
+        from PIL import Image
+
+        source_file = self.downloads_dir / "flow-small.jpg"
+        Image.new("RGB", (640, 480), (120, 170, 210)).save(source_file, format="JPEG", quality=90)
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(
+            label="Ảnh 1", media_name="media", url="https://flow.example/original-1k.jpg", local_path=str(source_file), mime_type="image/jpeg"
+        )
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+        two_k = ImageUpscaleResult(bytes=self.service._test_jpeg_bytes(2048, seed=1), mime_type="image/jpeg", source="flow_2k", used_flow=True)
+
+        with patch.dict(os.environ, {"FLOW_UI_UPSCALE_2K_ENABLED": ""}, clear=False), patch.object(
+            self.service, "_with_client", new=AsyncMock(return_value=[{"bytes": two_k.bytes, "name": "gen_2K.jpeg"}])
+        ), patch.object(
+            self.service, "_upsample_artifact_bytes", new=AsyncMock(return_value=two_k)
+        ), patch.object(
+            self.service, "_trello_attach_file_bytes", side_effect=TimeoutError("The write operation timed out")
+        ) as attach_bytes, patch.object(
+            self.service, "_trello_attach_url", return_value={"id": "att-url", "name": "flow-cat.jpg", "url": "https://flow.example/original-1k.jpg"}
+        ) as attach_url, patch("flow_web.service.asyncio.sleep", new=AsyncMock(return_value=None)):
+            with self.assertRaises(FlowUiUpscaleUnavailableError) as raised:
+                asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        self.assertEqual(self.service.TRELLO_2K_UPLOAD_ATTEMPTS, attach_bytes.call_count)
+        attach_url.assert_not_called()
+        self.assertIn("khong attach URL 1K", str(raised.exception))
+        self.assertTrue(self.service._auto_trello_should_stop_on_child_error(str(raised.exception)))
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("thu lai sau", logs)
+
     def test_trello_archive_keeps_original_after_flow_upsample_failure(self) -> None:
         """With the UI-2K download switched off (FLOW_UI_UPSCALE_2K_ENABLED=0) the old fallback still applies."""
         from PIL import Image

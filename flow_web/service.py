@@ -188,6 +188,9 @@ class FlowWebService:
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
     TRELLO_TIMEOUT_S = 30
+    TRELLO_UPLOAD_TIMEOUT_S = 180  # a 2-3 MB 2K JPEG on a slow uplink needs more than the 30 s API timeout
+    TRELLO_2K_UPLOAD_ATTEMPTS = 3
+    TRELLO_2K_UPLOAD_RETRY_DELAYS_S = (10.0, 30.0)
     TRELLO_UPSCALE_LONG_EDGE_PX = 2048
     TRELLO_AI_TITLE_BACKUP_FILE_NAME = "trello-title-description-backups.json"
     TRELLO_AI_TITLE_BEGIN_MARKER = "<!-- FLOW_AI_TITLE_START -->"
@@ -3682,6 +3685,7 @@ class FlowWebService:
             "tat ca chrome profile flow da het quota",
             "khong tra ban 2k",
             "khong co ban 2k that",
+            "khong upload duoc ban 2k",
         )
         return any(signal in normalized for signal in stop_signals)
 
@@ -10283,6 +10287,7 @@ exit 1
                 continue
 
             name = self._trello_attachment_name(job_id, artifact, index)
+            real_2k_upload = False
             try:
                 await self.store.set_progress_hint(
                     job_id,
@@ -10382,18 +10387,49 @@ exit 1
                                             f"({source_size[0]}x{source_size[1]} -> {target_size[0]}x{target_size[1]}) trước khi upload Trello."
                                         ),
                                     )
-                        attachment_payload = await self._trello_attach_file_bytes_with_cover_fallback(
-                            job_id,
-                            index,
-                            key,
-                            token,
-                            card_id,
-                            source_bytes,
-                            source_mime or artifact.mime_type or "image/jpeg",
-                            name,
-                            set_cover and index == 0,
+                        real_2k_upload = bool(
+                            upscale_2k
+                            and self._flow_ui_upscale_enabled()
+                            and upscale_result.bytes
+                            and upscale_result.source == "flow_2k"
                         )
+                        attempts = self.TRELLO_2K_UPLOAD_ATTEMPTS if real_2k_upload else 1
+                        for attempt in range(attempts):
+                            try:
+                                attachment_payload = await self._trello_attach_file_bytes_with_cover_fallback(
+                                    job_id,
+                                    index,
+                                    key,
+                                    token,
+                                    card_id,
+                                    source_bytes,
+                                    source_mime or artifact.mime_type or "image/jpeg",
+                                    name,
+                                    set_cover and index == 0,
+                                )
+                                break
+                            except Exception as upload_exc:
+                                if attempt + 1 >= attempts:
+                                    raise
+                                delay = self.TRELLO_2K_UPLOAD_RETRY_DELAYS_S[min(attempt, len(self.TRELLO_2K_UPLOAD_RETRY_DELAYS_S) - 1)]
+                                await self.store.append_log(
+                                    job_id,
+                                    (
+                                        f"Upload ban 2K cua anh {index + 1} len Trello chua duoc (lan {attempt + 1}/{attempts}): "
+                                        f"{humanize_flow_error(str(upload_exc))[:120]}; thu lai sau {int(delay)} giay."
+                                    ),
+                                )
+                                await asyncio.sleep(delay)
+                    except FlowUiUpscaleUnavailableError:
+                        raise
                     except Exception as file_exc:
+                        if real_2k_upload:
+                            # The Flow URL is the 1K original: attaching it would put a 1K image on the card.
+                            await self._persist_held_artifact_files(job_id, artifacts)
+                            raise FlowUiUpscaleUnavailableError(
+                                f"Khong upload duoc ban 2K cua anh {index + 1}/{total_uploads} len Trello sau {attempts} lan "
+                                f"({humanize_flow_error(str(file_exc))[:120]}); app giu phan con lai cua card, khong attach URL 1K."
+                            ) from file_exc
                         await self.store.append_log(
                             job_id,
                             f"Upload file ảnh {index + 1} lên Trello chưa được, thử attach bằng URL: {humanize_flow_error(str(file_exc))}",
@@ -14752,6 +14788,7 @@ exit 1
         fields: Dict[str, Any] | None = None,
         data: bytes | None = None,
         headers: Dict[str, str] | None = None,
+        timeout_s: float | None = None,
     ) -> Any:
         payload = data
         request_headers = {"Accept": "application/json", **(headers or {})}
@@ -14766,7 +14803,7 @@ exit 1
             method="POST",
         )
         try:
-            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+            with urlopen(request, timeout=float(timeout_s or self.TRELLO_TIMEOUT_S)) as response:
                 raw_payload = response.read().decode("utf-8", errors="replace")
                 return json.loads(raw_payload) if raw_payload else {}
         except HTTPError as exc:
@@ -14915,6 +14952,7 @@ exit 1
             token,
             data=body,
             headers={"Content-Type": content_type},
+            timeout_s=self.TRELLO_UPLOAD_TIMEOUT_S,
         )
         if isinstance(payload, list):
             return payload[0] if payload else {}
