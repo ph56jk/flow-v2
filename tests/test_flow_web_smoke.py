@@ -7009,6 +7009,28 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(all(item["name"].startswith("Gen_image_") for item in results))
         self.assertIsNone(page.opened)
 
+    async def test_flow_ui_2k_download_skips_a_tile_that_repeats_an_image_already_downloaded(self) -> None:
+        """Virtualised grid: after the editor closes, tile 1 can show tile 0's image again (worker 1, 2026-09-11)."""
+        client, page = self._ui2k_fakes(generated=3, total_tiles=10)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+        original_click = page.mouse.click
+        service = self.service
+
+        async def click(x: float, y: float) -> None:
+            await original_click(x, y)
+            if (x, y) == (1231, 130) and page.opened == 1 and page.pending_download is not None:
+                # tile 1 hands back the same picture as tile 0
+                page.pending_download = type(page.pending_download)("Gen_image_1_2K_2026.jpeg", service._test_jpeg_bytes(2048, seed=0))
+
+        page.mouse.click = click
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"):
+            results = await self.service._download_flow_ui_upscaled_set(client, 5, job_id=job.id)
+
+        self.assertEqual(2, len(results))
+        self.assertEqual([0, 1, 2], page.downloads)
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("bo qua 1 tile trung", logs)
+
     async def test_flow_ui_2k_download_stops_when_enough_images_are_collected(self) -> None:
         client, page = self._ui2k_fakes(generated=12, total_tiles=40)
         job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))

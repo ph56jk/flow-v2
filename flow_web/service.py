@@ -15182,6 +15182,14 @@ exit 1
     """
     FLOW_UI_TILE_SELECTOR = 'img[alt*="Tile displaying"]'
     FLOW_UI_2K_GIVE_UP_FAILURES = 3
+    FLOW_UI_2K_DUPLICATE_DISTANCE = 0.005  # two downloads closer than this are the same image
+    FLOW_UI_TILE_SRC_JS = """
+        /* flow-ui-tile-src */
+        (index) => {
+          const img = document.querySelectorAll('img[alt*="Tile displaying"]')[index];
+          return img ? (img.currentSrc || img.src || '') : '';
+        }
+    """
     FLOW_UI_TILE_CENTER_JS = """
         /* flow-ui-tile-center */
         (index) => {
@@ -15278,10 +15286,21 @@ exit 1
             await self.store.append_log(job_id, f"Dang tai ban 2K tu giao dien Flow cho {wanted} anh (grid co {available} anh).")
         download_root = self._download_root()
         download_root.mkdir(parents=True, exist_ok=True)
-        for tile_index in range(min(max(available, 0), wanted + 4)):
+        # The grid is virtualised and re-mounts after the editor closes, so "tile index N" is not a stable
+        # identity: remember the thumbnail src of every tile handled and skip repeats (2026-09-11).
+        seen_srcs: set[str] = set()
+        duplicates = 0
+        for tile_index in range(min(max(available, 0), wanted + 8)):
             if len(results) >= wanted or failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES:
                 break
             try:
+                tile_src = await page.evaluate(self.FLOW_UI_TILE_SRC_JS, tile_index)
+                tile_src = tile_src if isinstance(tile_src, str) else ""
+                if tile_src and tile_src in seen_srcs:
+                    duplicates += 1
+                    continue
+                if tile_src:
+                    seen_srcs.add(tile_src)
                 center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index)
                 if not isinstance(center, dict) or float(center.get("w") or 0) < 40 or float(center.get("h") or 0) < 40:
                     raise RuntimeError(f"grid tile {tile_index + 1} is not rendered ({center})")
@@ -15329,7 +15348,19 @@ exit 1
                 data = await asyncio.to_thread(destination.read_bytes)
                 size = await asyncio.to_thread(self._image_size_from_bytes, data)
                 if data and size and max(size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
-                    results.append({"bytes": data, "name": file_name, "path": str(destination), "size": size})
+                    try:
+                        sig = await asyncio.to_thread(self._image_thumb_signature, data)
+                    except Exception:
+                        sig = None
+                    is_duplicate = bool(sig) and any(
+                        item.get("sig")
+                        and sum(abs(a - b) for a, b in zip(sig, item["sig"])) / len(sig) < self.FLOW_UI_2K_DUPLICATE_DISTANCE
+                        for item in results
+                    )
+                    if is_duplicate:
+                        duplicates += 1
+                    else:
+                        results.append({"bytes": data, "name": file_name, "path": str(destination), "size": size, "sig": sig})
                 else:
                     failures += 1
                 await self._flow_ui_leave_image_editor(page)
@@ -15348,7 +15379,8 @@ exit 1
                 except Exception:
                     pass
         if job_id:
-            await self.store.append_log(job_id, f"Da tai {len(results)}/{wanted} ban 2K tu giao dien Flow.")
+            dup_note = f"; bo qua {duplicates} tile trung" if duplicates else ""
+            await self.store.append_log(job_id, f"Da tai {len(results)}/{wanted} ban 2K tu giao dien Flow{dup_note}.")
         if failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES and len(results) < wanted:
             raise FlowUiUpscaleUnavailableError(
                 f"Flow khong tra ban 2K ({failures} anh khong tai duoc, moi {len(results)}/{wanted} anh co 2K); "
