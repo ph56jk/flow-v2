@@ -189,6 +189,7 @@ class FlowWebService:
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
     TRELLO_TIMEOUT_S = 30
+    TRELLO_EXISTING_2K_MIN_BYTES = 1_400_000  # a 2048px JPEG is 2-3 MB; a 1K one is under 1 MB
     TRELLO_UPLOAD_TIMEOUT_S = 180  # a 2-3 MB 2K JPEG on a slow uplink needs more than the 30 s API timeout
     TRELLO_2K_UPLOAD_ATTEMPTS = 3
     TRELLO_2K_UPLOAD_RETRY_DELAYS_S = (10.0, 30.0)
@@ -10241,6 +10242,22 @@ exit 1
         stored = 0
         failed = 0
         attachments: List[Dict[str, Any]] = []
+        # Images already on the card (a held card being retried keeps the ones uploaded before the hold).
+        existing_2k_names: set[str] = set()
+        try:
+            existing_attachments = await asyncio.to_thread(
+                self._trello_card_attachments_or_fetch, {}, key, token, card_id, field_names="id,name,bytes"
+            )
+            for item in existing_attachments or []:
+                item_name = str(item.get("name") or "").strip()
+                try:
+                    item_bytes = int(item.get("bytes") or 0)
+                except (TypeError, ValueError):
+                    item_bytes = 0
+                if item_name and item_bytes >= self.TRELLO_EXISTING_2K_MIN_BYTES:
+                    existing_2k_names.add(item_name)
+        except Exception as exc:  # noqa: BLE001 - listing is best effort; a failure just re-uploads
+            await self.store.append_log(job_id, f"Khong doc duoc danh sach attachment cua card (se upload binh thuong): {str(exc)[:100]}")
         upscale_announced = False
         total_uploads = len(artifacts)
         await self.store.set_progress_hint(
@@ -10290,6 +10307,11 @@ exit 1
                 continue
 
             name = self._trello_attachment_name(job_id, artifact, index)
+            if name in existing_2k_names:
+                stored += 1
+                attachments.append({"id": "", "name": name, "url": "", "existing": True})
+                await self.store.append_log(job_id, f"Anh {index + 1}/{total_uploads} ({name}) da co ban 2K tren card, bo qua.")
+                continue
             real_2k_upload = False
             try:
                 await self.store.set_progress_hint(
@@ -15015,6 +15037,10 @@ exit 1
     UI_2K_THUMB_SIZE = 24
     UI_2K_MATCH_MAX_DISTANCE = 0.04
     UI_2K_MATCH_MIN_MARGIN = 0.03
+    # A true pair usually sits at 0.001-0.015, "same scene, other design" at ~0.10. Flow's upscaler sometimes
+    # redraws details (Crown card 2026-09-11: 0.056), so a candidate that is clearly the best is still accepted.
+    UI_2K_MATCH_LOOSE_DISTANCE = 0.08
+    UI_2K_MATCH_LOOSE_MIN_MARGIN = 0.05
 
     def _image_thumb_signature(self, image_bytes: bytes) -> List[float]:
         """Tiny grayscale thumbnail used to pair a 1K artifact with its 2K download."""
@@ -15052,11 +15078,14 @@ exit 1
                 best = candidate
             elif distance < second_distance:
                 second_distance = distance
-        if best is None or best_distance > self.UI_2K_MATCH_MAX_DISTANCE:
+        if best is None:
             return None
-        if second_distance - best_distance < self.UI_2K_MATCH_MIN_MARGIN:
-            return None  # two candidates look alike: refuse rather than risk uploading the wrong one
-        return best
+        margin = second_distance - best_distance
+        if best_distance <= self.UI_2K_MATCH_MAX_DISTANCE and margin >= self.UI_2K_MATCH_MIN_MARGIN:
+            return best
+        if best_distance <= self.UI_2K_MATCH_LOOSE_DISTANCE and margin >= self.UI_2K_MATCH_LOOSE_MIN_MARGIN:
+            return best  # not a textbook pair, but nothing else comes close
+        return None  # too far, or two candidates look alike: refuse rather than risk uploading the wrong one
 
     async def _download_flow_ui_upscaled_set(self, client: Any, count: int, *, job_id: str = "") -> List[Dict[str, Any]]:
         """Open the newest grid images in Flow's editor and download their "2K Upscaled" versions.

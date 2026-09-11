@@ -3908,6 +3908,56 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("khong co ban 2K that", str(raised.exception))
         self.assertTrue(self.service._auto_trello_should_stop_on_child_error(str(raised.exception)))
 
+    def test_trello_archive_skips_images_whose_2k_is_already_on_the_card(self) -> None:
+        """retry-trello-upload of a held card must not duplicate the images uploaded before the hold."""
+        from PIL import Image
+
+        source_file = self.downloads_dir / "flow-small.jpg"
+        Image.new("RGB", (640, 480), (120, 170, 210)).save(source_file, format="JPEG", quality=90)
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifacts = [
+            JobArtifact(label="Ảnh 1", media_name="m1.jpg", local_path=str(source_file), mime_type="image/jpeg"),
+            JobArtifact(label="Ảnh 2", media_name="m2.jpg", local_path=str(source_file), mime_type="image/jpeg"),
+        ]
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+        two_k = ImageUpscaleResult(bytes=self.service._test_jpeg_bytes(2048, seed=1), mime_type="image/jpeg", source="flow_2k", used_flow=True)
+        existing = [
+            {"id": "old-1", "name": f"flow-{job.id[:8]}-1.jpg", "bytes": 2_400_000},
+            {"id": "old-src", "name": "trello-source.jpg", "bytes": 500_000},
+        ]
+
+        with patch.dict(os.environ, {"FLOW_UI_UPSCALE_2K_ENABLED": ""}, clear=False), patch.object(
+            self.service, "_trello_card_attachments_or_fetch", return_value=existing
+        ), patch.object(
+            self.service, "_with_client", new=AsyncMock(return_value=[{"bytes": two_k.bytes, "name": "gen_2K.jpeg"}])
+        ), patch.object(
+            self.service, "_upsample_artifact_bytes", new=AsyncMock(return_value=two_k)
+        ), patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            return_value={"id": "att-2", "name": f"flow-{job.id[:8]}-2.jpg", "url": "https://trello.example/att-2"},
+        ) as attach_bytes:
+            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
+
+        attach_bytes.assert_called_once()
+        self.assertEqual(f"flow-{job.id[:8]}-2.jpg", attach_bytes.call_args.args[5])
+        self.assertEqual(2, result["sent"])
+        self.assertEqual(0, result["failed"])
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("da co ban 2K tren card, bo qua", logs)
+
     def test_trello_archive_retries_2k_upload_then_holds_instead_of_attaching_1k_url(self) -> None:
         """Worker 2, 2026-09-10 16:50: the 2K file upload timed out and the URL fallback attached the 1K original."""
         from PIL import Image
@@ -7006,6 +7056,20 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             self.assertIsNotNone(matched, f"seed {seed} should match")
             self.assertEqual(self.service._test_jpeg_bytes(2048, seed=seed), matched["bytes"])
         self.assertIsNone(self.service._match_ui_upscaled_candidate(self.service._test_jpeg_bytes(1024, seed=7), candidates))
+
+    async def test_match_ui_upscaled_candidate_accepts_clearly_best_candidate_beyond_strict_distance(self) -> None:
+        source = self.service._test_jpeg_bytes(1024, seed=3)
+        source_sig = self.service._image_thumb_signature(source)
+        # Build a candidate whose signature is exactly 0.06 away (each channel shifted), and a far runner-up.
+        near = {"sig": [min(1.0, v + 0.06) if v < 0.5 else max(0.0, v - 0.06) for v in source_sig], "bytes": b"near"}
+        far = {"sig": [min(1.0, v + 0.3) if v < 0.5 else max(0.0, v - 0.3) for v in source_sig], "bytes": b"far"}
+        self.assertIs(near, self.service._match_ui_upscaled_candidate(source, [far, near]))
+        # Same distance but with a runner-up almost as close: refused.
+        rival = {"sig": [min(1.0, v + 0.07) if v < 0.5 else max(0.0, v - 0.07) for v in source_sig], "bytes": b"rival"}
+        self.assertIsNone(self.service._match_ui_upscaled_candidate(source, [rival, near]))
+        # Beyond the loose limit: refused even when alone.
+        too_far = {"sig": [min(1.0, v + 0.12) if v < 0.5 else max(0.0, v - 0.12) for v in source_sig], "bytes": b"toofar"}
+        self.assertIsNone(self.service._match_ui_upscaled_candidate(source, [too_far, far]))
 
     async def test_upsample_artifact_bytes_prefers_flow_ui_2k_candidate(self) -> None:
         source_path = self.data_dir / "ui2k-source.jpg"
