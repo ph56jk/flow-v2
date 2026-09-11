@@ -10537,14 +10537,6 @@ exit 1
             card["_auto_trello_skip_reason"] = f"{card.get('_auto_trello_skip_reason') or ''} (thieu Trello key/board nen chua chuyen list)".strip()
             return False
         try:
-            review_list_name = self._default_trello_review_list_name()
-            review_list_id = self._trello_content_review_list_id(key, token, board_id, review_list_name)
-            if not review_list_id:
-                card["_auto_trello_skip_reason"] = f"{card.get('_auto_trello_skip_reason') or ''} (khong tim thay list {review_list_name})".strip()
-                return False
-            self._trello_move_card_to_list(key, token, card_id, review_list_id)
-            card["_auto_trello_moved_to_review"] = True
-            logging.info("Auto Trello moved partial card %s (%s/%s outputs) to %s.", card_id, output_count, target_count, review_list_name)
             try:
                 done_label_name = self._default_trello_done_label_name()
                 done_label_id = self._trello_done_label_id(key, token, board_id, done_label_name)
@@ -10555,6 +10547,15 @@ exit 1
                 card["_auto_trello_skip_reason"] = (
                     f"{card.get('_auto_trello_skip_reason') or ''} (khong gan duoc nhan Done: {humanize_flow_error(str(label_exc))[:120]})"
                 ).strip()
+
+            review_list_name = self._default_trello_review_list_name()
+            review_list_id = self._trello_content_review_list_id(key, token, board_id, review_list_name)
+            if not review_list_id:
+                card["_auto_trello_skip_reason"] = f"{card.get('_auto_trello_skip_reason') or ''} (board khong co list {review_list_name}, chi gan nhan Done)".strip()
+                return bool(card.get("_auto_trello_done_label_attached"))
+            self._trello_move_card_to_list(key, token, card_id, review_list_id)
+            card["_auto_trello_moved_to_review"] = True
+            logging.info("Auto Trello moved partial card %s (%s/%s outputs) to %s.", card_id, output_count, target_count, review_list_name)
             return True
         except Exception as exc:
             card["_auto_trello_skip_reason"] = (
@@ -10603,8 +10604,10 @@ exit 1
                 cause = f"{qa_dropped} anh bi QA loai" if qa_dropped > 0 else "Flow tra thieu anh"
                 await self.store.append_log(
                     job_id,
-                    f"Bo anh co {output_count}/{target_count} anh ({cause}, khong tao bu); coi nhu du va chuyen card sang Content Review.",
+                    f"Bo anh co {output_count}/{target_count} anh ({cause}, khong tao bu); coi nhu da xong phan tao anh.",
                 )
+
+            done_label_result = await self._attach_trello_done_label_async(job_id, key, token, board_id, card_id)
 
             review_list_name = self._default_trello_review_list_name()
             review_list_id = await asyncio.to_thread(
@@ -10617,7 +10620,7 @@ exit 1
             if not review_list_id:
                 await self.store.append_log(
                     job_id,
-                    f"Trello da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, nhung khong tim thay list {review_list_name}.",
+                    f"Board Trello khong co list {review_list_name}; da gan nhan Done nhung khong move card.",
                 )
                 return {
                     "moved": False,
@@ -10625,6 +10628,7 @@ exit 1
                     "output_count": output_count,
                     "target_output_count": target_count,
                     "list_name": review_list_name,
+                    "done_label": done_label_result,
                 }
 
             payload = await asyncio.to_thread(
@@ -10638,63 +10642,6 @@ exit 1
                 job_id,
                 f"Da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, da chuyen card Trello sang {review_list_name}.",
             )
-            done_label_name = self._default_trello_done_label_name()
-            done_label_result: Dict[str, Any] = {"attached": False, "label_name": done_label_name}
-            try:
-                done_label_id = await asyncio.to_thread(
-                    self._trello_done_label_id,
-                    key,
-                    token,
-                    board_id,
-                    done_label_name,
-                )
-                if done_label_id:
-                    label_payload = await asyncio.to_thread(
-                        self._trello_add_label_to_card,
-                        key,
-                        token,
-                        card_id,
-                        done_label_id,
-                    )
-                    already = bool(isinstance(label_payload, dict) and label_payload.get("already_present"))
-                    done_label_result = {
-                        "attached": True,
-                        "label_id": done_label_id,
-                        "label_name": done_label_name,
-                        "already_present": already,
-                    }
-                    if already:
-                        await self.store.append_log(
-                            job_id,
-                            f"Nhan '{done_label_name}' da co san tren card Trello; giu nguyen.",
-                        )
-                    else:
-                        await self.store.append_log(
-                            job_id,
-                            f"Da gan nhan '{done_label_name}' vao card Trello de nguoi dung thay ngay card nao da xong.",
-                        )
-                else:
-                    done_label_result = {
-                        "attached": False,
-                        "label_name": done_label_name,
-                        "reason": "label_id_missing",
-                    }
-                    await self.store.append_log(
-                        job_id,
-                        f"Khong tim/tao duoc nhan '{done_label_name}' tren board; bo qua buoc gan nhan.",
-                    )
-            except Exception as label_exc:
-                label_detail = humanize_flow_error(str(label_exc))
-                done_label_result = {
-                    "attached": False,
-                    "label_name": done_label_name,
-                    "reason": "label_attach_failed",
-                    "error": label_detail,
-                }
-                await self.store.append_log(
-                    job_id,
-                    f"Khong gan duoc nhan '{done_label_name}' cho card sau khi chuyen list: {label_detail}",
-                )
             return {
                 "moved": True,
                 "output_count": output_count,
@@ -10707,12 +10654,73 @@ exit 1
             }
         except Exception as exc:
             detail = humanize_flow_error(str(exc))
-            await self.store.append_log(job_id, f"Khong chuyen duoc card sang Content Review: {detail}")
+            await self.store.append_log(job_id, f"Khong hoan tat duoc buoc sau tao anh (gan nhan/move card): {detail}")
             return {
                 "moved": False,
                 "reason": "move_failed",
                 "error": detail,
                 "target_output_count": target_count,
+            }
+
+    async def _attach_trello_done_label_async(
+        self,
+        job_id: str,
+        key: str,
+        token: str,
+        board_id: str,
+        card_id: str,
+    ) -> Dict[str, Any]:
+        done_label_name = self._default_trello_done_label_name()
+        try:
+            done_label_id = await asyncio.to_thread(
+                self._trello_done_label_id,
+                key,
+                token,
+                board_id,
+                done_label_name,
+            )
+            if not done_label_id:
+                await self.store.append_log(
+                    job_id,
+                    f"Khong tim/tao duoc nhan '{done_label_name}' tren board; bo qua buoc gan nhan.",
+                )
+                return {"attached": False, "label_name": done_label_name, "reason": "label_id_missing"}
+
+            label_payload = await asyncio.to_thread(
+                self._trello_add_label_to_card,
+                key,
+                token,
+                card_id,
+                done_label_id,
+            )
+            already = bool(isinstance(label_payload, dict) and label_payload.get("already_present"))
+            if already:
+                await self.store.append_log(
+                    job_id,
+                    f"Nhan '{done_label_name}' da co san tren card Trello; giu nguyen.",
+                )
+            else:
+                await self.store.append_log(
+                    job_id,
+                    f"Da gan nhan '{done_label_name}' vao card Trello vi da tao xong anh.",
+                )
+            return {
+                "attached": True,
+                "label_id": done_label_id,
+                "label_name": done_label_name,
+                "already_present": already,
+            }
+        except Exception as label_exc:
+            label_detail = humanize_flow_error(str(label_exc))
+            await self.store.append_log(
+                job_id,
+                f"Khong gan duoc nhan '{done_label_name}' cho card sau khi tao xong anh: {label_detail}",
+            )
+            return {
+                "attached": False,
+                "label_name": done_label_name,
+                "reason": "label_attach_failed",
+                "error": label_detail,
             }
 
     async def _trello_artifact_file_bytes(
