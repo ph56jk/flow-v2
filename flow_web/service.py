@@ -200,6 +200,8 @@ class FlowWebService:
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
     DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ()
     DEFAULT_TRELLO_REVIEW_LIST_NAME = "Content Review"
+    DEFAULT_TRELLO_DONE_LABEL_NAME = "Done"
+    DEFAULT_TRELLO_DONE_LABEL_COLOR = "green"
     DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
     DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
@@ -334,6 +336,7 @@ class FlowWebService:
         self._active_flow_profile_index = 0
         self._trello_source_downloads: Dict[str, Dict[str, Any]] = {}
         self._trello_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
+        self._trello_done_label_id_cache: Dict[str, str] = {}
         self._cleanup_state_cache: tuple[float, str, CleanupAssistantSnapshot] | None = None
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
@@ -10542,6 +10545,16 @@ exit 1
             self._trello_move_card_to_list(key, token, card_id, review_list_id)
             card["_auto_trello_moved_to_review"] = True
             logging.info("Auto Trello moved partial card %s (%s/%s outputs) to %s.", card_id, output_count, target_count, review_list_name)
+            try:
+                done_label_name = self._default_trello_done_label_name()
+                done_label_id = self._trello_done_label_id(key, token, board_id, done_label_name)
+                if done_label_id:
+                    self._trello_add_label_to_card(key, token, card_id, done_label_id)
+                    card["_auto_trello_done_label_attached"] = True
+            except Exception as label_exc:
+                card["_auto_trello_skip_reason"] = (
+                    f"{card.get('_auto_trello_skip_reason') or ''} (khong gan duoc nhan Done: {humanize_flow_error(str(label_exc))[:120]})"
+                ).strip()
             return True
         except Exception as exc:
             card["_auto_trello_skip_reason"] = (
@@ -10625,6 +10638,63 @@ exit 1
                 job_id,
                 f"Da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, da chuyen card Trello sang {review_list_name}.",
             )
+            done_label_name = self._default_trello_done_label_name()
+            done_label_result: Dict[str, Any] = {"attached": False, "label_name": done_label_name}
+            try:
+                done_label_id = await asyncio.to_thread(
+                    self._trello_done_label_id,
+                    key,
+                    token,
+                    board_id,
+                    done_label_name,
+                )
+                if done_label_id:
+                    label_payload = await asyncio.to_thread(
+                        self._trello_add_label_to_card,
+                        key,
+                        token,
+                        card_id,
+                        done_label_id,
+                    )
+                    already = bool(isinstance(label_payload, dict) and label_payload.get("already_present"))
+                    done_label_result = {
+                        "attached": True,
+                        "label_id": done_label_id,
+                        "label_name": done_label_name,
+                        "already_present": already,
+                    }
+                    if already:
+                        await self.store.append_log(
+                            job_id,
+                            f"Nhan '{done_label_name}' da co san tren card Trello; giu nguyen.",
+                        )
+                    else:
+                        await self.store.append_log(
+                            job_id,
+                            f"Da gan nhan '{done_label_name}' vao card Trello de nguoi dung thay ngay card nao da xong.",
+                        )
+                else:
+                    done_label_result = {
+                        "attached": False,
+                        "label_name": done_label_name,
+                        "reason": "label_id_missing",
+                    }
+                    await self.store.append_log(
+                        job_id,
+                        f"Khong tim/tao duoc nhan '{done_label_name}' tren board; bo qua buoc gan nhan.",
+                    )
+            except Exception as label_exc:
+                label_detail = humanize_flow_error(str(label_exc))
+                done_label_result = {
+                    "attached": False,
+                    "label_name": done_label_name,
+                    "reason": "label_attach_failed",
+                    "error": label_detail,
+                }
+                await self.store.append_log(
+                    job_id,
+                    f"Khong gan duoc nhan '{done_label_name}' cho card sau khi chuyen list: {label_detail}",
+                )
             return {
                 "moved": True,
                 "output_count": output_count,
@@ -10633,6 +10703,7 @@ exit 1
                 "list_name": review_list_name,
                 "card_id": str(payload.get("id") or card_id).strip() if isinstance(payload, dict) else card_id,
                 "card_url": str(payload.get("url") or payload.get("shortUrl") or "").strip() if isinstance(payload, dict) else "",
+                "done_label": done_label_result,
             }
         except Exception as exc:
             detail = humanize_flow_error(str(exc))
@@ -11212,6 +11283,12 @@ exit 1
     def _default_trello_review_list_name(self) -> str:
         return os.getenv("TRELLO_REVIEW_LIST_NAME", self.DEFAULT_TRELLO_REVIEW_LIST_NAME).strip() or self.DEFAULT_TRELLO_REVIEW_LIST_NAME
 
+    def _default_trello_done_label_name(self) -> str:
+        return os.getenv("TRELLO_DONE_LABEL_NAME", self.DEFAULT_TRELLO_DONE_LABEL_NAME).strip() or self.DEFAULT_TRELLO_DONE_LABEL_NAME
+
+    def _default_trello_done_label_color(self) -> str:
+        return os.getenv("TRELLO_DONE_LABEL_COLOR", self.DEFAULT_TRELLO_DONE_LABEL_COLOR).strip() or self.DEFAULT_TRELLO_DONE_LABEL_COLOR
+
     def _default_trello_extra_source_list_names(self) -> List[str]:
         allow_extra = os.getenv("TRELLO_ALLOW_EXTRA_SOURCE_LISTS", "").strip().lower() in {"1", "true", "yes", "on"}
         if not allow_extra:
@@ -11308,6 +11385,62 @@ exit 1
             if list_label and self._compact_match_text(list_label) == target_key:
                 return list_id
         return ""
+
+    def _trello_board_labels(self, key: str, token: str, board_id: str) -> List[Dict[str, Any]]:
+        board_id = self._normalize_trello_board_id(board_id)
+        if not board_id:
+            return []
+        payload = self._trello_get_json(
+            f"boards/{quote(board_id, safe='')}/labels",
+            key,
+            token,
+            fields={"fields": "id,name,color", "limit": "1000"},
+        )
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    def _trello_done_label_id(self, key: str, token: str, board_id: str, label_name: str = "") -> str:
+        board_id = self._normalize_trello_board_id(board_id)
+        target_name = str(label_name or "").strip() or self._default_trello_done_label_name()
+        cache_key = f"{board_id}::{self._compact_match_text(target_name)}"
+        cached = self._trello_done_label_id_cache.get(cache_key)
+        if cached:
+            return cached
+        if not board_id:
+            return ""
+        target_key = self._compact_match_text(target_name)
+        for item in self._trello_board_labels(key, token, board_id):
+            label_id = self._normalize_trello_id(str(item.get("id") or ""))
+            label_text = str(item.get("name") or "").strip()
+            if label_id and label_text and self._compact_match_text(label_text) == target_key:
+                self._trello_done_label_id_cache[cache_key] = label_id
+                return label_id
+        created = self._trello_create_board_label(
+            key,
+            token,
+            board_id,
+            target_name,
+            self._default_trello_done_label_color(),
+        )
+        created_id = self._normalize_trello_id(str(created.get("id") or ""))
+        if created_id:
+            self._trello_done_label_id_cache[cache_key] = created_id
+        return created_id
+
+    def _trello_create_board_label(
+        self,
+        key: str,
+        token: str,
+        board_id: str,
+        name: str,
+        color: str,
+    ) -> Dict[str, Any]:
+        payload = self._trello_request_json(
+            f"boards/{quote(board_id, safe='')}/labels",
+            key,
+            token,
+            fields={"name": name, "color": color},
+        )
+        return payload if isinstance(payload, dict) else {}
 
     def _trello_resolve_board_list_id(self, key: str, token: str, board_id: str, list_value: str = "") -> str:
         board_id = self._normalize_trello_board_id(board_id)
@@ -14902,6 +15035,24 @@ exit 1
             token,
             fields={"idList": list_id, "pos": "top"},
         )
+        return payload if isinstance(payload, dict) else {}
+
+    def _trello_add_label_to_card(self, key: str, token: str, card_id: str, label_id: str) -> Dict[str, Any]:
+        try:
+            payload = self._trello_request_json(
+                f"cards/{quote(card_id, safe='')}/idLabels",
+                key,
+                token,
+                fields={"value": label_id},
+            )
+        except RuntimeError as exc:
+            # Trello returns 400 "label is already on the card" when we re-tag a card.
+            # Treat that as success so retries stay idempotent.
+            if "already on the card" in str(exc).lower():
+                return {"already_present": True}
+            raise
+        if isinstance(payload, list):
+            return {"idLabels": payload}
         return payload if isinstance(payload, dict) else {}
 
     def _trello_attach_url(
