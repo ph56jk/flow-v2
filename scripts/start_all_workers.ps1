@@ -39,3 +39,4 @@ if ($NoOpenBrowser) {
     $secondaryArguments += "-NoOpenBrowser"
 }
 Start-WorkerLauncher -ScriptName "start_flow_worker_3170.ps1" -Arguments $secondaryArguments
+Start-WorkerLauncher -ScriptName "start_flow_worker_3171.ps1" -Arguments $secondaryArguments

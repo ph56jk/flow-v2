@@ -1,15 +1,12 @@
 # Multi-worker setup
 
-The Windows launchers run two isolated app instances:
+The Windows launchers run three isolated app instances:
 
 | Worker | Port | Local environment | Runtime data |
 |---|---:|---|---|
 | Primary | 3169 | `.env.local` | `data/` |
 | Worker 2 | 3170 | `.env.worker-3170.local` | `data/workers/3170/` |
-
-Worker 3 (`3171`) is available on disk (setup/start/login scripts under
-`scripts/`) but is no longer launched by `start_all_workers.ps1`. Bring it back
-by re-adding the launcher line or running `start_flow_worker_3171.ps1` directly.
+| Worker 3 | 3171 | `.env.worker-3171.local` | `data/workers/3171/` |
 
 Each secondary worker must have a separate Trello input list and separate
 Google Flow browser profiles. Account emails, project IDs, cookies, tokens,
@@ -44,13 +41,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\login_flow_profile.ps1 `
 ## Start workers
 
 ```powershell
-# Start Primary + Worker 2 without opening dashboard tabs.
+# Start all three without opening dashboard tabs.
 powershell -ExecutionPolicy Bypass -File .\scripts\start_all_workers.ps1 -NoOpenBrowser
 
-# Start Worker 2 on its own.
+# Start one secondary worker.
 powershell -ExecutionPolicy Bypass -File .\scripts\start_flow_worker_3170.ps1
-
-# (Optional) Re-enable Worker 3 by launching it manually.
 powershell -ExecutionPolicy Bypass -File .\scripts\start_flow_worker_3171.ps1
 ```
 
