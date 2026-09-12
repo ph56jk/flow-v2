@@ -10299,7 +10299,7 @@ exit 1
             ui_2k_wanted = max(total_uploads, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, generated_count))
             try:
                 ui_2k_candidates = await self._with_client(
-                    lambda client: self._download_flow_ui_upscaled_set(client, ui_2k_wanted, job_id=job_id),
+                    lambda client: self._download_flow_ui_upscaled_set(client, ui_2k_wanted, job_id=job_id, extra=self._flow_ui_2k_extra_candidates()),
                     workflow_id=first_workflow_id,
                 )
             except Exception as ui_exc:
@@ -15272,13 +15272,16 @@ exit 1
             return best  # not a textbook pair, but nothing else comes close
         return None  # too far, or two candidates look alike: refuse rather than risk uploading the wrong one
 
-    async def _download_flow_ui_upscaled_set(self, client: Any, count: int, *, job_id: str = "") -> List[Dict[str, Any]]:
+    async def _download_flow_ui_upscaled_set(self, client: Any, count: int, *, job_id: str = "", extra: int = 0) -> List[Dict[str, Any]]:
         """Open the newest grid images in Flow's editor and download their "2K Upscaled" versions.
 
         Returns [{"bytes", "name", "sig"}]; the loop stops after ``count`` downloads or at the first
         source upload (Trello attachments are named trello-*). Any per-image failure is logged and skipped.
         """
-        wanted = max(1, min(int(count or 1), self.FLOW_AGENT_MAX_OUTPUT_COUNT + 2))
+        # ``extra``: thêm ô ứng viên khi ảnh của thẻ nằm sâu dưới lưới (upload lại thẻ giữ qua đêm, khi
+        # nhiều thẻ mới hơn đã đẩy ảnh của nó xuống). Ghép ảnh theo thumbnail nên tải dư không sao.
+        extra = max(0, int(extra or 0))
+        wanted = max(1, min(int(count or 1), self.FLOW_AGENT_MAX_OUTPUT_COUNT + 2)) + extra
         page = await client._bm.page()
         project_id = str(getattr(client, "project_id", "") or "").strip()
         if project_id:
