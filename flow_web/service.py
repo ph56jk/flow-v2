@@ -10067,7 +10067,25 @@ exit 1
         await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp thiết kế ảnh nguồn Trello; tiếp tục upload.")
         return list(artifacts)
 
+    #: Số ô lưới quét thêm khi upload lại (FLOW_UI_2K_RETRY_EXTRA, mặc định 36 = ba thẻ mới hơn).
+    _flow_ui_2k_retry_active: int = 0
+
+    def _flow_ui_2k_extra_candidates(self) -> int:
+        if self._flow_ui_2k_retry_active <= 0:
+            return 0
+        try:
+            return max(0, int(os.getenv("FLOW_UI_2K_RETRY_EXTRA", "36") or 0))
+        except ValueError:
+            return 36
+
     async def retry_trello_upload(self, job_id: str) -> Dict[str, Any]:
+        self._flow_ui_2k_retry_active += 1
+        try:
+            return await self._retry_trello_upload_inner(job_id)
+        finally:
+            self._flow_ui_2k_retry_active -= 1
+
+    async def _retry_trello_upload_inner(self, job_id: str) -> Dict[str, Any]:
         """Re-run design QA + Trello upload from the images a finished job already generated.
 
         Generated files share local names across jobs, so the images are re-fetched from their
@@ -15290,7 +15308,16 @@ exit 1
         # identity: remember the thumbnail src of every tile handled and skip repeats (2026-09-11).
         seen_srcs: set[str] = set()
         duplicates = 0
-        for tile_index in range(min(max(available, 0), wanted + 8)):
+        # Ảnh nguồn (trello-*/erp-*) do các lượt Agent hỏng để lại nằm trên cùng lưới, và Flow tải thẳng
+        # ảnh upload khi bấm Download (không có menu 2K). Chúng không phải lỗi: bỏ qua và nới thêm ô để
+        # tới được ảnh tạo ra (ERP 2026-09-12: ba acc trả 0/12 vì 3 ô đầu đều là upload của lượt hỏng).
+        skipped_uploads = 0
+        upload_name_re = re.compile(r"^(erp|trello)-[\w.-]*\.(jpe?g|png|webp)", re.I)
+        tile_index = -1
+        while True:
+            tile_index += 1
+            if tile_index >= min(max(available, 0), wanted + 8 + skipped_uploads):
+                break
             if len(results) >= wanted or failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES:
                 break
             try:
@@ -15322,13 +15349,45 @@ exit 1
                     download_btn = next((it for it in controls if re.search(r"download media|^download\b", str(it.get("label") or ""), re.I)), None)
                 if not download_btn:
                     raise RuntimeError("no Download control in the image editor")
-                await page.mouse.click(float(download_btn["x"]), float(download_btn["y"]))
-                await asyncio.sleep(2.0)
+                # Ảnh upload thì Flow tải thẳng file gốc ngay khi bấm Download (không có menu): bắt lấy
+                # download ấy để nhận ra ô upload.
+                direct = None
+                try:
+                    async with page.expect_download(timeout=2500) as direct_info:
+                        await page.mouse.click(float(download_btn["x"]), float(download_btn["y"]))
+                    direct = await direct_info.value
+                except Exception:
+                    direct = None
+                direct_name = str(getattr(direct, "suggested_filename", "") or "") if direct is not None else ""
+                if direct is not None and not upload_name_re.search(direct_name):
+                    # Not a source upload (e.g. a download that was still settling): ignore it, read the menu.
+                    direct = None
+                if direct is not None:
+                    try:
+                        await direct.cancel()
+                    except Exception:
+                        pass
+                    skipped_uploads += 1
+                    if job_id and skipped_uploads <= 2:
+                        await self.store.append_log(
+                            job_id,
+                            f"O thu {tile_index + 1} tai thang file ({direct_name or 'khong ten'}): anh nguon upload, bo qua, khong tinh loi.",
+                        )
+                    await self._flow_ui_leave_image_editor(page)
+                    continue
+                await asyncio.sleep(0.5)
                 menu = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
                 menu = menu if isinstance(menu, list) else []
                 option = next((it for it in menu if re.search(r"\b2k\b", str(it.get("label") or ""), re.I) and re.search(r"upscal", str(it.get("label") or ""), re.I)), None)
                 if not option:
                     # uploads and non-generated media only offer the original size: we are past this card's outputs
+                    if job_id:
+                        labels = [str(it.get("label") or "").strip() for it in menu if str(it.get("label") or "").strip()]
+                        shot = await self._capture_flow_agent_debug_screenshot(page, "ui2k-menu") if failures == 0 else ""
+                        await self.store.append_log(
+                            job_id,
+                            f"Menu tai anh thu {tile_index + 1} khong co muc 2K Upscaled; menu: {labels[:12]} {shot}",
+                        )
                     await page.keyboard.press("Escape")
                     await asyncio.sleep(0.5)
                     await self._flow_ui_leave_image_editor(page)
@@ -15363,6 +15422,11 @@ exit 1
                         results.append({"bytes": data, "name": file_name, "path": str(destination), "size": size, "sig": sig})
                 else:
                     failures += 1
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            f"Ban 2K tu Flow cho anh thu {tile_index + 1} tai ve nhung khong phai 2K ({file_name}, {size}); bo qua.",
+                        )
                 await self._flow_ui_leave_image_editor(page)
             except Exception as exc:
                 failures += 1
