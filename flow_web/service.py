@@ -15319,6 +15319,17 @@ exit 1
         tile_index = -1
         while True:
             tile_index += 1
+            if available - 1 <= tile_index < wanted + 8 + skipped_uploads:
+                # Lưới ảo hóa chỉ vẽ ~27 ô một lúc: cuộn tới ô cuối đang vẽ để Flow vẽ thêm rồi đếm lại,
+                # nếu không quét sâu dừng ở 27 dù ảnh của thẻ cũ nằm dưới nữa (Idea 12, 2026-09-12).
+                try:
+                    await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, max(0, available - 1))
+                    await asyncio.sleep(1.2)
+                    grown = int(await tiles.count())
+                except Exception:
+                    grown = available
+                if grown > available:
+                    available = grown
             if tile_index >= min(max(available, 0), wanted + 8 + skipped_uploads):
                 break
             if len(results) >= wanted or failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES:
