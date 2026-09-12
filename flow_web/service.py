@@ -15229,13 +15229,25 @@ exit 1
     FLOW_UI_GRID_SCROLL_JS = """
         /* flow-ui-grid-scroll */
         () => {
-          const grid = [...document.querySelectorAll('cdk-virtual-scroll-viewport')]
+          // Cuộn khung chứa lưới: viewport ảo của Angular nếu có, không thì tổ tiên cuộn được gần nhất
+          // của một ô lưới, cuối cùng là cả trang.
+          const tile = document.querySelector('img[alt*="Tile displaying"]');
+          let grid = [...document.querySelectorAll('cdk-virtual-scroll-viewport')]
             .filter((el) => el.clientHeight > 0 && el.clientWidth > 0)
             .sort((a, b) => (b.clientHeight * b.clientWidth) - (a.clientHeight * a.clientWidth))[0];
-          if (!grid) { const y = window.scrollY; window.scrollBy(0, Math.floor(innerHeight * 0.8)); return { grid: false, exhausted: window.scrollY <= y + 1 }; }
+          if (!grid && tile) {
+            let el = tile.parentElement;
+            while (el && el !== document.body) {
+              const st = getComputedStyle(el);
+              if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 4) { grid = el; break; }
+              el = el.parentElement;
+            }
+          }
+          if (!grid) grid = document.scrollingElement || document.documentElement;
           const before = grid.scrollTop;
-          grid.scrollTop = before + Math.max(200, Math.floor(grid.clientHeight * 0.8));
-          return { grid: true, exhausted: grid.scrollTop <= before + 1 };
+          const heightBefore = grid.scrollHeight;
+          grid.scrollTop = before + Math.max(200, Math.floor((grid.clientHeight || innerHeight) * 0.8));
+          return { grid: grid.tagName, exhausted: grid.scrollTop <= before + 1, scrollTop: grid.scrollTop, scrollHeight: heightBefore };
         }
     """
 
@@ -15373,9 +15385,13 @@ exit 1
                     scrolled = await page.evaluate(self.FLOW_UI_GRID_SCROLL_JS)
                 except Exception:
                     scrolled = {}
-                await asyncio.sleep(1.2)
+                # Flow vẽ ô mới sau khi cuộn một nhịp; chỉ coi là hết lưới khi cuộn không nhúc nhích
+                # VÀ sau khi chờ vẫn không có ô chưa xem (vòng sau kiểm tra lại).
+                await asyncio.sleep(2.5)
                 exhausted_scrolls = exhausted_scrolls + 1 if (not isinstance(scrolled, dict) or scrolled.get("exhausted")) else 0
-                if exhausted_scrolls >= 2:
+                if exhausted_scrolls >= 3:
+                    if job_id:
+                        await self.store.append_log(job_id, f"Da cuon het luoi Flow ({scrolled}); dung quet o {visited} o.")
                     break
                 continue
             else:
