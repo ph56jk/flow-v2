@@ -15208,6 +15208,37 @@ exit 1
           return img ? (img.currentSrc || img.src || '') : '';
         }
     """
+    #: Ô lưới đầu tiên đang vẽ mà thumbnail chưa xem; cuộn nó vào giữa màn hình. Lưới ảo hóa chỉ giữ ~27 ô
+    #: trong DOM và thay ô cũ bằng ô mới khi cuộn, nên số thứ tự ô không dùng làm định danh được.
+    FLOW_UI_NEXT_TILE_JS = """
+        /* flow-ui-next-tile */
+        (seen) => {
+          const tiles = [...document.querySelectorAll('img[alt*="Tile displaying"]')];
+          const seenSet = new Set(seen || []);
+          for (let i = 0; i < tiles.length; i++) {
+            const img = tiles[i];
+            const src = img.currentSrc || img.src || '';
+            if (src && seenSet.has(src)) continue;
+            img.scrollIntoView({ block: 'center', inline: 'nearest' });
+            const r = img.getBoundingClientRect();
+            return { index: i, src, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height, total: tiles.length };
+          }
+          return null;
+        }
+    """
+    FLOW_UI_GRID_SCROLL_JS = """
+        /* flow-ui-grid-scroll */
+        () => {
+          const grid = [...document.querySelectorAll('cdk-virtual-scroll-viewport')]
+            .filter((el) => el.clientHeight > 0 && el.clientWidth > 0)
+            .sort((a, b) => (b.clientHeight * b.clientWidth) - (a.clientHeight * a.clientWidth))[0];
+          if (!grid) { const y = window.scrollY; window.scrollBy(0, Math.floor(innerHeight * 0.8)); return { grid: false, exhausted: window.scrollY <= y + 1 }; }
+          const before = grid.scrollTop;
+          grid.scrollTop = before + Math.max(200, Math.floor(grid.clientHeight * 0.8));
+          return { grid: true, exhausted: grid.scrollTop <= before + 1 };
+        }
+    """
+
     FLOW_UI_TILE_CENTER_JS = """
         /* flow-ui-tile-center */
         (index) => {
@@ -15317,32 +15348,54 @@ exit 1
         skipped_uploads = 0
         upload_name_re = re.compile(r"^(erp|trello)-[\w.-]*\.(jpe?g|png|webp)", re.I)
         tile_index = -1
+        visited = 0
+        next_mode = False  # trang thật trả ô theo thumbnail; trang giả/giao diện cũ đi theo số thứ tự
+        exhausted_scrolls = 0
         while True:
-            tile_index += 1
-            if available - 1 <= tile_index < wanted + 8 + skipped_uploads:
-                # Lưới ảo hóa chỉ vẽ ~27 ô một lúc: cuộn tới ô cuối đang vẽ để Flow vẽ thêm rồi đếm lại,
-                # nếu không quét sâu dừng ở 27 dù ảnh của thẻ cũ nằm dưới nữa (Idea 12, 2026-09-12).
-                try:
-                    await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, max(0, available - 1))
-                    await asyncio.sleep(1.2)
-                    grown = int(await tiles.count())
-                except Exception:
-                    grown = available
-                if grown > available:
-                    available = grown
-            if tile_index >= min(max(available, 0), wanted + 8 + skipped_uploads):
-                break
             if len(results) >= wanted or failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES:
                 break
+            if visited >= wanted + 8 + skipped_uploads:
+                break
+            tile = None
             try:
-                tile_src = await page.evaluate(self.FLOW_UI_TILE_SRC_JS, tile_index)
-                tile_src = tile_src if isinstance(tile_src, str) else ""
+                tile = await page.evaluate(self.FLOW_UI_NEXT_TILE_JS, sorted(seen_srcs))
+            except Exception:
+                tile = None
+            if isinstance(tile, dict) and "index" in tile:
+                next_mode = True
+                exhausted_scrolls = 0
+                tile_index = int(tile.get("index") or 0)
+                tile_src = str(tile.get("src") or "")
+                center = tile
+            elif next_mode and tile is None:
+                # Mọi ô đang vẽ đã xem: cuộn lưới cho Flow vẽ ô tiếp theo; cuộn tới đáy hai lần liền thì thôi.
+                try:
+                    scrolled = await page.evaluate(self.FLOW_UI_GRID_SCROLL_JS)
+                except Exception:
+                    scrolled = {}
+                await asyncio.sleep(1.2)
+                exhausted_scrolls = exhausted_scrolls + 1 if (not isinstance(scrolled, dict) or scrolled.get("exhausted")) else 0
+                if exhausted_scrolls >= 2:
+                    break
+                continue
+            else:
+                tile_index += 1
+                if tile_index >= min(max(available, 0), wanted + 8 + skipped_uploads):
+                    break
+                tile_src = ""
+                center = None
+            visited += 1
+            try:
+                if not next_mode:
+                    tile_src = await page.evaluate(self.FLOW_UI_TILE_SRC_JS, tile_index)
+                    tile_src = tile_src if isinstance(tile_src, str) else ""
                 if tile_src and tile_src in seen_srcs:
                     duplicates += 1
                     continue
                 if tile_src:
                     seen_srcs.add(tile_src)
-                center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index)
+                if center is None:
+                    center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index)
                 if not isinstance(center, dict) or float(center.get("w") or 0) < 40 or float(center.get("h") or 0) < 40:
                     raise RuntimeError(f"grid tile {tile_index + 1} is not rendered ({center})")
                 await asyncio.sleep(0.6)
