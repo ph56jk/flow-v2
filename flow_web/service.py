@@ -15228,26 +15228,16 @@ exit 1
     """
     FLOW_UI_GRID_SCROLL_JS = """
         /* flow-ui-grid-scroll */
-        () => {
-          // Cuộn khung chứa lưới: viewport ảo của Angular nếu có, không thì tổ tiên cuộn được gần nhất
-          // của một ô lưới, cuối cùng là cả trang.
-          const tile = document.querySelector('img[alt*="Tile displaying"]');
-          let grid = [...document.querySelectorAll('cdk-virtual-scroll-viewport')]
-            .filter((el) => el.clientHeight > 0 && el.clientWidth > 0)
-            .sort((a, b) => (b.clientHeight * b.clientWidth) - (a.clientHeight * a.clientWidth))[0];
-          if (!grid && tile) {
-            let el = tile.parentElement;
-            while (el && el !== document.body) {
-              const st = getComputedStyle(el);
-              if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 4) { grid = el; break; }
-              el = el.parentElement;
-            }
-          }
-          if (!grid) grid = document.scrollingElement || document.documentElement;
-          const before = grid.scrollTop;
-          const heightBefore = grid.scrollHeight;
-          grid.scrollTop = before + Math.max(200, Math.floor((grid.clientHeight || innerHeight) * 0.8));
-          return { grid: grid.tagName, exhausted: grid.scrollTop <= before + 1, scrollTop: grid.scrollTop, scrollHeight: heightBefore };
+        (prev) => {
+          // Đặt scrollTop lên cdk-virtual-scroll-viewport không ăn (scrollTop giữ 0 dù scrollHeight 46k,
+          // 2026-09-12): để trình duyệt tự cuộn tổ tiên đúng bằng scrollIntoView ô cuối đang vẽ.
+          const tiles = [...document.querySelectorAll('img[alt*="Tile displaying"]')];
+          if (!tiles.length) { window.scrollBy(0, Math.floor(innerHeight * 0.8)); return { tiles: 0, last: '', exhausted: false }; }
+          const last = tiles[tiles.length - 1];
+          const src = last.currentSrc || last.src || '';
+          last.scrollIntoView({ block: 'end', inline: 'nearest' });
+          window.scrollBy(0, 300);
+          return { tiles: tiles.length, last: src, exhausted: !!prev && src === prev };
         }
     """
 
@@ -15363,6 +15353,7 @@ exit 1
         visited = 0
         next_mode = False  # trang thật trả ô theo thumbnail; trang giả/giao diện cũ đi theo số thứ tự
         exhausted_scrolls = 0
+        last_bottom_src = ""
         while True:
             if len(results) >= wanted or failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES:
                 break
@@ -15382,9 +15373,11 @@ exit 1
             elif next_mode and tile is None:
                 # Mọi ô đang vẽ đã xem: cuộn lưới cho Flow vẽ ô tiếp theo; cuộn tới đáy hai lần liền thì thôi.
                 try:
-                    scrolled = await page.evaluate(self.FLOW_UI_GRID_SCROLL_JS)
+                    scrolled = await page.evaluate(self.FLOW_UI_GRID_SCROLL_JS, last_bottom_src)
                 except Exception:
                     scrolled = {}
+                if isinstance(scrolled, dict):
+                    last_bottom_src = str(scrolled.get("last") or "")
                 # Flow vẽ ô mới sau khi cuộn một nhịp; chỉ coi là hết lưới khi cuộn không nhúc nhích
                 # VÀ sau khi chờ vẫn không có ô chưa xem (vòng sau kiểm tra lại).
                 await asyncio.sleep(2.5)
