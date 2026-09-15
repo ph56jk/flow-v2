@@ -1,0 +1,981 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Bảng điều khiển HaviGroup</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e8590c'/%3E%3Ctext x='16' y='23' font-family='Arial' font-weight='700' font-size='20' fill='white' text-anchor='middle'%3EH%3C/text%3E%3C/svg%3E">
+<!-- Trang của `python -m flow_web.board`. Hai phần: đăng Etsy (/api/etsy) và tạo
+     ảnh (/api/images). Số liệu về qua luồng /api/stream; luồng hỏng thì hỏi hai
+     địa chỉ trên 10 giây một lần. Mọi xử lý số liệu nằm bên Python (có test), trang chỉ vẽ. -->
+<style>
+  :root {
+    --bg: #f3f4f6; --panel: #ffffff; --soft: #f8f9fb; --ink: #14161b; --muted: #697083; --line: #e3e5ea;
+    --accent: #e8590c; --violet: #7048e8;
+    --ok: #0e7c52; --ok-bg: #def5ea;
+    --run: #1f56d1; --run-bg: #e4ecfd;
+    --wait: #9a5a00; --wait-bg: #fcf0d8;
+    --bad: #c62f2b; --bad-bg: #fce5e4;
+    --off: #858b98; --off-bg: #eceef2;
+    --shadow: 0 1px 2px rgba(15, 23, 42, .05), 0 2px 8px rgba(15, 23, 42, .05);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014; --panel: #161920; --soft: #1b1f27; --ink: #e7e9ee; --muted: #9aa1b1; --line: #272c36;
+      --accent: #ff8a3d; --violet: #9775fa;
+      --ok: #43d197; --ok-bg: #11281e;
+      --run: #7fa6ff; --run-bg: #16223d;
+      --wait: #f2b650; --wait-bg: #2c2310;
+      --bad: #ff6f69; --bad-bg: #33191a;
+      --off: #7e8595; --off-bg: #1f232b;
+      --shadow: none;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  a { color: inherit; text-decoration-color: color-mix(in srgb, currentColor 35%, transparent); text-underline-offset: 2px; }
+  a:hover { color: var(--accent); }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 20px 20px 48px; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+
+  .t-ok   { --tone: var(--ok);   --tone-bg: var(--ok-bg); }
+  .t-run  { --tone: var(--run);  --tone-bg: var(--run-bg); }
+  .t-wait { --tone: var(--wait); --tone-bg: var(--wait-bg); }
+  .t-bad  { --tone: var(--bad);  --tone-bg: var(--bad-bg); }
+  .t-off  { --tone: var(--off);  --tone-bg: var(--off-bg); }
+  .t-warn { --tone: var(--wait); --tone-bg: var(--wait-bg); }
+
+  header { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .brand { display: flex; gap: 12px; align-items: center; }
+  .logo { width: 40px; height: 40px; border-radius: 11px; background: var(--accent); color: #fff; display: grid; place-items: center;
+    font-weight: 800; font-size: 19px; box-shadow: var(--shadow); flex: none; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+  .flow { color: var(--muted); font-size: 12.5px; }
+  .flow b { color: var(--ink); font-weight: 600; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .bar form { margin: 0; }
+  .pill { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 999px; background: var(--panel);
+    border: 1px solid var(--line); font-size: 12.5px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tone, var(--off)); flex: none; }
+  .t-run .dot, .dot.live { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { box-shadow: 0 0 0 4px var(--tone-bg, var(--ok-bg)); } }
+  .btn { border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 5px 11px;
+    font: inherit; font-size: 12.5px; cursor: pointer; white-space: nowrap; }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn[disabled] { opacity: .5; cursor: default; }
+
+  .switch { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .sec { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--line);
+    background: var(--panel); color: inherit; font: inherit; text-align: left; cursor: pointer; box-shadow: var(--shadow); }
+  .sec:hover { border-color: var(--accent); }
+  .sec.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
+  .sec .ic { width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; font-weight: 800; color: #fff; background: var(--accent); flex: none; }
+  .sec .ic.img { background: var(--violet); }
+  .sec .ic.sku { background: var(--run); }
+  .sec .txt { min-width: 0; }
+  .sec b { display: block; font-size: 15px; }
+  .sec small { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sec .count { margin-left: auto; font-size: 12.5px; padding: 1px 9px; }
+
+  .banner { border-radius: 12px; padding: 12px 16px; margin-bottom: 16px; background: var(--bad-bg); color: var(--bad); border: 1px solid color-mix(in srgb, var(--bad) 30%, transparent); }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .kpi { position: relative; overflow: hidden; background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px 13px 18px; box-shadow: var(--shadow); cursor: pointer; text-align: left; font: inherit; color: inherit; }
+  .kpi::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--tone, var(--line)); }
+  .kpi:hover { border-color: var(--tone, var(--accent)); }
+  .kpi .n { font-size: 28px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; color: var(--tone, var(--ink)); }
+  .kpi .l { font-size: 12.5px; margin-top: 4px; }
+  .kpi .h { font-size: 11.5px; color: var(--muted); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); }
+  .alerts { margin-bottom: 16px; }
+  .alerts h2 { font-size: 13px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  .alert { display: flex; gap: 10px; align-items: baseline; padding: 9px 16px; border-bottom: 1px solid var(--line); }
+  .alert:last-child { border-bottom: 0; }
+  .alert .dot { transform: translateY(-1px); }
+  .alert.none { color: var(--ok); }
+  .count { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 999px; background: var(--tone-bg, var(--off-bg)); color: var(--tone, var(--muted));
+    font-size: 11.5px; font-weight: 700; text-align: center; }
+
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; align-items: flex-end; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
+  .tab { border: 0; background: none; font: inherit; color: var(--muted); padding: 9px 14px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; font-weight: 600; }
+  .tab:hover { color: var(--ink); }
+  .tab.on { color: var(--ink); border-bottom-color: var(--accent); }
+  .tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .search { flex: 1 1 220px; max-width: 360px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 7px 11px; font: inherit; }
+  .search:focus { outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent); border-color: var(--accent); }
+  .chipbtn { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 999px; padding: 5px 11px; font: inherit; font-size: 12.5px; cursor: pointer; }
+  .chipbtn.on { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  .pick { flex: 0 1 280px; }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600;
+    padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--soft); white-space: nowrap; }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--soft); }
+  tr.t-bad td:first-child { box-shadow: inset 3px 0 var(--bad); }
+  .title { font-size: 12.5px; color: var(--muted); max-width: 260px; }
+  .note { font-size: 12.5px; color: var(--muted); max-width: 380px; overflow-wrap: anywhere; }
+  tr.t-bad .note { color: var(--bad); }
+  .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .nowrap { white-space: nowrap; }
+  .num { font-variant-numeric: tabular-nums; }
+  .empty { padding: 32px 16px; text-align: center; color: var(--muted); }
+
+  .chip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    background: var(--tone-bg, var(--off-bg)); color: var(--tone, var(--muted)); white-space: nowrap; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 6px; font-size: 11px; background: var(--off-bg); color: var(--muted); margin-left: 4px; white-space: nowrap; }
+
+  .steps { display: flex; align-items: center; margin-bottom: 6px; }
+  .steps .s { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--line); background: var(--panel); flex: none; }
+  .steps .ln { width: 18px; height: 2px; background: var(--line); flex: none; }
+  .steps .s.done, .steps .ln.done { background: var(--ok); border-color: var(--ok); }
+  .steps .s.cur { background: var(--tone); border-color: var(--tone); box-shadow: 0 0 0 3px var(--tone-bg); }
+  .steplabels { font-size: 10.5px; color: var(--muted); letter-spacing: .02em; text-transform: none; font-weight: 500; }
+
+  .spin { width: 11px; height: 11px; border: 2px solid var(--run-bg); border-top-color: var(--run); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .pad { padding: 12px; }
+  .pad h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 6px 4px 10px; }
+  .pad h3:not(:first-child) { margin-top: 20px; }
+  .machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  .machine { padding: 14px 16px; position: relative; }
+  .machine.t-off { opacity: .55; }
+  .machine .head { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .machine .name { font-weight: 700; display: flex; gap: 8px; align-items: center; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; margin: 0; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; overflow-wrap: anywhere; }
+  .list .alert { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 6px; background: var(--panel); }
+
+  footer { margin-top: 20px; font-size: 12px; color: var(--muted); }
+  .toast { position: fixed; right: 16px; bottom: 16px; max-width: min(420px, calc(100vw - 32px)); background: var(--ink); color: var(--panel);
+    padding: 10px 14px; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.2); font-size: 13px; }
+  @media (max-width: 640px) {
+    .wrap { padding: 14px 16px 40px; }
+    .kpi .n { font-size: 24px; }
+    .pick { flex-basis: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo">H</div>
+      <div>
+        <h1>Bảng điều khiển HaviGroup</h1>
+        <div class="flow" id="flow"></div>
+      </div>
+    </div>
+    <div class="bar">
+      <span class="pill" id="src-pill"><span class="dot"></span><span>…</span></span>
+      <span class="pill"><span class="dot live t-ok" id="live-dot"></span><span id="updated">Đang tải…</span></span>
+      <button class="btn" id="refresh">Làm mới</button>
+      <form method="post" action="/logout" id="logout" hidden><button class="btn" type="submit">Đăng xuất</button></form>
+    </div>
+  </header>
+
+  <nav class="switch" id="switch" aria-label="Phần của bảng"></nav>
+  <div id="banner"></div>
+  <div class="kpis" id="kpis"></div>
+  <section class="panel alerts" id="alerts"></section>
+
+  <nav class="tabs" id="tabs"></nav>
+  <div class="tools" id="tools">
+    <input class="search" id="search" type="search" autocomplete="off">
+    <div class="bar" id="filters"></div>
+  </div>
+  <section class="panel" id="view"><div class="empty">Đang tải…</div></section>
+
+  <footer id="footer"></footer>
+</div>
+<div class="toast" id="toast" hidden></div>
+
+<script>
+(() => {
+  const $ = (sel) => document.querySelector(sel);
+  // Chỉ thay HTML khi nội dung đổi: số liệu về liên tục mà lần nào cũng thay cả
+  // khối thì bảng mất vị trí cuộn ngang, chữ đang bôi đen cũng mất. Vì thế
+  // "… phút trước" và số giây đang chạy không nằm trong HTML: tick() điền sau.
+  const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
+  const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const store = {
+    get(key, fallback) { try { return localStorage.getItem('havi-board.' + key) || fallback; } catch { return fallback; } },
+    set(key, value) { try { localStorage.setItem('havi-board.' + key, value); } catch { /* chế độ riêng tư */ } },
+  };
+
+  // Mỗi phần giữ dữ liệu, tab và bộ lọc riêng.
+  const S = {
+    etsy: { data: null, error: '', busy: false, tab: store.get('etsy.tab', 'cards'), filter: store.get('etsy.filter', 'all') },
+    img: { data: null, error: '', busy: false, tab: store.get('img.tab', 'jobs'), filter: store.get('img.filter', 'all') },
+    sku: { data: null, error: '', busy: false, tab: store.get('sku.tab', 'cards'), filter: store.get('sku.filter', 'all'), cluster: store.get('sku.cluster', '') },
+  };
+  let section = store.get('section', 'etsy');
+  if (!S[section]) section = 'etsy';
+  let query = '';
+
+  // ── giờ ──────────────────────────────────────────────────────────
+  const VN = { timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit', hour12: false };
+  const clock = (iso) => { if (!iso) return ''; const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString('vi-VN', VN); };
+  function ago(iso) {
+    if (!iso) return '—';
+    const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    if (s < 45) return 'vừa xong';
+    if (s < 3600) return Math.round(s / 60) + ' phút trước';
+    if (s < 86400) return Math.round(s / 3600) + ' giờ trước';
+    return Math.round(s / 86400) + ' ngày trước';
+  }
+  const agoTag = (iso) => iso ? `<span class="ago" data-t="${esc(iso)}" title="${esc(clock(iso))} giờ VN"></span>` : '<span class="muted">—</span>';
+  function dur(s) {
+    if (s == null || isNaN(s)) return '—';
+    s = Math.max(0, Math.round(s));
+    const pad = (n) => String(n).padStart(2, '0');
+    if (s < 60) return s + 's';
+    const m = Math.floor(s / 60);
+    return m < 60 ? `${m}m${pad(s % 60)}` : `${Math.floor(m / 60)}h${pad(m % 60)}`;
+  }
+  // Việc còn chạy thì đếm từ ``from`` ngay trong trang; xong rồi thì lấy số máy chủ tính.
+  const since = (from, s, going) => going && from ? `<span class="dur" data-from="${esc(from)}"></span>` : dur(s);
+  function tick() {
+    document.querySelectorAll('.ago[data-t]').forEach((el) => { el.textContent = ago(el.dataset.t); });
+    document.querySelectorAll('.dur[data-from]').forEach((el) => { el.textContent = dur((Date.now() - Date.parse(el.dataset.from)) / 1000); });
+  }
+
+  // ── mảnh nhỏ ─────────────────────────────────────────────────────
+  const chip = (tone, text, title) => `<span class="chip t-${esc(tone)}"${title ? ` title="${esc(title)}"` : ''}>${text}</span>`;
+  const link = (url, text) => url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(text)}</a>` : esc(text);
+  const none = '<span class="muted">—</span>';
+  const matches = (item, fields) => !query || fields.some((f) => String(item[f] ?? '').toLowerCase().includes(query));
+  function filterBar(st, filters, rows) {
+    put($('#filters'), filters.map(([key, label, fn]) =>
+      `<button class="chipbtn${key === st.filter ? ' on' : ''}" data-filter="${key}">${label} <span class="muted">${rows.filter(fn).length}</span></button>`).join(''));
+    return (filters.find((f) => f[0] === st.filter) || filters[0])[2];
+  }
+
+  // ══ Đăng Etsy ════════════════════════════════════════════════════
+  const STEPS = ['Khai', 'Giao', 'Đăng', 'Nháp'];
+  function steps(card) {
+    let out = `<div class="steps t-${esc(card.tone)}" title="${STEPS.join(' → ')}">`;
+    STEPS.forEach((name, i) => {
+      if (i) out += `<span class="ln${i <= card.stage ? ' done' : ''}"></span>`;
+      const done = i < card.stage || (i === card.stage && card.stage === 3 && card.tone === 'ok');
+      out += `<span class="s ${done ? 'done' : i === card.stage ? 'cur' : ''}" title="${name}"></span>`;
+    });
+    return out + `</div>${chip(card.tone, esc(card.label))}`;
+  }
+  function checkCell(check, jobId, canCheck) {
+    let out = '';
+    if (check && check.state === 'running') return chip('run', '<span class="spin"></span> đang soát…');
+    if (check && check.state === 'done') {
+      if (check.error) out += chip('bad', 'soát hỏng', check.text);
+      else {
+        const count = check.photos == null ? 'không đọc được số ảnh' : (check.expected != null ? `${check.photos}/${check.expected} ảnh` : `${check.photos} ảnh`);
+        const tone = check.ok === false ? 'bad' : check.ok ? 'ok' : 'wait';
+        out += chip(tone, (check.ok === false ? 'LỆCH ' : check.ok ? '✓ ' : '') + esc(count), check.text);
+        if (check.has_video) out += ' ' + chip('wait', 'còn video');
+        if (check.unsaved) out += ' ' + chip('wait', 'sửa dở');
+      }
+      if (check.draft_url) out += ` <a href="${esc(check.draft_url)}" target="_blank" rel="noopener">mở nháp ↗</a>`;
+    }
+    if (canCheck) out += ` <button class="btn" data-check="${esc(jobId)}">${check ? 'Soát lại' : 'Soát'}</button>`;
+    return out || none;
+  }
+
+  const CARD_FILTERS = [
+    ['all', 'Tất cả', () => true],
+    ['bad', 'Hỏng / lỗi', (c) => c.tone === 'bad'],
+    ['running', 'Đang chạy', (c) => c.stage >= 1 && c.stage < 3 && c.tone !== 'bad'],
+    ['drafts', 'Đã lưu nháp', (c) => c.stage === 3],
+    ['declare', 'Chờ khai', (c) => c.stage === 0 && c.tone === 'wait'],
+    ['unchecked', 'Chưa soi', (c) => c.stage === 0 && c.tone === 'off'],
+  ];
+
+  function etsyCards(d, st) {
+    const test = filterBar(st, CARD_FILTERS, d.cards);
+    const rows = d.cards.filter(test).filter((c) => matches(c, ['task', 'title', 'account', 'machine', 'sku', 'copysku', 'note']));
+    if (!rows.length) return `<div class="empty">${d.cards.length ? 'Không có thẻ nào khớp.' : 'Chưa có thẻ nào ở cột Đang review.'}</div>`;
+    return `<div class="table-wrap"><table>
+      <thead><tr>
+        <th>Thẻ</th><th>Tiến độ <div class="steplabels">Khai → Giao → Đăng → Nháp</div></th><th>Tài khoản → máy</th>
+        <th>Mẫu copysku / SKU</th><th>Ảnh</th><th>Cập nhật</th><th>Ghi chú</th><th>Soát bản nháp</th>
+      </tr></thead><tbody>${rows.map((c) => `
+      <tr class="t-${esc(c.tone)}">
+        <td class="nowrap"><div class="mono">${link(c.url, c.task)}</div><div class="title">${esc(c.title) || none}</div>
+          ${c.closed ? '<span class="tag" title="Bản nháp đã lưu nên lister tự chuyển thẻ sang Hoàn thành">đã sang Hoàn thành</span>' : c.in_review ? '' : '<span class="tag" title="Thẻ đã rời cột Đang review; việc đăng vẫn còn trong hàng đợi">đã rời cột</span>'}
+          ${c.runs > 1 ? `<span class="tag">${c.runs} lượt</span>` : ''}</td>
+        <td class="nowrap">${steps(c)}</td>
+        <td class="nowrap">${esc(c.account) || none}${c.machine ? `<div class="muted mono">→ ${esc(c.machine)}</div>` : ''}</td>
+        <td class="nowrap">${esc(c.copysku) || none}<div class="muted mono">${esc(c.sku)}</div></td>
+        <td class="num">${c.images ?? none}</td>
+        <td class="nowrap">${agoTag(c.updated_at)}</td>
+        <td><div class="note">${esc(c.note)}</div>${c.old_drafts ? `<span class="tag" title="Lượt cũ đã bị thay: bản nháp cũ trên Etsy phải xoá tay">${c.old_drafts} nháp cũ cần xoá tay</span>` : ''}</td>
+        <td class="nowrap">${checkCell(c.check, c.job, c.can_check)}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function etsyJobs(d) {
+    put($('#filters'), '');
+    const rows = d.jobs.filter((j) => matches(j, ['id', 'card', 'title', 'machine', 'sku', 'error', 'label']));
+    if (!rows.length) return `<div class="empty">${d.jobs.length ? 'Không có việc nào khớp.' : 'Hàng đợi bản Listing trống (hàng đợi nằm trong RAM: bản Listing khởi động lại là mất lịch sử).'}</div>`;
+    return `<div class="table-wrap"><table>
+      <thead><tr><th>Việc</th><th>Thẻ</th><th>Máy</th><th>Trạng thái</th><th>Ảnh</th><th>Tạo lúc</th><th>Chờ</th><th>Chạy</th><th>Kết quả</th><th>Soát</th></tr></thead>
+      <tbody>${rows.map((j) => `
+      <tr class="t-${esc(j.tone)}">
+        <td class="nowrap"><div class="mono">${esc(j.id)}</div>${j.attempts > 1 ? `<span class="tag">${j.attempts} lần thử</span>` : ''}</td>
+        <td class="nowrap"><div class="mono">${link(j.card_url, j.card || '—')}</div><div class="title">${esc(j.title)}</div></td>
+        <td class="nowrap mono">${esc(j.machine) || '—'}${j.agent ? `<div class="muted">agent ${esc(j.agent)}</div>` : ''}</td>
+        <td class="nowrap">${chip(j.tone, esc(j.label))}</td>
+        <td class="num">${j.images ?? '—'}</td>
+        <td class="nowrap">${esc(clock(j.created_at))}<div class="muted">${agoTag(j.created_at)}</div></td>
+        <td class="num nowrap">${since(j.created_at, j.wait_s, j.status === 'queued')}</td>
+        <td class="num nowrap">${since(j.started_at, j.run_s, j.status === 'in_progress')}</td>
+        <td><div class="note">${j.error ? esc(j.error) : j.saved ? 'đã lưu bản nháp' : esc(j.message)}</div></td>
+        <td class="nowrap">${checkCell(j.check, j.id, j.status === 'completed' && j.saved && j.sku)}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function etsyMachines(d) {
+    put($('#filters'), '');
+    const rows = d.machines.filter((m) => matches(m, ['id', 'label', 'computer', 'ip', 'busy']));
+    if (!rows.length) return '<div class="empty">Không có máy nào.</div>';
+    return `<div class="machines pad">${rows.map((m) => {
+      const state = m.retired ? chip('off', esc(m.retired))
+        : !m.online ? chip('bad', 'mất liên lạc')
+        : m.busy ? chip('run', 'đang đăng ' + esc(m.busy)) : chip('ok', 'rảnh');
+      return `<div class="panel machine t-${esc(m.tone)}">
+        <div class="head"><div class="name"><span class="dot"></span>${esc(m.label)}</div>${state}</div>
+        <dl class="kv">
+          <dt>Mã</dt><dd class="mono">${esc(m.id)}</dd>
+          <dt>Báo về</dt><dd>${agoTag(m.last_seen)}</dd>
+          <dt>Agent</dt><dd class="mono">${esc(m.agent) || '—'} · ext ${esc(m.extension) || '—'}</dd>
+          <dt>Việc</dt><dd>${m.drafts} nháp đã lưu${m.queued ? ` · <b>${m.queued} chờ</b>` : ''}</dd>
+          <dt>Máy</dt><dd class="mono">${esc(m.computer)} · ${esc(m.ip)}</dd>
+        </dl></div>`;
+    }).join('')}</div>`;
+  }
+
+  const ETSY = {
+    name: 'Đăng Etsy', icon: 'E', url: '/api/etsy',
+    flow: 'ERP <b>Đang review</b> → Review Lister → máy Etsy → <b>bản nháp</b>',
+    search: 'Tìm mã thẻ, tiêu đề, tài khoản, SKU…',
+    footer: () => `${pace()} Nút <b>Soát</b> nhờ máy Etsy mở bản nháp và đếm ảnh, không bấm lưu.`,
+    summary: (d) => `${d.kpi.running} đang đăng · ${d.kpi.drafts} bản nháp · máy ${d.kpi.machines_on}/${d.kpi.machines}`,
+    pill(d) {
+      const l = d.lister;
+      return {
+        tone: l.tone,
+        text: l.error ? 'Lister: không đọc được' : l.tone === 'bad' ? `Lister: im từ ${ago(l.at)}` : `Lister: lượt trước ${ago(l.at)}`,
+        title: l.at ? `${clock(l.at)} giờ VN, quét mỗi ${l.every} giây` : l.error,
+      };
+    },
+    banner(d) {
+      const down = Object.entries(d.sources).filter(([name, err]) => err && name !== 'lister');
+      return down.length
+        ? `<div class="banner">Không gọi được bản Listing ở ${esc(d.base)}: ${down.map(([n, e]) => `${esc(n)} — ${esc(e)}`).join('; ')}. Bản Listing trên hvg-pc (cổng 8001) tắt?</div>`
+        : '';
+    },
+    tiles(d) {
+      const k = d.kpi;
+      return [
+        { n: k.review ?? '—', l: 'Thẻ ở Đang review', h: 'lister thấy ở lượt trước', tone: '', go: 'cards:all' },
+        { n: k.declare, l: 'Chờ khai account / copysku', h: k.unchecked ? `việc của người · ${k.unchecked} thẻ chưa soi` : 'việc của người', tone: k.declare ? 'wait' : '', go: 'cards:declare' },
+        { n: k.running, l: 'Đang chờ máy / đang đăng', h: 'trong hàng đợi bản Listing', tone: k.running ? 'run' : '', go: 'cards:running' },
+        { n: k.drafts, l: 'Đã lưu bản nháp', h: 'thẻ có nháp trên Etsy', tone: k.drafts ? 'ok' : '', go: 'cards:drafts' },
+        { n: k.broken, l: 'Hỏng / lỗi', h: 'xem mục Cần xử lý', tone: k.broken ? 'bad' : '', go: 'cards:bad' },
+        { n: `${k.machines_on}/${k.machines}`, l: 'Máy Etsy trực tuyến', h: 'không tính máy đã bỏ', tone: k.machines_on < k.machines ? 'bad' : 'ok', go: 'machines' },
+      ];
+    },
+    calm: 'Không có gì cần xử lý. Thẻ chờ khai account/copysku là bước tay, không tính ở đây.',
+    tabs: [
+      ['cards', 'Thẻ', (d) => d.cards.length, etsyCards],
+      ['jobs', 'Việc đăng', (d) => d.jobs.length, etsyJobs],
+      ['machines', 'Máy Etsy', (d) => d.machines.length, etsyMachines],
+    ],
+  };
+
+  // ══ Tạo ảnh ══════════════════════════════════════════════════════
+  const running = (j) => j.status === 'running' || j.status === 'polling';
+  const JOB_FILTERS = [
+    ['all', 'Tất cả', () => true],
+    ['active', 'Đang chạy / chờ', (j) => running(j) || j.status === 'queued'],
+    ['done', 'Xong', (j) => j.status === 'completed'],
+    ['bad', 'Hỏng', (j) => j.tone === 'bad'],
+    ['quota', 'Hết quota', (j) => j.quota],
+    ['interrupted', 'Bị ngắt', (j) => j.status === 'interrupted'],
+  ];
+
+  function imgJobs(d, st) {
+    const test = filterBar(st, JOB_FILTERS, d.jobs);
+    const rows = d.jobs.filter(test).filter((j) => matches(j, ['id', 'task', 'title', 'project', 'label', 'stage', 'error', 'detail']));
+    if (!rows.length) return `<div class="empty">${d.jobs.length ? 'Không có job nào khớp.' : d.sources.state ? 'Không đọc được flow-v2.' : 'flow-v2 chưa có job nào.'}</div>`;
+    return `<div class="table-wrap"><table>
+      <thead><tr><th>Thẻ ERP</th><th>Trạng thái</th><th>Ảnh</th><th>Tạo lúc</th><th>Đã chạy</th><th>Tín hiệu cuối</th><th>Chi tiết</th></tr></thead>
+      <tbody>${rows.map((j) => {
+        const short = j.made != null && j.requested && j.status === 'completed' && j.made < j.requested;
+        return `
+      <tr class="t-${esc(j.tone)}">
+        <td class="nowrap"><div class="mono">${link(j.task_url, j.task || j.id.slice(0, 8))}</div><div class="title">${esc(j.title) || none}</div>
+          ${j.project ? `<span class="tag" style="margin-left:0">${esc(j.project)}</span>` : ''}</td>
+        <td class="nowrap">${chip(j.tone, (running(j) ? '<span class="spin"></span> ' : '') + esc(j.label))}${j.stage ? `<div class="sub">${esc(j.stage)}</div>` : ''}</td>
+        <td class="num nowrap">${short ? `<b style="color:var(--wait)">${j.made}</b>` : (j.made ?? '—')}${j.requested ? `<span class="muted">/${j.requested}</span>` : ''}
+          ${j.sent ? `<div class="sub">${j.sent} lên thẻ ERP</div>` : ''}</td>
+        <td class="nowrap">${esc(clock(j.created_at))}<div class="muted">${agoTag(j.created_at)}</div></td>
+        <td class="num nowrap">${since(j.created_at, j.run_s, running(j) || j.status === 'queued')}</td>
+        <td class="nowrap">${agoTag(j.signal_at)}</td>
+        <td><div class="note">${esc(j.error || j.detail || j.last_log) || none}</div></td>
+      </tr>`;
+      }).join('')}</tbody></table></div>`;
+  }
+
+  function imgHealth(d) {
+    put($('#filters'), '');
+    const h = d.health;
+    const auth = d.auth === true ? chip('ok', 'đã đăng nhập') : d.auth === false ? chip('bad', 'chưa đăng nhập') : chip('off', 'không rõ');
+    const profiles = d.profiles.map((p) => `<div class="panel machine t-${p.quota_blocked ? 'wait' : 'ok'}">
+        <div class="head"><div class="name"><span class="dot"></span>${esc(p.label)}</div>${p.quota_blocked ? chip('wait', 'hết quota') : chip('ok', 'còn quota')}</div>
+        <dl class="kv">
+          <dt>Đang dùng</dt><dd>${p.active ? 'có' : 'không'}</dd>
+          ${p.quota_blocked ? `<dt>Mở lại</dt><dd>${d.quota_until ? esc(d.quota_until) + ' giờ VN' : 'khoảng 14:00 giờ VN'}</dd>` : ''}
+        </dl></div>`).join('');
+    const google = `<div class="panel machine t-${d.auth === false ? 'bad' : d.auth ? 'ok' : 'off'}">
+        <div class="head"><div class="name"><span class="dot"></span>Google Flow</div>${auth}</div>
+        <dl class="kv"><dt>Máy</dt><dd class="mono">hvg-pc · ${esc(d.base) || '—'}</dd>
+        <dt>Job còn giữ</dt><dd>${d.kpi.jobs}</dd></dl></div>`;
+    const signals = h.signals.map((s) => `<div class="alert t-${esc(s.tone)}"><span class="dot"></span><span><b>${esc(s.label)}</b>${s.status_label ? ` · ${esc(s.status_label)}` : ''}<div class="sub">${esc(s.detail)}</div></span></div>`).join('');
+    const timeline = h.timeline.map((t) => `<div class="alert t-${esc(t.tone)}"><span class="dot"></span><span><b>${esc(t.title)}</b> <span class="muted">· ${agoTag(t.at)}</span><div class="sub">${esc(t.detail)}</div></span></div>`).join('');
+    return `<div class="pad">
+      <h3>Profile Flow và đăng nhập</h3><div class="machines">${google}${profiles}</div>
+      ${h.headline || signals ? `<h3>Sức khoẻ dự án${h.status_label ? ' · ' + esc(h.status_label) : ''}</h3>
+        ${h.headline ? `<p style="margin:0 4px 10px"><b>${esc(h.headline)}</b>${h.summary ? `<span class="muted"> — ${esc(h.summary)}</span>` : ''}</p>` : ''}
+        <div class="list">${signals}</div>` : ''}
+      ${timeline ? `<h3>Gần đây</h3><div class="list">${timeline}</div>` : ''}
+    </div>`;
+  }
+
+  const IMG = {
+    name: 'Tạo ảnh', icon: 'A', url: '/api/images',
+    flow: 'ERP <b>Idea</b> → flow-v2 trên hvg-pc → Google Flow → <b>ảnh lên thẻ</b>',
+    search: 'Tìm mã thẻ, tiêu đề, lỗi…',
+    footer: (d) => `${pace()} Số liệu của flow-v2 trên hvg-pc${d ? `, trong ${d.kpi.jobs} job còn giữ: số hỏng là số tối thiểu` : ''}. `
+      + 'Máy tạo ảnh DESKTOP-DPTR5BH (Trello) chưa có trên bảng: worker ở đó chỉ nghe nội bộ.',
+    summary: (d) => `${d.kpi.active} đang tạo · ${d.kpi.images_today} ảnh hôm nay · quota ${d.kpi.profiles_open}/${d.kpi.profiles}`,
+    pill(d) {
+      if (d.sources.state) return { tone: 'bad', text: 'flow-v2: không đọc được', title: d.sources.state };
+      if (d.auth === false) return { tone: 'bad', text: 'Flow: chưa đăng nhập Google', title: '' };
+      const k = d.kpi;
+      if (k.profiles && !k.profiles_open) return { tone: 'wait', text: `Flow: hết quota${d.quota_until ? ' tới ' + d.quota_until : ''}`, title: 'giờ VN' };
+      return { tone: 'ok', text: `Flow: ${k.profiles_open}/${k.profiles} profile còn quota`, title: '' };
+    },
+    banner: (d) => d.sources.state
+      ? `<div class="banner">Không gọi được flow-v2 ở ${esc(d.base) || '—'}: ${esc(d.sources.state)}. Service flow-v2 trên hvg-pc (cổng 8000) tắt?</div>`
+      : '',
+    tiles(d) {
+      const k = d.kpi;
+      return [
+        { n: k.active, l: 'Đang tạo', h: k.queued ? `${k.queued} job chờ chạy` : 'không có job chờ', tone: k.active ? 'run' : '', go: 'jobs:active' },
+        { n: k.images_today, l: 'Ảnh tạo hôm nay', h: `${k.done_today} job xong · tính theo giờ VN`, tone: k.images_today ? 'ok' : '', go: 'jobs:done' },
+        { n: k.failed, l: 'Hỏng trong 24 giờ', h: 'không tính hết quota', tone: k.failed ? 'bad' : '', go: 'jobs:bad' },
+        { n: k.quota_failed, l: 'Hỏng vì hết quota', h: d.quota_until ? `khoá tới ${d.quota_until} giờ VN` : '24 giờ qua · bot tự xếp lại', tone: k.quota_failed ? 'wait' : '', go: 'jobs:quota' },
+        { n: k.interrupted, l: 'Bị ngắt', h: 'flow-v2 khởi động lại giữa chừng', tone: k.interrupted ? 'wait' : '', go: 'jobs:interrupted' },
+        { n: `${k.profiles_open}/${k.profiles}`, l: 'Profile Flow còn quota', h: d.auth === false ? 'Google chưa đăng nhập!' : d.auth ? 'Google đã đăng nhập' : 'không rõ đăng nhập',
+          tone: d.auth === false ? 'bad' : k.profiles && !k.profiles_open ? 'wait' : 'ok', go: 'health' },
+      ];
+    },
+    calm: 'Không có gì cần xử lý.',
+    tabs: [
+      ['jobs', 'Job', (d) => d.jobs.length, imgJobs],
+      ['health', 'Flow và sức khoẻ', (d) => d.profiles.length, imgHealth],
+    ],
+  };
+
+  // ══ SKU & Thuộc tính ═════════════════════════════════════════════
+  // Số của bot: mỗi lượt quét bot ghi sku_status.json từ đúng cây nó vừa đọc.
+  // Bảng không gọi ERP.
+  // cut: thẻ ngoài cây bị cắt mà không có dòng bảng. Bot không biết thẻ có mã chưa,
+  // nên không gộp vào "Chưa có SKU".
+  const REASON_TONE = { cut: 'off', product: 'bad', book: 'bad', wait: 'run', images: 'wait', todo: 'off' };
+  const SKU_FILTERS = [
+    ['all', 'Tất cả', () => true],
+    ['nosku', 'Chưa có SKU', (c) => !!c.reason && c.reason !== 'cut'],
+    ['working', 'Đang làm chưa có SKU', (c) => c.working_no_sku],
+    ['cut', 'Chưa đọc được (cây bị cắt)', (c) => c.reason === 'cut'],
+    ['book', 'Bảng SKU thiếu dòng', (c) => c.reason === 'book' || c.reason === 'product'],
+    ['images', 'Ảnh chờ duyệt', (c) => c.reason === 'images'],
+    ['todo', 'Chưa sang Đang làm', (c) => c.reason === 'todo'],
+    ['account', 'Thiếu account', (c) => c.account_state === 'missing'],
+    ['copysku', 'Thiếu copysku', (c) => c.copysku_state === 'missing'],
+  ];
+  const CLUSTER_FILTERS = [
+    ['all', 'Tất cả', () => true],
+    ['cut', 'Bị cắt cây', (c) => c.truncated],
+    ['attrs', 'Thiếu thuộc tính', (c) => c.missing.length > 0],
+    ['working', 'Có thẻ Đang làm chưa có SKU', (c) => c.working_no_sku > 0],
+  ];
+
+  // Thẻ lọc theo cụm (ô chọn) và theo lý do (nút). Cụm đã rời số liệu thì coi như chọn mọi cụm.
+  function skuBar(st, d) {
+    const cluster = d.clusters.some((c) => c.task === st.cluster) ? st.cluster : '';
+    const inCluster = d.cards.filter((c) => !cluster || c.cluster === cluster);
+    const pick = d.clusters.length > 1
+      ? `<select class="search pick" data-cluster aria-label="Lọc theo cụm"><option value="">Mọi cụm (${d.clusters.length})</option>${d.clusters.map((c) =>
+        `<option value="${esc(c.task)}"${c.task === cluster ? ' selected' : ''}>${esc(c.task)} · ${esc(String(c.subject).slice(0, 40))}</option>`).join('')}</select>`
+      : '';
+    put($('#filters'), pick + SKU_FILTERS.map(([key, label, fn]) =>
+      `<button class="chipbtn${key === st.filter ? ' on' : ''}" data-filter="${key}">${label} <span class="muted">${inCluster.filter(fn).length}</span></button>`).join(''));
+    return inCluster.filter((SKU_FILTERS.find((f) => f[0] === st.filter) || SKU_FILTERS[0])[2]);
+  }
+
+  function declared(state, value) {
+    if (state === 'ok') return `<span class="mono">${esc(value)}</span>`;
+    if (state === 'inherit') return `<span class="mono">${esc(value)}</span> <span class="tag" title="Thẻ con chưa có. Bot sẽ chép từ thẻ cha ở lượt sau.">thẻ cha</span>`;
+    if (state === 'missing') return chip('wait', 'thiếu');
+    return none;
+  }
+
+  // Chưa có số của bot thì nói thẳng ra, đừng để bảng trống trơn.
+  const skuNone = (d) => d.bot.error === 'HTTP 404' ? 'Bot chưa ghi số SKU.' : d.bot.error ? 'Chưa đọc được tệp của bot.' : 'Bot chưa đọc cụm nào.';
+
+  function skuCards(d, st) {
+    const rows = skuBar(st, d).filter((c) => matches(c, ['task', 'subject', 'cluster', 'sku', 'why', 'account', 'copysku', 'column']));
+    if (!rows.length) return `<div class="empty">${d.cards.length ? 'Không có thẻ nào khớp.' : skuNone(d)}</div>`;
+    return `<div class="table-wrap"><table>
+      <thead><tr><th>Thẻ</th><th>Cột</th><th>SKU / vì sao chưa có</th><th>Account</th><th>Copysku</th></tr></thead>
+      <tbody>${rows.map((c) => `
+      <tr${c.working_no_sku ? ' class="t-bad"' : ''}>
+        <td><div class="mono nowrap">${link(c.url, c.task)}${c.done ? ' ' + chip('ok', 'DONE') : ''}</div><div class="title">${esc(c.subject) || none}</div>
+          <div class="sub mono">cụm ${esc(c.cluster)}</div></td>
+        <td class="nowrap">${esc(c.column) || none}</td>
+        <td>${c.sku ? `<span class="mono">${esc(c.sku)}</span>${c.source === 'board' ? ' <span class="tag" title="Cây taskFull bị cắt: mã đọc từ dòng taskBoard.">dòng bảng</span>' : ''}` : c.reason ? chip(REASON_TONE[c.reason] || 'off', esc(c.why)) : none}</td>
+        <td class="nowrap">${declared(c.account_state, c.account)}</td>
+        <td class="nowrap">${declared(c.copysku_state, c.copysku)}</td>
+      </tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function skuClusters(d, st) {
+    const test = filterBar(st, CLUSTER_FILTERS, d.clusters);
+    const rows = d.clusters.filter(test).filter((c) => matches(c, ['task', 'subject', 'board', 'project', 'content']));
+    if (!rows.length) return `<div class="empty">${d.clusters.length ? 'Không có cụm nào khớp.' : skuNone(d)}</div>`;
+    return `<div class="machines pad">${rows.map((c) => {
+      const tone = c.truncated ? 'bad' : c.working_no_sku ? 'bad' : c.missing.length ? 'wait' : 'ok';
+      const read = c.truncated
+        ? chip('bad', c.unseen ? `bot đọc ${c.received}/${c.total} thẻ` : 'cây bị cắt', 'ERP cắt cây taskFull: bot chưa thấy phần còn lại')
+        : chip('ok', `đủ ${c.total} thẻ con`);
+      const attrs = Object.entries(c.attributes).map(([key, value]) => `<dt>${esc(key)}</dt><dd>${value ? esc(value) : chip('wait', 'thiếu')}</dd>`).join('');
+      const content = String(c.content || '');
+      const cols = c.columns.map((x) => `${esc(x.name)} <b>${x.n}</b>`).join(' · ') || none;
+      return `<div class="panel machine t-${tone}">
+        <div class="head"><div class="name mono"><span class="dot"></span>${link(c.url, c.task)}</div>${read}</div>
+        <div class="title" style="margin-bottom:8px">${esc(c.subject) || none}${c.done ? ' ' + chip('ok', 'DONE') : ''}</div>
+        <dl class="kv">
+          <dt>Bảng</dt><dd>${esc(c.board) || none}${c.column ? ` · ${esc(c.column)}` : ''}</dd>
+          ${attrs}
+          <dt>content</dt><dd>${content ? esc(content.slice(0, 160)) + (content.length > 160 ? '…' : '') : none}</dd>
+          <dt>Thẻ con</dt><dd>${cols}</dd>
+          <dt>Chưa có SKU</dt><dd>${c.working_no_sku ? `<b style="color:var(--bad)">${c.working_no_sku} ở Đang làm</b> · ` : ''}${c.no_sku} thẻ${c.unread ? ` · ${c.unread} thẻ chưa đọc được (cây bị cắt)` : ''}</dd>
+        </dl>
+        <div style="margin-top:10px"><button class="btn" data-pick="${esc(c.task)}">Xem ${c.cards} thẻ con</button></div></div>`;
+    }).join('')}</div>`;
+  }
+
+  // ── Sổ bot ───────────────────────────────────────────────────────
+  // Mọi thứ bot nắm bên ERP: bot ghi kèm vào sku_status.json mỗi lượt quét,
+  // nên tab này không tốn thêm một lượt ERP nào.
+  const bnum = (v) => v == null ? '—' : String(v);
+  const boards = (names, tone) => names.length
+    ? names.map((n) => chip(tone, esc(n))).join(' ')
+    : none;
+
+  function brainTable(head, rows, cells) {
+    return `<div class="table-wrap"><table><thead><tr>${head.map((h) => `<th>${h}</th>`).join('')}</tr></thead>
+      <tbody>${rows.map((r) => `<tr>${cells(r).map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function skuBrain(d, st) {
+    put($('#filters'), '');
+    const b = d.brain || {};
+    const c = b.counts || {};
+    const x = b.counts_extra || {};
+    const r = b.rate || {};
+    const lim = r.limits || {};
+    const run = b.last_run || {};
+    const hit = (rows, fields) => (rows || []).filter((row) => matches(row, fields));
+    const paused = hit(b.paused, ['task']);
+    const warned = hit(b.warned_columns, ['task', 'column']);
+    const ledger = hit(b.ledger, ['prefix']);
+    const cats = hit(b.categories, ['name', 'prefix']);
+    const book = hit(b.book, ['name', 'prefix']);
+
+    // Sổ rỗng hoàn toàn mới là chưa ghi. Một sổ rỗng lẻ là chuyện bình thường.
+    const rong = !b.bot_user && !c.projects && !c.runs
+      && ['paused', 'warned_columns', 'ledger', 'categories', 'book'].every((k) => !(b[k] || []).length);
+    if (rong) {
+      return `<div class="empty">${d.bot.error ? skuNone(d) : 'Bot chưa ghi sổ ERP. Bản bot trên hvg-pc còn cũ thì lượt quét tới sẽ có.'}</div>`;
+    }
+
+    const tranBot = lim.agent == null ? chip('off', 'chưa đặt') : `${bnum(lim.agent)} lượt/phút`;
+    const tranSv = lim.graphql == null ? chip('off', 'chưa đặt') : `${bnum(lim.graphql)} lượt/phút`;
+    const bienDu = r.headroom == null ? none
+      : `<b${r.headroom <= 0 ? ' style="color:var(--bad)"' : ''}>${bnum(r.headroom)}</b> lượt`;
+
+    const scope = `<div class="panel machine t-ok">
+        <div class="head"><div class="name"><span class="dot"></span>Phạm vi bot</div>${
+          b.bot_user ? `<span class="mono">${esc(b.bot_user)}</span>` : chip('off', 'chưa rõ tài khoản')}</div>
+        <dl class="kv">
+          <dt>Bảng đang theo</dt><dd>${c.projects || 0} bảng</dd>
+          <dt>Làn nhanh</dt><dd>${boards(b.fast_lane || [], 'ok')}</dd>
+          <dt>Ngoài làn nhanh</dt><dd>${boards(b.outside_fast_lane || [], 'off')}</dd>
+        </dl>
+        <div class="sub" style="margin-top:8px">Bảng ngoài làn nhanh vẫn được quét, chỉ không có lượt điền SKU riêng.</div></div>`;
+
+    const nhip = `<div class="panel machine t-${esc(r.tone || 'ok')}">
+        <div class="head"><div class="name"><span class="dot"></span>Nhịp ERP một phút</div>${
+          chip(r.tone || 'ok', `${bnum(r.calls)} lượt`)}</div>
+        <dl class="kv">
+          <dt>Trần bot + làn nhanh</dt><dd>${tranBot}</dd>
+          <dt>Biên dư còn lại</dt><dd>${bienDu}</dd>
+          <dt>Trần service (tách thẻ con)</dt><dd>${tranSv}</dd>
+        </dl>
+        <div class="sub" style="margin-top:8px">Hai trần đếm riêng, không biết nhau: nâng trần bot không làm tách thẻ con nhanh lên.</div></div>`;
+
+    const luot = `<div class="panel machine t-ok">
+        <div class="head"><div class="name"><span class="dot"></span>Bot đã làm gì</div>${
+          run.task ? chip('ok', 'đang chạy') : chip('off', 'chưa có lượt nào')}</div>
+        <dl class="kv">
+          <dt>Lượt tạo ảnh gần nhất</dt><dd>${run.task ? `${link(run.link, run.task)} · ${agoTag(run.at)}` : none}</dd>
+          <dt>Thẻ đã cho chạy</dt><dd>${c.runs || 0}</dd>
+          <dt>Thẻ đã đăng Etsy</dt><dd>${c.listed || 0}</dd>
+          <dt>Bình luận đã trả lời</dt><dd>${c.handled || 0} <span class="muted">· giữ 45 ngày</span></dd>
+          <dt>Lượt hỏi não</dt><dd>${c.brain_calls || 0} <span class="muted">· trong một ngày</span></dd>
+        </dl></div>`;
+
+    const soDung = paused.length
+      ? brainTable(['Thẻ', 'Dừng từ'], paused, (p) => [
+        `<span class="mono nowrap">${link(p.link, p.task)}</span>`,
+        `${agoTag(p.at)}${p.at ? ` <span class="muted">· ${esc(clock(p.at))} giờ VN</span>` : ''}`])
+      : `<div class="empty">${(b.paused || []).length ? 'Không có thẻ nào khớp.' : 'Không thẻ nào đang bị dừng.'}</div>`;
+
+    const soCot = warned.length
+      ? brainTable(['Thẻ', 'Cột bot đã nhắc'], warned, (w) => [
+        `<span class="mono nowrap">${link(w.link, w.task)}</span>`, esc(w.column) || none])
+      : `<div class="empty">${(b.warned_columns || []).length ? 'Không có thẻ nào khớp.' : 'Không thẻ nào bị nhắc đặt sai cột.'}</div>`;
+
+    const soSo = ledger.length
+      ? brainTable(['Tiền tố', 'Số kế tiếp'], ledger, (l) => [
+        `<span class="mono">${esc(l.prefix)}</span>`, `<span class="mono">${String(l.next).padStart(3, '0')}</span>`])
+      : `<div class="empty">${(b.ledger || []).length ? 'Không có tiền tố nào khớp.' : 'Sổ cấp số còn trống.'}</div>`;
+
+    // Một mặt hàng nhiều mã: bot lấy mã đầu. Nói ra mã còn lại, đừng lặng lẽ chọn hộ.
+    const bangSheet = book.length
+      ? brainTable(['Mặt hàng', 'Bot lấy mã', 'Mã khác bảng ghi'], book, (k) => [
+        esc(k.name), `<span class="mono">${esc(k.prefix)}</span>`,
+        (k.alternates || []).length ? (k.alternates || []).map((a) => chip('wait', esc(a))).join(' ') : none])
+      : `<div class="empty">${(b.book || []).length ? 'Không có mặt hàng nào khớp.' : 'Bot chưa đọc được bảng mã sheet.'}</div>`;
+
+    const bangMa = cats.length
+      ? brainTable(['Danh mục sản phẩm ERP', 'Tiền tố SKU'], cats, (k) => [
+        esc(k.name), `<span class="mono">${esc(k.prefix)}</span>`])
+      : `<div class="empty">${(b.categories || []).length ? 'Không có danh mục nào khớp.' : 'Chưa đọc được danh mục sản phẩm bên ERP.'}</div>`;
+
+    return `<div class="pad">
+      <div class="machines">${scope}${nhip}${luot}</div>
+      <h3>Thẻ người bảo bot dừng <span class="count${(b.paused || []).length ? ' t-warn' : ' t-ok'}">${(b.paused || []).length}</span></h3>
+      <p class="sub" style="margin:0 4px 8px">Sổ này <b>không tự hết hạn</b>: thẻ nằm đây im tới khi có người gỡ. Dừng lâu nhất xếp trên.</p>
+      ${soDung}
+      <h3>Thẻ bot đã nhắc đặt sai cột <span class="count${(b.warned_columns || []).length ? ' t-warn' : ' t-ok'}">${(b.warned_columns || []).length}</span></h3>
+      <p class="sub" style="margin:0 4px 8px">Bot chỉ nhắc một lần mỗi thẻ. Sổ này cũng <b>không tự hết hạn</b>.</p>
+      ${soCot}
+      <h3>Sổ cấp số SKU <span class="count">${(b.ledger || []).length}</span></h3>
+      <p class="sub" style="margin:0 4px 8px">Số kế tiếp bot sẽ phát cho mỗi tiền tố. ERP không chặn SKU trùng — chống trùng chỉ nằm ở đây.</p>
+      ${soSo}
+      <h3>Bảng mã sheet <span class="count${x.book_multi ? ' t-warn' : ''}">${(b.book || []).length}</span></h3>
+      <p class="sub" style="margin:0 4px 8px">Mặt hàng → mã, bot đọc từ sheet bảng mã.${
+        x.book_multi ? ` <b>${x.book_multi}</b> mặt hàng được bảng ghi nhiều mã: bot lấy mã đầu, những mã còn lại hiện ở cột phải. Sai mã ở đây là in sai lên thùng hàng.` : ''}</p>
+      ${bangSheet}
+      <h3>Danh mục sản phẩm ERP <span class="count">${(b.categories || []).length}</span></h3>
+      <p class="sub" style="margin:0 4px 8px">Tiền tố SKU khai thẳng bên ERP.${
+        x.categories_no_prefix ? ` Còn <b>${x.categories_no_prefix}</b> danh mục chưa khai tiền tố — bot không đoán hộ.` : ''}</p>
+      ${bangMa}
+    </div>`;
+  }
+
+  const SKU = {
+    name: 'SKU & Thuộc tính', icon: 'S', url: '/api/sku',
+    flow: 'Bot đọc cây ERP mỗi lượt quét → <b>sku_status.json</b> → bảng. Bảng không gọi ERP',
+    search: 'Tìm mã thẻ, tiêu đề, SKU, account…',
+    footer: (d) => `${pace()} Số của bot, ghi mỗi lượt quét${d && d.bot.every ? ` (${d.bot.every} giây một lượt)` : ''}. `
+      + 'Bảng không gọi ERP: mọi lượt ERP đều là của bot. Trần thật và nhịp thật xem ở tab Sổ bot.',
+    summary: (d) => d.bot.error === 'HTTP 404' ? 'bot chưa ghi số SKU'
+      : d.bot.error ? 'không đọc được tệp của bot' : `${d.kpi.working_no_sku} thẻ Đang làm chưa có SKU · ${d.kpi.clusters} cụm`,
+    pill(d) {
+      const b = d.bot;
+      return {
+        tone: b.tone,
+        text: b.error === 'HTTP 404' ? 'Bot chưa ghi số SKU' : b.error ? 'Bot: không đọc được tệp SKU'
+          : b.stale ? 'Bot chưa ghi mới' : `Bot: lượt trước ${ago(b.at)}`,
+        title: b.at ? `${clock(b.at)} giờ VN, quét mỗi ${b.every} giây` : b.error,
+      };
+    },
+    banner(d) {
+      const b = d.bot;
+      if (b.error) {
+        return `<div class="banner">${b.error === 'HTTP 404'
+          ? 'Bot chưa ghi số SKU: chưa có tệp sku_status.json. Bot chưa quét xong lượt nào, hoặc app 8000 chưa đặt ERP_LISTING_FILES_DIR (thư mục downloads của bản Listing).'
+          : `Không đọc được sku_status.json qua bản Listing ở ${esc(d.base)}: ${esc(b.error)}.`}</div>`;
+      }
+      if (b.stale) return `<div class="banner">Bot chưa ghi mới: lượt cuối ${b.at ? esc(clock(b.at)) + ' giờ VN' : 'không rõ giờ'}, bot quét mỗi ${b.every} giây. Số dưới đây là của lượt cũ.</div>`;
+      return '';
+    },
+    tiles(d) {
+      const k = d.kpi;
+      const known = !d.bot.error;
+      const n = (value) => known ? value : '—';
+      const bad = (value) => !known ? '' : value ? 'bad' : 'ok';
+      const wait = (value) => known && value ? 'wait' : '';
+      return [
+        { n: n(k.working_no_sku), l: 'Thẻ Đang làm chưa có SKU', h: 'đã tới lúc cấp mã mà chưa có', tone: bad(k.working_no_sku), go: 'cards:working' },
+        { n: n(k.truncated), l: 'Cụm bị ERP cắt cây', h: !known ? 'chưa có số của bot' : k.unread ? `${k.unread} thẻ chưa đọc được` + (k.from_board ? ` · ${k.from_board} thẻ đọc từ dòng bảng` : '')
+          : k.from_board ? `${k.from_board} thẻ ngoài cây đọc từ dòng bảng` : k.unseen ? `${k.unseen} thẻ con bot chưa thấy` : 'bot thấy đủ thẻ con', tone: bad(k.truncated), go: 'clusters:cut' },
+        { n: n(k.missing_attrs), l: 'Cụm thiếu thuộc tính', h: 'thẻ cha chưa khai đủ', tone: wait(k.missing_attrs), go: 'clusters:attrs' },
+        { n: n(k.missing_account), l: 'Thẻ thiếu account', h: 'thẻ con và thẻ cha đều chưa có', tone: wait(k.missing_account), go: 'cards:account' },
+        { n: n(k.missing_copysku), l: 'Thẻ thiếu copysku', h: 'thẻ con và thẻ cha đều chưa có', tone: wait(k.missing_copysku), go: 'cards:copysku' },
+        { n: n(k.clusters), l: 'Cụm bot đang theo', h: `${k.cards} thẻ con · ${k.done} nhãn DONE`, tone: '', go: 'clusters:all' },
+      ];
+    },
+    calm: 'Không có gì cần xử lý: thẻ Đang làm đều có SKU, cụm nào bot cũng đọc đủ thẻ.',
+    tabs: [
+      ['cards', 'Thẻ con', (d) => d.cards.length, skuCards],
+      ['clusters', 'Cụm', (d) => d.clusters.length, skuClusters],
+      ['brain', 'Sổ bot', (d) => (d.brain && d.brain.counts && d.brain.counts.projects) || 0, skuBrain],
+    ],
+  };
+
+  const SECTIONS = { etsy: ETSY, img: IMG, sku: SKU };
+
+  // ── vẽ ───────────────────────────────────────────────────────────
+  function badge(key) {
+    const st = S[key];
+    if (!st.data) return st.error ? '<span class="count t-bad">!</span>' : '<span class="count">…</span>';
+    const alerts = st.data.alerts || [];
+    const down = st.error || Object.entries(st.data.sources || {}).some(([name, err]) => err && name !== 'lister');
+    const bad = alerts.some((a) => a.tone === 'bad');
+    const tone = bad || down ? 't-bad' : alerts.length ? 't-warn' : 't-ok';
+    const text = alerts.length || (down ? '!' : '✓');
+    return `<span class="count ${tone}" title="${alerts.length} việc cần xử lý">${text}</span>`;
+  }
+
+  function render() {
+    put($('#switch'), Object.entries(SECTIONS).map(([key, sec]) => `
+      <button class="sec${key === section ? ' on' : ''}" data-section="${key}" aria-pressed="${key === section}">
+        <span class="ic ${key}">${sec.icon}</span>
+        <span class="txt"><b>${sec.name}</b><small>${esc(S[key].data ? sec.summary(S[key].data) : S[key].error || 'đang tải…')}</small></span>
+        ${badge(key)}
+      </button>`).join(''));
+
+    const sec = SECTIONS[section];
+    const st = S[section];
+    const d = st.data;
+    put($('#flow'), sec.flow);
+    $('#search').placeholder = sec.search;
+    put($('#footer'), sec.footer(d));
+    const lost = st.error
+      ? `<div class="banner">Không lấy được phần ${esc(sec.name)} từ máy chủ bảng (${esc(st.error)}).${d ? ' Đang hiện số liệu cũ.' : ''}</div>`
+      : '';
+    if (!d) {
+      $('#src-pill').className = 'pill';
+      put($('#src-pill'), '<span class="dot"></span><span>…</span>');
+      put($('#banner'), lost);
+      ['#kpis', '#alerts', '#tabs', '#filters'].forEach((sel) => put($(sel), ''));
+      put($('#view'), `<div class="empty">${st.error ? 'Chưa có số liệu.' : 'Đang tải…'}</div>`);
+      return;
+    }
+
+    const pill = sec.pill(d);
+    $('#src-pill').className = `pill t-${pill.tone}`;
+    put($('#src-pill'), `<span class="dot"></span><span title="${esc(pill.title)}">${esc(pill.text)}</span>`);
+    put($('#banner'), lost + sec.banner(d));
+
+    put($('#kpis'), sec.tiles(d).map((t) => `
+      <button class="kpi${t.tone ? ' t-' + t.tone : ''}" data-go="${t.go}">
+        <div class="n">${esc(t.n)}</div><div class="l">${esc(t.l)}</div><div class="h">${esc(t.h)}</div>
+      </button>`).join(''));
+
+    const alerts = d.alerts;
+    const bad = alerts.filter((a) => a.tone === 'bad').length;
+    put($('#alerts'), `<h2>Cần xử lý · ${esc(sec.name)} <span class="count ${bad ? 't-bad' : alerts.length ? 't-warn' : 't-ok'}">${alerts.length}</span></h2>` +
+      (alerts.length
+        ? alerts.map((a) => `<div class="alert t-${esc(a.tone)}"><span class="dot"></span><span>${esc(a.text)}${a.link ? ` · <a href="${esc(a.link)}" target="_blank" rel="noopener">mở thẻ ↗</a>` : ''}</span></div>`).join('')
+        : `<div class="alert none">${esc(sec.calm)}</div>`));
+
+    const tab = sec.tabs.find((t) => t[0] === st.tab) || sec.tabs[0];
+    $('#tools').hidden = tab[0] === 'health';  // tab sức khoẻ không có gì để tìm
+    put($('#tabs'), sec.tabs.map(([key, label, count]) =>
+      `<button class="tab${key === tab[0] ? ' on' : ''}" data-tab="${key}">${label} <span class="count">${count(d)}</span></button>`).join(''));
+    put($('#view'), tab[3](d, st));
+    tick();
+  }
+
+  // ── tải ──────────────────────────────────────────────────────────
+  // Luồng /api/stream: máy chủ đẩy phần nào đổi thì vẽ lại phần ấy. Luồng
+  // hỏng thì quay về hỏi 10 giây một lần tới khi nối lại được.
+  let stream = null;
+  let streaming = false;
+  const pace = () => streaming ? 'Cập nhật trực tiếp.' : 'Tự làm mới mỗi 10 giây.';
+
+  function live() {
+    const st = S[section];
+    const at = st.got ? new Date(st.got).toLocaleTimeString('vi-VN', { hour12: false }) : '';
+    if (st.error) {
+      $('#live-dot').className = 'dot t-bad';
+      $('#updated').textContent = 'Mất kết nối tới máy chủ bảng';
+    } else if (streaming) {
+      $('#live-dot').className = 'dot live t-ok';
+      $('#updated').textContent = 'Trực tiếp' + (at ? ' · ' + at : '');
+    } else {
+      $('#live-dot').className = 'dot t-wait';
+      $('#updated').textContent = (at ? 'Cập nhật ' + at + ' · ' : '') + 'hỏi lại 10 giây một lần';
+    }
+  }
+
+  function got(key, data) {
+    S[key].data = data;
+    S[key].error = '';
+    S[key].got = Date.now();
+    if (key === section) live();
+    render();
+  }
+
+  function openStream() {
+    if (stream || !window.EventSource) return;
+    clearTimeout(openStream.again);
+    const es = stream = new EventSource('/api/stream');
+    es.onopen = () => { streaming = true; live(); render(); };
+    Object.keys(SECTIONS).forEach((key) => es.addEventListener(key, (event) => {
+      try { got(key, JSON.parse(event.data)); } catch { /* bản hỏng: chờ bản sau */ }
+    }));
+    es.onerror = () => {
+      streaming = false;
+      live();
+      render();
+      if (es.readyState !== EventSource.CLOSED) return;  // trình duyệt tự nối lại sau 3 giây
+      // Máy chủ từ chối (hết phiên, quá đông, Cloudflare báo lỗi): hỏi thường, một phút sau thử lại.
+      stream = null;
+      load();
+      openStream.again = setTimeout(openStream, 60000);
+    };
+  }
+
+  function closeStream() {
+    clearTimeout(openStream.again);
+    if (stream) stream.close();
+    stream = null;
+    streaming = false;
+  }
+
+  function wake() {
+    openStream();
+    // Luồng chưa lên sau 3 giây (mạng chặn, trình duyệt cũ) thì hỏi thường luôn.
+    clearTimeout(wake.timer);
+    wake.timer = setTimeout(() => { if (!streaming || Object.values(S).some((st) => !st.data)) load(); }, 3000);
+  }
+
+  async function fetchSection(key) {
+    const st = S[key];
+    if (st.busy) return;  // flow-v2 chậm thì đừng chồng thêm lượt gọi
+    st.busy = true;
+    let data = null;
+    try {
+      const res = await fetch(SECTIONS[key].url, { cache: 'no-store', credentials: 'same-origin' });
+      if (res.status === 401) { location.href = '/login'; return; }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      data = await res.json();
+    } catch (err) {
+      st.error = err.message || String(err);
+    } finally {
+      st.busy = false;
+    }
+    if (data) return got(key, data);
+    if (key === section) live();
+    render();
+  }
+  const load = () => Promise.all(Object.keys(SECTIONS).map(fetchSection));
+
+  function toast(text) {
+    const el = $('#toast');
+    el.textContent = text;
+    el.hidden = false;
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => { el.hidden = true; }, 5000);
+  }
+
+  async function startCheck(jobId, button) {
+    button.disabled = true;
+    try {
+      const res = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ job: jobId }) });
+      if (res.status === 401) { location.href = '/login'; return; }
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || 'HTTP ' + res.status);
+      toast('Đã nhờ máy Etsy mở bản nháp. Mất 1–3 phút, kết quả tự hiện.');
+      fetchSection('etsy');
+    } catch (err) {
+      toast('Không soát được: ' + err.message);
+      button.disabled = false;
+    }
+  }
+
+  document.addEventListener('click', (event) => {
+    const el = event.target.closest('[data-check],[data-section],[data-tab],[data-filter],[data-go],[data-pick]');
+    if (!el) return;
+    if (el.dataset.check) return startCheck(el.dataset.check, el);
+    const st = S[section];
+    if (el.dataset.section) {
+      section = el.dataset.section;
+      store.set('section', section);
+      query = '';
+      $('#search').value = '';
+      live();
+    }
+    if (el.dataset.tab) { st.tab = el.dataset.tab; store.set(section + '.tab', st.tab); }
+    if (el.dataset.filter) { st.filter = el.dataset.filter; store.set(section + '.filter', st.filter); }
+    if (el.dataset.go) {
+      const [nextTab, nextFilter] = el.dataset.go.split(':');
+      st.tab = nextTab; store.set(section + '.tab', st.tab);
+      if (nextFilter) { st.filter = nextFilter; store.set(section + '.filter', st.filter); }
+      $('#view').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+    if (el.dataset.pick) {  // "Xem thẻ con" của một cụm
+      S.sku.cluster = el.dataset.pick; store.set('sku.cluster', S.sku.cluster);
+      st.tab = 'cards'; store.set(section + '.tab', st.tab);
+      st.filter = 'all'; store.set(section + '.filter', st.filter);
+    }
+    render();
+  });
+  document.addEventListener('change', (event) => {
+    const el = event.target.closest('[data-cluster]');
+    if (!el) return;
+    S.sku.cluster = el.value;
+    store.set('sku.cluster', el.value);
+    render();
+  });
+  $('#search').addEventListener('input', (event) => { query = event.target.value.trim().toLowerCase(); render(); });
+  $('#refresh').addEventListener('click', load);
+  // Tab ẩn thì đóng luồng: không ai xem thì máy chủ thôi dựng số liệu.
+  document.addEventListener('visibilitychange', () => { if (document.hidden) closeStream(); else wake(); });
+  setInterval(() => { if (!document.hidden && !streaming) load(); }, 10000);
+  setInterval(() => { if (!document.hidden) tick(); }, 1000);
+  fetch('/api/me', { cache: 'no-store' }).then((res) => res.ok ? res.json() : {}).then((me) => { $('#logout').hidden = !me.gate; }).catch(() => {});
+  render();
+  if (!document.hidden) wake();
+})();
+</script>
+</body>
+</html>

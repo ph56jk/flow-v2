@@ -8,8 +8,6 @@ from .messages import classify_job_error, humanize_flow_error
 from .paths import STATE_FILE, ensure_app_dirs
 from .schemas import (
     AppConfig,
-    EtsyAccount,
-    EtsyConfig,
     IntegrationConfig,
     JobArtifact,
     JobErrorSnapshot,
@@ -23,10 +21,137 @@ from .schemas import (
     JobRetrySnapshot,
     SkillRecord,
     StateSnapshot,
-    TrelloConfig,
+    ERPConfig,
     normalized_app_config,
     utc_now,
 )
+
+
+#: Số lượt chạy giữ lại trong lịch sử, và mức trần tuyệt đối kể cả khi còn nợ.
+JOB_HISTORY_LIMIT = 50
+JOB_HISTORY_CEILING = 500
+#: Hạn ngạch tối thiểu cho những lượt chạy **có ảnh** (A7.1).  Trong sự cố hết
+#: quota, watcher và agent bot mỗi cái sinh một lượt cho mỗi thẻ con, mỗi 3
+#: phút, mỗi lượt chết trong ~5 giây và không để lại artifact nào: sáu thẻ lấp
+#: đủ 50 ô trước trưa và đẩy hết lịch sử thật ra khỏi dashboard.  Đó là thứ làm
+#: sự cố trông như "không có gì chạy" thay vì "hết quota".
+JOB_HISTORY_MIN_WITH_ARTIFACTS = 20
+#: Những trạng thái kết thúc mà một lượt chạy **không artifact** coi như chết
+#: trắng: nó không kể được gì mà lượt bên cạnh không kể được.  Đúng một ô này
+#: là chỗ hạn ngạch ở trên lấy để trả, chứ không nới cửa sổ ra thêm.
+JOB_HISTORY_DEAD_END_STATUSES = frozenset({"failed", "error", "cancelled", "canceled", "interrupted"})
+#: Lượt chưa kết thúc.  Hồ sơ của nó là thứ duy nhất vòng chạy còn giữ id để
+#: gọi tới; cắt nó là lượt đó lặng lẽ không bao giờ chạy.
+JOB_HISTORY_LIVE_STATUSES = frozenset({"queued", "running", "polling"})
+
+
+def job_owes_erp_images(job: JobRecord) -> bool:
+    """Lượt chạy còn ảnh chưa giao được cho thẻ ERP của nó.
+
+    Ảnh đã tạo mà chưa lên thẻ thì chỉ hồ sơ lượt chạy này biết chúng nằm ở
+    đâu. Cắt nó khỏi lịch sử là cắt luôn đường đăng bù: thẻ vĩnh viễn trắng
+    trong khi mười hai tấm ảnh vẫn nằm trên đĩa. Nên nó ở lại quá hạn mức,
+    cho tới khi từng tấm đã lên thẻ hoặc đã có người quyết.
+    """
+    payload = job.input if isinstance(job.input, dict) else {}
+    if not str(payload.get("erp_output_task_id") or "").strip():
+        return False
+    if not job.artifacts:
+        return False
+    result = job.result if isinstance(job.result, dict) else {}
+    review = result.get("erp_review")
+    items = review.get("items") if isinstance(review, dict) and isinstance(review.get("items"), dict) else {}
+    approvals = result.get("dashboard_approvals")
+    decided = approvals if isinstance(approvals, dict) else {}
+    for index in range(len(job.artifacts)):
+        key = str(index)
+        if str((decided.get(key) or {}).get("status") or "") in {"approved", "rejected"}:
+            continue
+        if str((items.get(key) or {}).get("comment") or ""):
+            continue
+        return True
+    return False
+
+
+def job_is_dead_end(job: JobRecord) -> bool:
+    """Lượt chạy chết trắng: đã kết thúc hỏng/huỷ/đứt và không để lại ảnh nào.
+
+    Đây là chữ ký của cơn lụt trong sự cố hết quota. Một ô lịch sử của nó
+    không kể được gì mà lượt bên cạnh không kể được, nên khi lịch sử phải
+    chọn giữa nó và một lượt có ảnh thật, chính nó là cái nhường chỗ.
+    """
+    if job.artifacts:
+        return False
+    status = str(getattr(job, "status", "") or "").strip().lower()
+    return status in JOB_HISTORY_DEAD_END_STATUSES
+
+
+def _live_job_ids(jobs: List[JobRecord]) -> set:
+    """Lượt chưa kết thúc, cộng lô (batch) đang sở hữu một lượt như thế.
+
+    Lô Auto AI liên tục thêm một lượt con cho mỗi thẻ; sau ~50 thẻ chính hồ sơ lô
+    là bản cũ nhất và bị cắt, vòng lặp mất lô (get_job trả None) và lượt con cuối
+    đứng "queued" mãi trong khi /api/health vẫn ok (flowautomation 9680695).
+    """
+    live_ids = {
+        job.id for job in jobs if str(getattr(job, "status", "") or "").strip().lower() in JOB_HISTORY_LIVE_STATUSES
+    }
+    for job in jobs:
+        result = job.result if isinstance(job.result, dict) else {}
+        owned = {str(child_id) for child_id in (result.get("child_job_ids") or []) if child_id}
+        current_child = str(result.get("current_child_job_id") or "")
+        if current_child:
+            owned.add(current_child)
+        if owned & live_ids:
+            live_ids.add(job.id)
+    return live_ids
+
+
+def trim_job_history(jobs: List[JobRecord]) -> List[JobRecord]:
+    """Lịch sử sau khi cắt.
+
+    Cửa sổ vẫn là ``JOB_HISTORY_LIMIT`` lượt mới nhất. Hai thứ được phép phá
+    cửa sổ đó, và chúng phá theo hai cách khác nhau:
+
+    1. Lượt còn **nợ ảnh cho thẻ ERP** ở lại **thêm** vào cửa sổ
+       (``job_owes_erp_images``, A7.4): ảnh đã tạo mà chưa lên thẻ thì chỉ hồ
+       sơ này biết chúng nằm đâu, cắt nó là cắt luôn đường đăng bù.  Lượt
+       **chưa kết thúc** (``JOB_HISTORY_LIVE_STATUSES``) cũng ở lại như thế:
+       xếp một lô lớn không được đẩy lượt đang chờ của lô trước ra ngoài.
+    2. Hạn ngạch ``JOB_HISTORY_MIN_WITH_ARTIFACTS`` lượt **có ảnh** (A7.1) thì
+       **đổi chỗ**, không nới thêm: mỗi lượt có ảnh được kéo về chỉ khi trong
+       cửa sổ còn một ô chết trắng (``job_is_dead_end``) để nhường, và ô cũ
+       nhất nhường trước. Một loạt lượt hỏng 5 giây vì thế không đẩy được
+       lịch sử thật ra khỏi dashboard, còn một lượt đã xong xuôi — ảnh đã lên
+       thẻ hoặc đã có người quyết — vẫn rơi ra như cũ khi cửa sổ đầy những
+       lượt bình thường.
+
+    Trả về theo **thứ tự cũ**, mới nhất trước (A7.3): đây là nguồn cho
+    dashboard, đảo thứ tự ở đây là đổi giao diện.  ``JOB_HISTORY_CEILING`` vẫn
+    là trần tuyệt đối (A7.2).
+    """
+    if len(jobs) <= JOB_HISTORY_LIMIT:
+        return list(jobs)
+    keep = set(range(JOB_HISTORY_LIMIT))
+    # Ô nhường được, cũ nhất trước: giữ thiên vị lượt mới trong cửa sổ.
+    spare_slots = [index for index in reversed(range(JOB_HISTORY_LIMIT)) if job_is_dead_end(jobs[index])]
+    with_artifacts = sum(1 for job in jobs[:JOB_HISTORY_LIMIT] if job.artifacts)
+    live_ids = _live_job_ids(jobs)
+    for index in range(JOB_HISTORY_LIMIT, len(jobs)):
+        job = jobs[index]
+        if job.id in live_ids:
+            keep.add(index)
+            continue
+        if job_owes_erp_images(job):
+            keep.add(index)
+            with_artifacts += 1
+            continue
+        if not job.artifacts or with_artifacts >= JOB_HISTORY_MIN_WITH_ARTIFACTS or not spare_slots:
+            continue
+        keep.discard(spare_slots.pop(0))
+        keep.add(index)
+        with_artifacts += 1
+    return [job for index, job in enumerate(jobs) if index in keep][:JOB_HISTORY_CEILING]
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -47,11 +172,13 @@ class StateStore:
         self._lock = asyncio.Lock()
         self._state = self._load()
         self._normalize_saved_config()
-        self._normalize_saved_trello_config()
-        self._normalize_saved_etsy_config()
-        self._normalize_saved_etsy_accounts()
+        self._normalize_saved_erp_config()
         self._normalize_saved_integration_config()
         self._normalize_saved_jobs()
+        #: Id các lượt vừa bị ``_repair_incomplete_jobs`` đóng dấu
+        #: ``interrupted`` ở lần khởi động này.  Service đọc nó để xếp lại thẻ
+        #: idea bị ngắt, thay vì để cả lô nằm im chờ người.
+        self.interrupted_on_start: List[str] = []
         self._repair_incomplete_jobs()
 
     def snapshot(self) -> StateSnapshot:
@@ -63,23 +190,11 @@ class StateStore:
             await self._save_locked()
         return self._state.config
 
-    async def replace_trello_config(self, config: TrelloConfig) -> TrelloConfig:
+    async def replace_erp_config(self, config: ERPConfig) -> ERPConfig:
         async with self._lock:
-            self._state.trello_config = self._normalize_trello_config(config)
+            self._state.erp_config = self._normalize_erp_config(config)
             await self._save_locked()
-        return self._state.trello_config
-
-    async def replace_etsy_config(self, config: EtsyConfig) -> EtsyConfig:
-        async with self._lock:
-            self._state.etsy_config = self._normalize_etsy_config(config)
-            await self._save_locked()
-        return self._state.etsy_config
-
-    async def replace_etsy_accounts(self, accounts: List[EtsyAccount]) -> List[EtsyAccount]:
-        async with self._lock:
-            self._state.etsy_accounts = self._normalize_etsy_accounts(accounts)
-            await self._save_locked()
-        return list(self._state.etsy_accounts)
+        return self._state.erp_config
 
     async def replace_integration_config(self, config: IntegrationConfig) -> IntegrationConfig:
         async with self._lock:
@@ -127,10 +242,16 @@ class StateStore:
     def get_job(self, job_id: str) -> Optional[JobRecord]:
         return next((job for job in self._state.jobs if job.id == job_id), None)
 
+    JOB_HISTORY_LIMIT = JOB_HISTORY_LIMIT
+    LIVE_JOB_STATUSES = tuple(sorted(JOB_HISTORY_LIVE_STATUSES))
+
+    def _trim_job_history(self) -> None:
+        self._state.jobs = trim_job_history(self._state.jobs)
+
     async def add_job(self, job: JobRecord) -> JobRecord:
         async with self._lock:
             self._state.jobs.insert(0, job)
-            self._state.jobs = self._state.jobs[:50]
+            self._trim_job_history()
             self._sync_job_error_snapshot(job)
             self._sync_job_retry_snapshot(job)
             self._sync_job_replay_snapshot(job)
@@ -338,34 +459,11 @@ class StateStore:
             encoding="utf-8",
         )
 
-    def _normalize_saved_trello_config(self) -> None:
-        normalized = self._normalize_trello_config(self._state.trello_config)
-        if _model_dump(normalized) == _model_dump(self._state.trello_config):
+    def _normalize_saved_erp_config(self) -> None:
+        normalized = self._normalize_erp_config(self._state.erp_config)
+        if _model_dump(normalized) == _model_dump(self._state.erp_config):
             return
-        self._state.trello_config = normalized
-        STATE_FILE.write_text(
-            json.dumps(_model_dump(self._state), indent=2),
-            encoding="utf-8",
-        )
-
-    def _normalize_saved_etsy_config(self) -> None:
-        normalized = self._normalize_etsy_config(getattr(self._state, "etsy_config", EtsyConfig()))
-        if _model_dump(normalized) == _model_dump(getattr(self._state, "etsy_config", EtsyConfig())):
-            return
-        self._state.etsy_config = normalized
-        STATE_FILE.write_text(
-            json.dumps(_model_dump(self._state), indent=2),
-            encoding="utf-8",
-        )
-
-    def _normalize_saved_etsy_accounts(self) -> None:
-        # getattr-safe: legacy state.json predates etsy_accounts, so an absent
-        # field must read as an empty list (zero extra accounts = default-only).
-        current = list(getattr(self._state, "etsy_accounts", []) or [])
-        normalized = self._normalize_etsy_accounts(current)
-        if [_model_dump(item) for item in normalized] == [_model_dump(item) for item in current]:
-            return
-        self._state.etsy_accounts = normalized
+        self._state.erp_config = normalized
         STATE_FILE.write_text(
             json.dumps(_model_dump(self._state), indent=2),
             encoding="utf-8",
@@ -381,24 +479,22 @@ class StateStore:
             encoding="utf-8",
         )
 
-    def _normalize_trello_config(self, config: TrelloConfig) -> TrelloConfig:
+    def _normalize_erp_config(self, config: ERPConfig) -> ERPConfig:
         payload = _model_dump(config)
-        upload_mode = str(payload.get("upload_mode") or "file").strip().lower()
-        if upload_mode not in {"file", "url"}:
-            upload_mode = "file"
-        # ``upscale_to_2k`` was added later; legacy state.json không có khoá này
-        # nên dùng default True, nhưng nếu user đã chọn False thì phải tôn
-        # trọng — không re-default lại True khi normalize.
-        raw_upscale = payload.get("upscale_to_2k", True)
-        return TrelloConfig(
+        base_url = str(payload.get("base_url") or "https://erp.havigroup.llc").strip().rstrip("/")
+        if base_url != "https://erp.havigroup.llc":
+            base_url = "https://erp.havigroup.llc"
+        return ERPConfig(
             api_key=str(payload.get("api_key") or "").strip(),
-            token=str(payload.get("token") or "").strip(),
-            board_id=str(payload.get("board_id") or "").strip(),
-            card_id=str(payload.get("card_id") or "").strip(),
-            list_id=str(payload.get("list_id") or "").strip(),
-            upload_mode=upload_mode,
-            set_cover=payload.get("set_cover") is not False,
-            upscale_to_2k=raw_upscale is not False,
+            api_secret=str(payload.get("api_secret") or payload.get("token") or "").strip(),
+            base_url=base_url,
+            project_id=str(payload.get("project_id") or "PROJ-0013").strip() or "PROJ-0013",
+            task_id=str(payload.get("task_id") or "").strip(),
+            status=str(payload.get("status") or "").strip(),
+            # Bảng chuẩn hoá dựng lại từng trường một, nên trường nào quên ở
+            # đây là trường ấy rơi mất im lặng: API gật, màn hình bảo đã lưu,
+            # mà lượt đọc ngay sau thấy ô rỗng.
+            sku_sheet_url=str(payload.get("sku_sheet_url") or "").strip(),
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
 
@@ -407,77 +503,14 @@ class StateStore:
         return IntegrationConfig(
             gemini_api_key=str(payload.get("gemini_api_key") or "").strip(),
             gemini_model=str(payload.get("gemini_model") or "gemini-2.5-flash").strip() or "gemini-2.5-flash",
+            gemini_api_key_cleared_at=str(payload.get("gemini_api_key_cleared_at") or "").strip(),
             telegram_bot_token=str(payload.get("telegram_bot_token") or "").strip(),
             telegram_chat_id=str(payload.get("telegram_chat_id") or "").strip(),
             playwright_browsers_path=str(payload.get("playwright_browsers_path") or "").strip(),
+            removelogo_url=str(payload.get("removelogo_url") or "").strip().rstrip("/"),
+            removelogo_enabled=payload.get("removelogo_enabled") is not False,
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
-
-    def _normalize_etsy_config(self, config: EtsyConfig) -> EtsyConfig:
-        payload = _model_dump(config)
-        api_key = str(payload.get("api_key") or "").strip()
-        api_secret = str(payload.get("api_secret") or "").strip()
-        if ":" in api_key and not api_secret:
-            api_key, api_secret = [part.strip() for part in api_key.split(":", 1)]
-        try:
-            quantity = int(payload.get("quantity") or 1)
-        except (TypeError, ValueError):
-            quantity = 1
-        return EtsyConfig(
-            api_key=api_key,
-            api_secret=api_secret,
-            access_token=str(payload.get("access_token") or "").strip(),
-            refresh_token=str(payload.get("refresh_token") or "").strip(),
-            user_id=str(payload.get("user_id") or "").strip(),
-            shop_id=str(payload.get("shop_id") or "").strip(),
-            taxonomy_id=str(payload.get("taxonomy_id") or "").strip(),
-            shipping_profile_id=str(payload.get("shipping_profile_id") or "").strip(),
-            return_policy_id=str(payload.get("return_policy_id") or "").strip(),
-            readiness_state_id=str(payload.get("readiness_state_id") or "").strip(),
-            quantity=max(1, quantity),
-            price=str(payload.get("price") or "9.99").strip() or "9.99",
-            who_made=str(payload.get("who_made") or "i_did").strip() or "i_did",
-            when_made=str(payload.get("when_made") or "made_to_order").strip() or "made_to_order",
-            is_supply=bool(payload.get("is_supply")),
-            should_auto_renew=bool(payload.get("should_auto_renew")),
-            updated_at=str(payload.get("updated_at") or "").strip(),
-        )
-
-    @staticmethod
-    def _normalize_account_slug(value: Any) -> str:
-        slug = str(value or "").strip().lower()
-        slug = "".join(ch if (ch.isalnum() or ch in "_-") else "-" for ch in slug)
-        return slug.strip("-")
-
-    def _normalize_etsy_account(self, account: EtsyAccount) -> EtsyAccount:
-        payload = _model_dump(account)
-        slug = self._normalize_account_slug(payload.get("slug"))
-        return EtsyAccount(
-            slug=slug,
-            label=str(payload.get("label") or "").strip() or slug,
-            trello_board_id=str(payload.get("trello_board_id") or "").strip(),
-            trello_list_id=str(payload.get("trello_list_id") or "").strip(),
-            etsy_shop_id=str(payload.get("etsy_shop_id") or "").strip(),
-            enabled=payload.get("enabled") is not False,
-            updated_at=str(payload.get("updated_at") or "").strip(),
-        )
-
-    def _normalize_etsy_accounts(self, accounts: Any) -> List[EtsyAccount]:
-        # Drop reserved slugs ("" / "default" belong to the implicit default
-        # account = global TrelloConfig/EtsyConfig, never stored here) and dedup
-        # by slug (last write wins, original order preserved).
-        seen: Dict[str, EtsyAccount] = {}
-        order: List[str] = []
-        for raw in (accounts or []):
-            account = raw if isinstance(raw, EtsyAccount) else _model_validate(EtsyAccount, dict(raw or {}))
-            normalized = self._normalize_etsy_account(account)
-            slug = normalized.slug
-            if not slug or slug == "default":
-                continue
-            if slug not in seen:
-                order.append(slug)
-            seen[slug] = normalized
-        return [seen[slug] for slug in order]
 
     def _normalize_saved_jobs(self) -> None:
         changed = False
@@ -516,6 +549,7 @@ class StateStore:
         for job in self._state.jobs:
             if job.status in {"queued", "running", "polling"}:
                 previous_status = job.status
+                self.interrupted_on_start.append(job.id)
                 job.status = "interrupted"
                 job.error = "Máy chủ đã khởi động lại khi tác vụ đang chạy."
                 job.updated_at = utc_now()

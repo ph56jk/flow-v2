@@ -3,10 +3,12 @@
 .pw-browsers/
 .playwright-cli/
 .env.local
+.env.worker-*.local
 .codex/
 __pycache__/
 .pytest_cache/
 *.pyc
+._*
 flow_web_ui.egg-info/
 flow_v2.egg-info/
 dist/
@@ -16,14 +18,38 @@ outputs/
 data/uploads/*
 data/downloads/*
 data/flow-profiles/*
-data/state.json
+# CLAUDE.md điều 3 viết "data/state.json*" — có dấu sao.  Tên chính xác thì
+# lọt mất bản tạm và bản sao lưu (.tmp, .bak, .1), mà chúng cũng là trạng thái
+# của máy đang chạy.  Bài canh: tests/test_luat_cung_repo.py
+data/state.json*
+data/state.before-*.json
+data/state.corrupt-*.json
+data/state.restored-*.json
+data/trello-title-description-backups.json
+data/workers/
 data/_state_dump.json
+data/agent_bot_state.json
+# Sổ số SKU đã phát là trạng thái của *máy đang chạy bot*, không phải
+# cấu hình chung: commit nó vào đây thì một bản checkout cũ đẩy được bộ
+# đếm đi lùi, mà đi lùi nghĩa là cấp trùng mã đã in ra nhãn.
+data/sku_ledger.json
+data/erp-agent-nhip.json
+data/erp-agent-nhip.json.lock
+# Cache danh mục sản phẩm ERP (load_product_categories) — bản sao đọc lại
+# được bất cứ lúc nào từ ERP, khác data/sku_book.json (bảng người vận hành
+# gõ tay, cố ý được commit).  Đưa vào git chỉ tổ tạo xung đột merge vô nghĩa.
+data/product_categories.json
 .flow-web.log
 .flow-web.pid
 logs/
 !data/uploads/.gitkeep
 !data/downloads/.gitkeep
 !data/flow-profiles/.gitkeep
+
+# Local account helpers and editable rule workbooks contain operator data.
+scripts/login_flow_*acc*.ps1
+Flow_Tool_Rules_Current_Work_*.xlsx
+data/*Rules*Manual*.xlsx
 
 # Beads / Dolt files (added by bd init)
 .dolt/
@@ -35,16 +61,5 @@ logs/
 .ralph-output/
 .ralph-tui/
 
-# Secrets / runtime data (never commit)
-data/etsy_oauth_pending.json
-data/etsy_section_tracking.json
-data/*.bak-*
-data/state.json.bak-quota
-.claude/
-.tmp/
-
-# Stray junk files
-/no
-*.err
-etsy_vm_backend_proxy.log
-C:\\Users*
+# Cache Gemini sinh lúc chạy: có mã thẻ và đường dẫn ảnh của người vận hành.
+data/visual-rule-cache.json

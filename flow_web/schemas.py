@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def utc_now() -> str:
@@ -24,60 +25,32 @@ class AppConfig(BaseModel):
     output_dir: str = ""
 
 
-class TrelloConfig(BaseModel):
-    api_key: str = ""
-    token: str = ""
-    board_id: str = ""
-    card_id: str = ""
-    list_id: str = ""
-    upload_mode: str = "file"
-    set_cover: bool = True
-    upscale_to_2k: bool = True
-    updated_at: str = ""
-
-
-class EtsyConfig(BaseModel):
+class ERPConfig(BaseModel):
     api_key: str = ""
     api_secret: str = ""
-    access_token: str = ""
-    refresh_token: str = ""
-    user_id: str = ""
-    shop_id: str = ""
-    taxonomy_id: str = ""
-    shipping_profile_id: str = ""
-    return_policy_id: str = ""
-    readiness_state_id: str = ""
-    quantity: int = 1
-    price: str = "9.99"
-    who_made: str = "i_did"
-    when_made: str = "made_to_order"
-    is_supply: bool = False
-    should_auto_renew: bool = False
-    updated_at: str = ""
-
-
-class EtsyAccount(BaseModel):
-    # One additional Etsy account in the multi-account fleet. The DEFAULT account
-    # (slug == "") is NOT stored here — it is the existing global TrelloConfig +
-    # EtsyConfig, so legacy single-account state keeps working untouched. Entries
-    # in this list are ONLY the extra accounts (shop2, shop3, …), each with its
-    # own Trello board (image/info source) and its own Etsy shop.
-    slug: str = ""
-    label: str = ""
-    trello_board_id: str = ""
-    trello_list_id: str = ""
-    etsy_shop_id: str = ""
-    enabled: bool = True
+    base_url: str = "https://erp.havigroup.llc"
+    project_id: str = "PROJ-0013"
+    task_id: str = ""
+    status: str = ""
+    # Link bảng SKU của xưởng trên Google Sheet. Ở đây chứ không chỉ trong
+    # .env.local: đổi bảng thì không nên phải sửa file rồi khởi động lại.
+    sku_sheet_url: str = ""
     updated_at: str = ""
 
 
 class IntegrationConfig(BaseModel):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
-    gemini_image_model: str = ""
+    # Mốc lần bấm "Xoá khoá" gần nhất. Còn mốc này, và nó mới hơn lần sửa
+    # .env.local, thì snapshot không được dựng khoá lại từ env.
+    gemini_api_key_cleared_at: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     playwright_browsers_path: str = ""
+    # Local Gemini watermark processor (removelogo). Empty url falls back to
+    # REMOVE_LOGO_URL then the documented http://127.0.0.1:8788 loopback.
+    removelogo_url: str = ""
+    removelogo_enabled: bool = True
     updated_at: str = ""
 
 
@@ -111,11 +84,49 @@ def normalize_project_id(project_value: str) -> str:
     return candidate
 
 
+FLOW_NAVIGATION_BASE_URL_ENV = "FLOW_NAVIGATION_BASE_URL"
+FLOW_NAVIGATION_DEFAULT_BASE_URL = "https://flow.google.com"
+
+
+def flow_navigation_base_url() -> str:
+    """Host mở giao diện Flow; API vẫn dùng host riêng của nó."""
+    raw = str(os.getenv(FLOW_NAVIGATION_BASE_URL_ENV, "") or "").strip().rstrip("/")
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return raw
+    return FLOW_NAVIGATION_DEFAULT_BASE_URL
+
+
+def is_flow_navigation_url(value: str) -> bool:
+    """Chấp nhận host mới, host cũ và host cấu hình để nhận diện tab Flow."""
+    host = urlparse(str(value or "").strip()).netloc.lower()
+    configured_host = urlparse(flow_navigation_base_url()).netloc.lower()
+    return host in {"flow.google.com", "labs.google", configured_host}
+
+
+FLOW_TOKEN_PAGE_BASE_URL = "https://labs.google/fx/tools/flow"
+
+
+def flow_token_page_url(project_value: str) -> str:
+    """Trang lấy Bearer token — luôn là labs.google, không theo host giao diện.
+
+    Token nằm trong phiên next-auth của labs.google
+    (``__NEXT_DATA__.props.pageProps.session`` và ``/fx/api/auth/session``).
+    Editor mới ``flow.google.com`` không có hai thứ đó, nên mở token ở đấy là
+    không lấy được gì.  Đường dẫn này cũng bỏ đoạn locale ``/vi/``: bản có
+    locale giờ là trang giới thiệu, bản không locale vẫn là app thật.
+    """
+    project_id = normalize_project_id(project_value)
+    if not project_id:
+        return ""
+    return f"{FLOW_TOKEN_PAGE_BASE_URL}/project/{quote(project_id, safe='')}"
+
+
 def canonical_project_url(project_value: str) -> str:
     project_id = normalize_project_id(project_value)
     if not project_id:
         return ""
-    return f"https://labs.google/fx/vi/tools/flow/project/{quote(project_id, safe='')}"
+    return f"{flow_navigation_base_url()}/project/{quote(project_id, safe='')}"
 
 
 def normalized_app_config(config: Any) -> AppConfig:
@@ -145,6 +156,14 @@ class JobArtifact(BaseModel):
     mime_type: str = ""
     prompt: str = ""
     dimensions: Dict[str, Any] = Field(default_factory=dict)
+    # Local Gemini watermark pass: "cleaned" (visible watermark repaired),
+    # "metadata_only" (AI provenance stripped but the sparkle is still visible),
+    # "skipped" (nothing to remove) or "failed" (original bytes kept).
+    watermark_status: str = ""
+    watermark_error: str = ""
+    # Set when the local fallback repair - not removelogo - was what removed the
+    # visible sparkle, so a reviewer can tell the two cleaners apart.
+    watermark_repair: str = ""
 
 
 class JobRecoveryAction(BaseModel):
@@ -283,9 +302,7 @@ class PublicSkillSnapshot(BaseModel):
 
 class StateSnapshot(BaseModel):
     config: AppConfig = Field(default_factory=AppConfig)
-    trello_config: TrelloConfig = Field(default_factory=TrelloConfig)
-    etsy_config: EtsyConfig = Field(default_factory=EtsyConfig)
-    etsy_accounts: List[EtsyAccount] = Field(default_factory=list)
+    erp_config: ERPConfig = Field(default_factory=ERPConfig)
     integration_config: IntegrationConfig = Field(default_factory=IntegrationConfig)
     flow_profile_quota_blocked_until: Dict[str, float] = Field(default_factory=dict)
     flow_profile_agent_retry_error_counts: Dict[str, int] = Field(default_factory=dict)
@@ -304,79 +321,113 @@ class ConfigUpdateRequest(BaseModel):
     output_dir: str = ""
 
 
-class TrelloConfigUpdateRequest(BaseModel):
+class ERPConfigUpdateRequest(BaseModel):
     api_key: str = ""
-    token: str = ""
-    board_id: str = ""
-    card_id: str = ""
-    list_id: str = ""
-    upload_mode: str = "file"
-    set_cover: bool = True
-    upscale_to_2k: bool = True
+    api_secret: str = ""
+    base_url: str = "https://erp.havigroup.llc"
+    project_id: str = "PROJ-0013"
+    task_id: str = ""
+    status: str = ""
+    sku_sheet_url: str = ""
+    clear_sku_sheet_url: bool = False
     clear_credentials: bool = False
     persist_to_env: bool = False  # also write to .env.local so creds survive state resets
 
 
-class EtsyConfigUpdateRequest(BaseModel):
-    api_key: str = ""
-    api_secret: str = ""
-    access_token: str = ""
-    refresh_token: str = ""
-    user_id: str = ""
-    shop_id: str = ""
-    taxonomy_id: str = ""
-    shipping_profile_id: str = ""
-    return_policy_id: str = ""
-    readiness_state_id: str = ""
-    quantity: int = 1
-    price: str = "9.99"
-    who_made: str = "i_did"
-    when_made: str = "made_to_order"
-    is_supply: bool = False
-    should_auto_renew: bool = False
-    clear_credentials: bool = False
+class ERPIdeaBatchRequest(BaseModel):
+    """Fan a parent "Idea" card out over the child cards its breakdown made.
+
+    One child card is one idea: the images generated for it are written back
+    onto that same card, so the board keeps one card per idea instead of one
+    pile of images on the parent.
+    """
+
+    task_id: str = ""
+    child_task_ids: List[str] = Field(default_factory=list)
+    count: int = 0  # images per idea; 0 keeps the app default
+    include_done: bool = False  # rerun ideas that already carry Flow images
+    model: str = ""
+    aspect: str = "square"
 
 
-class EtsyAccountUpsertRequest(BaseModel):
-    slug: str = ""
-    label: str = ""
-    trello_board_id: str = ""
-    trello_list_id: str = ""
-    etsy_shop_id: str = ""
-    enabled: bool = True
+class SkuSyncRequest(BaseModel):
+    """Cấp mã SKU cho cây thẻ dưới một thẻ gốc."""
+
+    task_id: str = ""
+    dry_run: bool = False
+    #: Đánh số lại cả cây, kể cả thẻ đã có mã.  Mặc định tắt: mã SKU đã đi ra
+    #: ngoài phần mềm nên đổi nó là việc người vận hành phải chủ động yêu cầu.
+    renumber: bool = False
 
 
-class EtsyAccountDeleteRequest(BaseModel):
-    slug: str = ""
+class SkuBookUpdateRequest(BaseModel):
+    """Bảng sản phẩm → phần tên SKU, như người vận hành gõ trong sheet."""
+
+    entries: Dict[str, str] = Field(default_factory=dict)
 
 
-class ResetReadyTrelloRequest(BaseModel):
-    trello_board_id: str = ""
-    trello_list_id: str = ""
+class AccountBookUpdateRequest(BaseModel):
+    """Sổ tay tài khoản: mã tài khoản → shop, máy chạy, ghi chú.
+
+    Giá trị nhận cả dạng chuỗi (``"acc32": "etsy-vn32"``) lẫn dạng bảng
+    (``{"shop": …, "machine": …}``), vì đó là hai cách người vận hành gõ khi
+    họ có ít hoặc nhiều thông tin trong tay.
+    """
+
+    entries: Dict[str, Any] = Field(default_factory=dict)
 
 
-class EtsySectionSyncRequest(BaseModel):
-    trello_board_id: str = ""
-    trello_list_id: str = ""
-    include_list_ids: List[str] = Field(default_factory=list)
-    include_list_names: List[str] = Field(default_factory=list)
-    exclude_list_names: List[str] = Field(default_factory=list)
-    dry_run: bool = True
-    create_missing: bool = False
-    tracking_only: bool = False
-    replace_tracking: bool = False
-    max_sections: int = 100
+class PipelineAdvanceRequest(BaseModel):
+    """Đẩy một thẻ đi một bước trên bảng theo luật cột."""
+
+    task_id: str = ""
+
+
+class TaskMetaEditRequest(BaseModel):
+    """Sửa vài ô trong khối Thuộc tính của một thẻ, theo lời người dùng nói với bot.
+
+    ``edits`` là *danh sách cặp* chứ không phải map, để giữ đúng thứ tự người
+    ta gõ ra — câu "acc: acc32, template: t1" phải ghi theo đúng thứ tự ấy khi
+    có ai đó đọc lại log.  Ô nào không nằm trong danh sách được phép sửa thì
+    ``service`` bỏ, chứ không phải người gọi.
+    """
+
+    task_id: str = ""
+    edits: List[Tuple[str, str]] = Field(default_factory=list)
+
+
+class ResetReadyERPRequest(BaseModel):
+    erp_project_id: str = "PROJ-0013"
+    erp_status_id: str = ""
+
+
+# Connector Telegram đã gỡ. API settings không nhận các trường này nữa, và
+# payload còn gửi kèm phải bị từ chối thành tiếng: im lặng bỏ qua làm người
+# gọi tưởng token đã được lưu.
+TELEGRAM_SETTINGS_FIELDS = ("telegram_bot_token", "telegram_chat_id", "clear_telegram_bot_token")
 
 
 class IntegrationConfigUpdateRequest(BaseModel):
     gemini_api_key: str = ""
     gemini_model: str = ""
-    gemini_image_model: str = ""
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
     playwright_browsers_path: str = ""
+    removelogo_url: str = ""
+    removelogo_enabled: Optional[bool] = None
     clear_gemini_api_key: bool = False
-    clear_telegram_bot_token: bool = False
+    clear_removelogo_url: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_telegram_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            leftover = [name for name in TELEGRAM_SETTINGS_FIELDS if name in data]
+            if leftover:
+                raise ValueError(
+                    "Telegram đã gỡ khỏi app, API settings không nhận "
+                    + ", ".join(leftover)
+                    + " nữa. Bỏ các trường này khỏi payload."
+                )
+        return data
 
 
 class AutomationModuleRequest(BaseModel):
@@ -401,27 +452,6 @@ class AutomationGraphRequest(BaseModel):
     selected_module_id: str = ""
 
 
-class EtsyVariationValueRequest(BaseModel):
-    value: str = ""
-    price: str = ""
-    quantity: int = 0
-    is_enabled: bool = True
-
-
-class EtsyVariationRequest(BaseModel):
-    property_name: str = ""
-    property_id: int = 0
-    scale_id: int = 0
-    values: List[EtsyVariationValueRequest] = Field(default_factory=list)
-
-
-class EtsyAttributeRequest(BaseModel):
-    property_id: int = 0
-    scale_id: int = 0
-    value_ids: List[int] = Field(default_factory=list)
-    values: List[str] = Field(default_factory=list)
-
-
 class CreateJobRequest(BaseModel):
     type: str
     prompt: str = ""
@@ -429,7 +459,6 @@ class CreateJobRequest(BaseModel):
     timeout_s: int = 0
     source_job_id: str = ""
     model: str = ""
-    image_engine: str = "google_flow"
     aspect: str = "landscape"
     count: int = 1
     start_image_path: str = ""
@@ -438,56 +467,20 @@ class CreateJobRequest(BaseModel):
     reference_media_names: List[str] = Field(default_factory=list)
     media_id: str = ""
     workflow_id: str = ""
-    telegram_chat_id: str = ""
-    telegram_enabled: bool = True
-    trello_enabled: bool = True
-    etsy_enabled: bool = False
-    amazon_enabled: bool = False
+    erp_enabled: bool = True
     flow_agent_enabled: bool = True
     flow_agent_auto_approve: bool = True
     automation_graph: AutomationGraphRequest = Field(default_factory=AutomationGraphRequest)
-    trello_board_id: str = ""
-    trello_card_id: str = ""
-    trello_list_id: str = ""
-    trello_attachment_ids: List[str] = Field(default_factory=list)
-    trello_source_card_id: str = ""
-    trello_source_attachment_ids: List[str] = Field(default_factory=list)
-    trello_set_cover: bool = True
-    etsy_listing_title: str = ""
-    etsy_listing_description: str = ""
-    etsy_listing_tags: List[str] = Field(default_factory=list)
-    etsy_listing_materials: List[str] = Field(default_factory=list)
-    etsy_browser_copy_enabled: bool = False
-    etsy_account_id: str = ""
-    etsy_template_listing_url: str = ""
-    etsy_template_listing_id: str = ""
-    etsy_section_name: str = ""
-    etsy_listing_sku: str = ""
-    etsy_vm_image_dir: str = ""
-    etsy_keep_color_chart: bool = True
-    etsy_delete_existing_images: bool = True
-    etsy_price: str = ""
-    etsy_quantity: int = 0
-    etsy_taxonomy_id: str = ""
-    etsy_shipping_profile_id: str = ""
-    etsy_return_policy_id: str = ""
-    etsy_readiness_state_id: str = ""
-    etsy_publish: bool = False
-    etsy_variations: List[EtsyVariationRequest] = Field(default_factory=list)
-    etsy_attributes: List[EtsyAttributeRequest] = Field(default_factory=list)
-    amazon_browser_copy_enabled: bool = False
-    amazon_account_id: str = ""
-    amazon_template_listing_url: str = ""
-    amazon_template_listing_id: str = ""
-    amazon_listing_title: str = ""
-    amazon_listing_description: str = ""
-    amazon_listing_sku: str = ""
-    amazon_product_type: str = ""
-    amazon_vm_image_dir: str = ""
-    amazon_delete_existing_images: bool = True
-    amazon_price: str = ""
-    amazon_quantity: int = 0
-    amazon_publish: bool = False
+    erp_project_id: str = ""
+    erp_task_id: str = ""
+    erp_status_id: str = ""
+    erp_attachment_ids: List[str] = Field(default_factory=list)
+    erp_source_task_id: str = ""
+    erp_source_attachment_ids: List[str] = Field(default_factory=list)
+    # Card that receives the finished images. Empty means "write back to the
+    # card the source image came from"; the idea fan-out sets it to the child
+    # card so each idea keeps its own images.
+    erp_output_task_id: str = ""
     prompt_source_row: int = 0
     prompt_product: str = ""
     prompt_product_key: str = ""
@@ -511,11 +504,11 @@ class PromptBatchItemRequest(BaseModel):
     product_name: str = ""
     index: str = ""
     notes: str = ""
-    trello_card_id: str = ""
-    trello_list_id: str = ""
-    trello_attachment_ids: List[str] = Field(default_factory=list)
-    trello_source_card_id: str = ""
-    trello_source_attachment_ids: List[str] = Field(default_factory=list)
+    erp_task_id: str = ""
+    erp_status_id: str = ""
+    erp_attachment_ids: List[str] = Field(default_factory=list)
+    erp_source_task_id: str = ""
+    erp_source_attachment_ids: List[str] = Field(default_factory=list)
 
 
 class PromptBatchRequest(BaseModel):
@@ -523,30 +516,10 @@ class PromptBatchRequest(BaseModel):
     items: List[PromptBatchItemRequest] = Field(default_factory=list)
     title: str = ""
     limit: int = 40
-    auto_trello: bool = False
-    create_etsy_draft: bool = False
-    etsy_only: bool = False
+    auto_erp: bool = False
     run_until_empty: bool = False
     continuous: bool = False
     poll_interval_s: int = 30
-
-
-class ExtensionAutoTrelloPlanRequest(BaseModel):
-    batch: PromptBatchRequest = Field(default_factory=PromptBatchRequest)
-
-
-class ExtensionAutoTrelloImageRequest(BaseModel):
-    data_url: str = ""
-    url: str = ""
-    name: str = ""
-    mime_type: str = ""
-
-
-class ExtensionAutoTrelloArchiveRequest(BaseModel):
-    job: CreateJobRequest = Field(default_factory=lambda: CreateJobRequest(type="image"))
-    item: Dict[str, Any] = Field(default_factory=dict)
-    images: List[ExtensionAutoTrelloImageRequest] = Field(default_factory=list)
-    extension_result: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DownloadRequest(BaseModel):
@@ -556,6 +529,21 @@ class DownloadRequest(BaseModel):
 class ArtifactOpenRequest(BaseModel):
     artifact_index: int = 0
     target: str = "best"
+
+
+class DashboardApprovalRequest(BaseModel):
+    """A review decision made in the local Flow v2 dashboard."""
+
+    status: str = ""
+    reviewer: str = ""
+
+
+class DashboardArtifactAddRequest(BaseModel):
+    """A public image the reviewer adds to an open ERP idea review."""
+
+    url: str = ""
+    label: str = ""
+    reviewer: str = ""
 
 
 class ReplayCleanupRequest(BaseModel):
@@ -627,16 +615,6 @@ class FlowOperatorRequest(BaseModel):
     instruction: str = ""
     context: str = ""
     run_mode: str = "plan"
-
-
-class MasterBotRequest(BaseModel):
-    instruction: str = ""
-    context: str = ""
-    run_mode: str = "plan"
-    auto_trello: bool = False
-    continuous: bool = False
-    limit: int = 0
-    create_etsy_draft: bool = False
 
 
 class StoryboardScene(BaseModel):

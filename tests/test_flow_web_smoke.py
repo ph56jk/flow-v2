@@ -7,12 +7,13 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import AsyncMock, patch
+from typing import Any, Dict
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException, UploadFile
 
@@ -27,20 +28,51 @@ from flow_web.schemas import (
     JobRecord,
     PromptBatchRequest,
     PromptCreateRequest,
-    ResetReadyTrelloRequest,
+    ResetReadyERPRequest,
     SkillRecord,
     StateSnapshot,
     StoryboardPlanRequest,
-    TrelloConfig,
-    TrelloConfigUpdateRequest,
+    ERPConfig,
+    ERPConfigUpdateRequest,
     UserAssistantRequest,
 )
-from flow_web.service import FlowAgentQuotaError, FlowBrowserProfile, FlowWebService, ImageUpscaleResult
+from flow_web.service import (
+    FlowAgentQuotaError,
+    FlowBrowserProfile,
+    FlowWebService,
+    ImageUpscaleResult,
+    RemoveLogoNoWatermarkError,
+    _full_chromium_headless_launcher,
+)
 from flow_web.shot_rules import PRODUCT_SHOT_RULES
+from flow_web.store import (
+    JOB_HISTORY_CEILING,
+    JOB_HISTORY_LIMIT,
+    StateStore,
+    trim_job_history,
+)
+
+
+def _approved(artifacts: JobArtifact | list[JobArtifact]) -> dict[str, Any]:
+    """Job result standing for "the reviewer approved every image".
+
+    The ERP archive refuses to write anything until each artifact carries a
+    dashboard decision, so archive tests have to state the decision they assume.
+    """
+    count = 1 if isinstance(artifacts, JobArtifact) else len(artifacts)
+    return {"dashboard_approvals": {str(index): {"status": "approved"} for index in range(count)}}
+from flow_web.service import FlowAgentFailedError, FlowUiUpscaleUnavailableError
 from flow_web.store import StateStore
 
 
+def _model_dump_for_test(model: Any) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(mode="json")
+    return model.dict()
+
+
 class TempAppPathsMixin:
+
     def start_temp_paths(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
         self.temp_root = Path(self._tempdir.name)
@@ -79,6 +111,7 @@ class TempAppPathsMixin:
 
 
 class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
+
     def setUp(self) -> None:
         self.start_temp_paths()
         self._batch_pause_env = patch.dict(
@@ -93,6 +126,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.addCleanup(self._batch_pause_env.stop)
         self.store = StateStore()
         self.service = FlowWebService(self.store)
+        # The project-membership guard talks to the live ERP. Left unpatched a
+        # unit test fires a real request at production and fails on HTTP 401,
+        # so it is neutral by default; the tests that assert the guard itself
+        # patch it again with their own behaviour.
+        self._assert_task_patch = patch.object(self.service, "_erp_assert_task_in_project")
+        self._assert_task_patch.start()
+        self.addCleanup(self._assert_task_patch.stop)
 
     def test_save_upload_deduplicates_file_name(self) -> None:
         first = UploadFile(filename="demo.jpg", file=io.BytesIO(b"first"))
@@ -137,25 +177,43 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("", specs[0].project_id)
         self.assertEqual("4671337a-b32d-468a-a47a-bac90541ca2e", specs[1].project_id)
 
-    def test_prompt_batch_child_request_syncs_trello_graph_scope_to_item(self) -> None:
+    def test_state_uses_active_flow_profile_project_from_env_when_config_is_empty(self) -> None:
+        profile_dir = self.temp_root / "flow-acc2"
+        project_id = "98b0631c-45ac-4ea1-b735-005c248965c8"
+        with patch.dict(
+            os.environ,
+            {
+                "FLOW_CHROME_PROFILE_DIRS": f"Acc2={profile_dir}",
+                "FLOW_CHROME_PROFILE_PROJECTS": f"Acc2={project_id}",
+                "FLOW_CHROME_PROFILE_COUNT": "",
+            },
+            clear=False,
+        ):
+            state = self.service.get_state()
+
+        self.assertEqual(project_id, state["config"]["project_id"])
+        self.assertEqual(f"https://flow.google.com/project/{project_id}", state["config"]["project_url"])
+        self.assertEqual("Acc2", state["config"]["project_name"])
+
+    def test_prompt_batch_child_request_syncs_erp_graph_scope_to_item(self) -> None:
         base = CreateJobRequest(
             type="image",
             prompt="",
             model="NARWHAL",
-            trello_board_id="board123",
-            trello_card_id="shirt-card",
-            trello_list_id="shirt-list",
-            trello_attachment_ids=["old-att"],
+            erp_project_id="PROJ-0049",
+            erp_task_id="shirt-card",
+            erp_status_id="shirt-list",
+            erp_attachment_ids=["old-att"],
             automation_graph={
                 "modules": [
                     {
-                        "id": "trello-source",
-                        "type": "trello_source",
+                        "id": "erp-source",
+                        "type": "erp_source",
                         "settings": {
-                            "trelloBoard": "board123",
-                            "trelloCard": "shirt-card",
-                            "trelloList": "shirt-list",
-                            "trelloAttachmentIds": ["old-att"],
+                            "erpProject": "board123",
+                            "erpTask": "shirt-card",
+                            "erpStatus": "shirt-list",
+                            "erpAttachmentIds": ["old-att"],
                         },
                     },
                     {
@@ -169,13 +227,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                         },
                     },
                     {
-                        "id": "trello-log",
-                        "type": "trello",
+                        "id": "erp-log",
+                        "type": "erp",
                         "settings": {
-                            "trelloBoard": "board123",
-                            "trelloCard": "shirt-card",
-                            "trelloList": "shirt-list",
-                            "trelloAttachmentIds": ["old-att"],
+                            "erpProject": "board123",
+                            "erpTask": "shirt-card",
+                            "erpStatus": "shirt-list",
+                            "erpAttachmentIds": ["old-att"],
                         },
                     },
                 ]
@@ -186,30 +244,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {
                 "prompt": "new prompt",
                 "flow_agent_instruction": True,
-                "trello_card_id": "ready-card",
-                "trello_list_id": "ready-list",
-                "trello_attachment_ids": ["ready-att"],
+                "erp_task_id": "ready-card",
+                "erp_status_id": "ready-list",
+                "erp_attachment_ids": ["ready-att"],
             },
             0,
             1,
         )
 
-        self.assertEqual("ready-card", child.trello_card_id)
-        self.assertEqual("ready-list", child.trello_list_id)
-        self.assertEqual(["ready-att"], child.trello_attachment_ids)
-        self.assertEqual("ready-card", child.trello_source_card_id)
-        self.assertEqual(["ready-att"], child.trello_source_attachment_ids)
+        self.assertEqual("ready-card", child.erp_task_id)
+        self.assertEqual("ready-list", child.erp_status_id)
+        self.assertEqual(["ready-att"], child.erp_attachment_ids)
+        self.assertEqual("ready-card", child.erp_source_task_id)
+        self.assertEqual(["ready-att"], child.erp_source_attachment_ids)
         self.assertEqual("square", child.aspect)
         self.assertEqual(12, child.count)
         self.assertEqual("GEMINI_3_PRO_IMAGE", child.model)
         self.assertTrue(child.flow_agent_enabled)
         self.assertTrue(child.flow_agent_auto_approve)
         graph = child.automation_graph.model_dump(mode="json")
-        trello_modules = [module for module in graph["modules"] if module["type"] in {"trello_source", "trello"}]
-        for module in trello_modules:
-            self.assertEqual("ready-list", module["settings"]["trelloList"])
-            self.assertEqual("ready-card", module["settings"]["trelloCard"])
-            self.assertEqual(["ready-att"], module["settings"]["trelloAttachmentIds"])
+        erp_modules = [module for module in graph["modules"] if module["type"] in {"erp_source", "erp"}]
+        for module in erp_modules:
+            self.assertEqual("ready-list", module["settings"]["erpStatus"])
+            self.assertEqual("ready-card", module["settings"]["erpTask"])
+            self.assertEqual(["ready-att"], module["settings"]["erpAttachmentIds"])
         flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
         self.assertEqual("square", flow_module["settings"]["imageAspect"])
         self.assertEqual(12, flow_module["settings"]["imageCount"])
@@ -235,7 +293,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "prompt": "finish missing outputs",
                 "flow_agent_instruction": True,
                 "flow_agent_image_count": 2,
-                "trello_card_name": "partial card",
+                "erp_task_name": "partial card",
             },
             0,
             1,
@@ -312,15 +370,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         self.assertFalse(self.service._flow_image_call_uses_selected_image(attached_file_call, "media-source", "workflow-source"))
 
-    def test_auto_trello_generic_title_does_not_filter_ready_cards(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_generic_title_does_not_filter_ready_cards(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "card-1",
                 "shortLink": "short-1",
                 "idList": "ready",
                 "name": "baby pillowcase",
-                "url": "https://trello.example/c/card-1",
+                "url": "https://erp.example/c/card-1",
                 "_image_attachments": [{"id": "att-1", "name": "source.jpg", "mimeType": "image/jpeg"}],
             },
             {
@@ -328,24 +386,24 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "shortLink": "short-2",
                 "idList": "ready",
                 "name": "embroidered apron",
-                "url": "https://trello.example/c/card-2",
+                "url": "https://erp.example/c/card-2",
                 "_image_attachments": [{"id": "att-2", "name": "source.png", "mimeType": "image/png"}],
             },
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(2, len(items))
-        self.assertEqual("", self.service._trello_auto_search_query(request))
-        self.assertEqual({"card-1", "card-2"}, {item["trello_card_id"] for item in items})
+        self.assertEqual("", self.service._erp_auto_search_query(request))
+        self.assertEqual({"card-1", "card-2"}, {item["erp_task_id"] for item in items})
 
-    def test_auto_trello_ready_for_ai_label_does_not_filter_ready_cards(self) -> None:
+    def test_auto_erp_ready_for_ai_label_does_not_filter_ready_cards(self) -> None:
         request = CreateJobRequest(
             type="image",
-            title="Auto AI Trello: chờ sản phẩm mới liên tục",
+            title="Auto AI ERP: chờ sản phẩm mới liên tục",
             prompt_product="phần ready for AI",
             prompt_product_key="phần ready for AI",
-            prompt_notes="Trello search: phần ready for AI",
+            prompt_notes="ERP search: phần ready for AI",
             count=4,
         )
         cards = [
@@ -354,7 +412,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "shortLink": "apron",
                 "idList": "ready",
                 "name": "embroidered apron",
-                "url": "https://trello.example/c/apron",
+                "url": "https://erp.example/c/apron",
                 "_image_attachments": [{"id": "att-apron", "name": "source.jpg", "mimeType": "image/jpeg"}],
             },
             {
@@ -362,18 +420,18 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "shortLink": "pillow",
                 "idList": "ready",
                 "name": "baby pillowcase",
-                "url": "https://trello.example/c/pillow",
+                "url": "https://erp.example/c/pillow",
                 "_image_attachments": [{"id": "att-pillow", "name": "source.png", "mimeType": "image/png"}],
             },
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
-        self.assertEqual("", self.service._trello_auto_search_query(request))
-        self.assertEqual({"card-apron", "card-pillow"}, {item["trello_card_id"] for item in items})
+        self.assertEqual("", self.service._erp_auto_search_query(request))
+        self.assertEqual({"card-apron", "card-pillow"}, {item["erp_task_id"] for item in items})
 
-    def test_auto_trello_card_description_guides_flow_agent_prompt(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_task_description_guides_flow_agent_prompt(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "card-desc",
@@ -384,26 +442,26 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                     "AI NOTE: Personalized embroidered pillowcase named Emma. "
                     "Use a soft pastel nursery scene. Do not change the name Emma."
                 ),
-                "url": "https://trello.example/c/desc",
+                "url": "https://erp.example/c/desc",
                 "_image_attachments": [{"id": "att-desc", "name": "source.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-desc"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         prompt = items[0]["prompt"]
-        self.assertIn("Product-specific notes from the Trello card description", prompt)
+        self.assertIn("Product-specific notes from the ERP card description", prompt)
         self.assertIn("Do not change the name Emma", prompt)
-        self.assertIn("Treat the Trello description as user-supplied product guidance", prompt)
+        self.assertIn("Treat the ERP description as user-supplied product guidance", prompt)
         self.assertIn("baby pillowcase or cushion shape", items[0]["design_analysis"])
         self.assertIn("Hands embroidering pillowcase", items[0]["shot_labels"])
 
-    def test_trello_ai_title_description_block_preserves_existing_description(self) -> None:
+    def test_erp_ai_title_description_block_preserves_existing_description(self) -> None:
         description = "Original buyer notes.\nKeep the flower motif exact."
 
-        updated = self.service._trello_description_with_ai_title(
+        updated = self.service._erp_description_with_ai_title(
             description,
             title="Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
             product_type="Drawstring Bag",
@@ -412,27 +470,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             updated_at="2026-06-08T10:00:00+00:00",
         )
 
-        self.assertIn(description, updated)
-        self.assertIn("AI Suggested Etsy Title:", updated)
+        self.assertEqual(
+            f"{description}\n\nPersonalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+            updated,
+        )
         self.assertIn("Personalized Linen Drawstring Bag with Lavender Embroidery", updated)
-        self.assertIn("AI Product Type:\nDrawstring Bag", updated)
+        self.assertNotIn("AI Suggested Etsy Title:", updated)
+        self.assertNotIn("AI Product Type:", updated)
         self.assertNotIn("AI Embroidery Design:", updated)
         self.assertNotIn("AI Title Status:", updated)
         self.assertNotIn("AI Title Source:", updated)
         self.assertNotIn("AI Title Updated:", updated)
-        self.assertIn(self.service.TRELLO_AI_TITLE_BEGIN_MARKER, updated)
-        self.assertIn(self.service.TRELLO_AI_TITLE_END_MARKER, updated)
+        self.assertNotIn(self.service.ERP_AI_TITLE_BEGIN_MARKER, updated)
+        self.assertNotIn(self.service.ERP_AI_TITLE_END_MARKER, updated)
 
-    def test_trello_ai_title_update_writes_backup_before_description_put(self) -> None:
+    def test_erp_ai_title_update_writes_backup_before_description_put(self) -> None:
         card = {
             "id": "card-title",
             "name": "source product",
             "desc": "Original card description",
-            "url": "https://trello.example/c/card-title",
+            "url": "https://erp.example/c/card-title",
         }
 
-        with patch.object(self.service, "_trello_put_json", return_value={"desc": "updated desc"}) as put_json:
-            result = self.service._write_trello_ai_title_to_description(
+        with patch.object(self.service, "_erp_put_json", return_value={"desc": "updated desc"}) as put_json:
+            result = self.service._write_erp_ai_title_to_description(
                 key="key",
                 token="token",
                 card=card,
@@ -451,10 +512,37 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(backup_path.is_file())
         payload = json.loads(backup_path.read_text(encoding="utf-8"))
         self.assertEqual(1, len(payload))
-        self.assertEqual("card-title", payload[0]["card_id"])
+        self.assertEqual("card-title", payload[0]["task_id"])
         self.assertEqual("Lavender Sprig", payload[0]["embroidery_design"])
         self.assertEqual("Original card description", payload[0]["old_description"])
-        self.assertIn("AI Suggested Etsy Title:", payload[0]["new_description"])
+        self.assertEqual(
+            "Original card description\n\nPersonalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+            payload[0]["new_description"],
+        )
+        self.assertNotIn("AI Suggested Etsy Title:", payload[0]["new_description"])
+        self.assertNotIn("AI Product Type:", payload[0]["new_description"])
+        self.assertNotIn(self.service.ERP_AI_TITLE_BEGIN_MARKER, payload[0]["new_description"])
+        self.assertNotIn(self.service.ERP_AI_TITLE_END_MARKER, payload[0]["new_description"])
+
+    def test_erp_ai_title_title_only_backup_prevents_duplicate_append(self) -> None:
+        card = {
+            "id": "card-title",
+            "name": "source product",
+            "desc": "Original card description\n\nPersonalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+            "url": "https://erp.example/c/card-title",
+        }
+        self.service._write_erp_ai_title_description_backup(
+            task_id="card-title",
+            task_name="source product",
+            task_url="https://erp.example/c/card-title",
+            old_description="Original card description",
+            new_description=card["desc"],
+            title="Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
+            product_type="Drawstring Bag",
+            embroidery_design="Lavender Sprig",
+        )
+
+        self.assertFalse(self.service._erp_should_write_ai_title_description(card))
 
     def test_ai_title_enforces_visible_embroidery_design_in_title(self) -> None:
         title = self.service._title_with_embroidery_design(
@@ -467,8 +555,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Drawstring Bag", title)
 
     def test_ai_title_fallback_uses_embroidery_design_from_context(self) -> None:
-        payload = self.service._fallback_trello_product_title(
-            card_name="lavender daisy drawstring bag",
+        payload = self.service._fallback_erp_product_title(
+            task_name="lavender daisy drawstring bag",
             attachment_name="pale_sage_linen_lavender_daisy_drawstring_bag.jpeg",
             product_rule_key="drawstring_bag",
             visible_product="linen drawstring bag with lavender daisy embroidery",
@@ -479,8 +567,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Drawstring Bag", payload["title"])
 
     def test_ai_title_fallback_ignores_personalized_name_as_design(self) -> None:
-        payload = self.service._fallback_trello_product_title(
-            card_name="Custom order for Emma",
+        payload = self.service._fallback_erp_product_title(
+            task_name="Custom order for Emma",
             attachment_name="emma_personalized_name_linen_drawstring_bag.jpeg",
             product_rule_key="drawstring_bag",
             visible_product="linen drawstring bag with embroidered name Emma",
@@ -500,52 +588,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Emma", title)
         self.assertIn("Hand Embroidered Linen Drawstring Bag", title)
 
-    def test_auto_trello_ai_title_missing_gemini_records_error_on_item(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
-        card = {
-            "id": "card-no-gemini-title",
-            "shortLink": "no-gemini-title",
-            "idList": "ready",
-            "name": "embroidered drawstring pouch",
-            "desc": "Buyer note: handmade linen bag.",
-            "url": "https://trello.example/c/no-gemini-title",
-            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag.jpeg", "mimeType": "image/jpeg"}],
-            "_selected_attachment_ids": ["att-title"],
-        }
 
-        with patch.object(self.service, "_gemini_api_key", return_value=""):
-            items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
 
-        self.assertEqual(1, len(items))
-        self.assertIn("Gemini", card["_ai_title_error"])
-        self.assertIn("Gemini", items[0]["ai_title_error"])
-        self.assertEqual("", items[0]["ai_suggested_title"])
-        self.assertIn("Drawstring Bag category", items[0]["design_analysis"])
 
-    def test_auto_trello_enrichment_writes_ai_title_to_description(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+    def test_auto_erp_enrichment_never_rewrites_the_erp_description(self) -> None:
+        """ERP write-back is append-only.
+
+        Visual analysis is allowed to shape the Flow prompt, but the Task
+        description belongs to whoever wrote it — the app only ever appends
+        comments, so no enrichment may PUT over it.
+        """
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         card = {
             "id": "card-ai-title",
             "shortLink": "ai-title",
             "idList": "ready",
             "name": "Sage_green_linen_drawstring_bag.jpeg",
             "desc": "Buyer note: keep lavender embroidery.",
-            "url": "https://trello.example/c/ai-title",
+            "url": "https://erp.example/c/ai-title",
             "_image_attachments": [{"id": "att-title", "name": "drawstring_bag.jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["att-title"],
         }
 
-        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+        with patch.dict(os.environ, {"FLOW_AI_TITLE_ENABLED": "1"}), patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
             self.service,
-            "_trello_credentials",
-            return_value=("trello-key", "trello-token"),
+            "_erp_credentials",
+            return_value=("erp-key", "erp-token"),
         ), patch.object(
             self.service,
-            "_trello_download_attachment_bytes",
+            "_erp_download_attachment_bytes",
             return_value=(b"image-bytes", "image/jpeg"),
         ), patch.object(
             self.service,
-            "_gemini_classify_trello_source_product_rule",
+            "_gemini_classify_erp_source_product_rule",
             return_value={
                 "product_rule_key": "drawstring_bag",
                 "confidence": 0.95,
@@ -554,87 +629,28 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             },
         ), patch.object(
             self.service,
-            "_gemini_suggest_trello_product_title",
-            return_value={
-                "title": "Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
-                "product_type": "Drawstring Bag",
-                "reason": "source is an embroidered pouch",
-            },
-        ) as suggest_title, patch.object(
-            self.service,
-            "_trello_put_json",
-            return_value={"desc": "Buyer note: keep lavender embroidery.\n\nAI Suggested Etsy Title:"},
+            "_erp_put_json",
         ) as put_json:
             self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
 
-        suggest_title.assert_called_once()
-        put_json.assert_called_once()
+        put_json.assert_not_called()
         self.assertEqual("drawstring_bag", card["_visual_product_rule_key"])
-        self.assertIn("Personalized Linen Drawstring Bag", card["_ai_suggested_title"])
-        self.assertTrue(Path(card["_ai_title_backup_path"]).is_file())
 
-    def test_auto_trello_ai_title_falls_back_when_gemini_returns_no_text(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
-        card = {
-            "id": "card-ai-title-fallback",
-            "shortLink": "ai-title-fallback",
-            "idList": "ready",
-            "name": "Hand-embroidered_drawstring_bag_pale_sage.jpeg",
-            "desc": "",
-            "url": "https://trello.example/c/ai-title-fallback",
-            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag_pale_sage.jpeg", "mimeType": "image/jpeg"}],
-            "_selected_attachment_ids": ["att-title"],
-        }
-
-        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
-            self.service,
-            "_trello_credentials",
-            return_value=("trello-key", "trello-token"),
-        ), patch.object(
-            self.service,
-            "_trello_download_attachment_bytes",
-            return_value=(b"image-bytes", "image/jpeg"),
-        ), patch.object(
-            self.service,
-            "_gemini_classify_trello_source_product_rule",
-            return_value={
-                "product_rule_key": "drawstring_bag",
-                "confidence": 0.95,
-                "visible_product": "embroidered linen drawstring bag",
-                "reason": "visible pouch with cords",
-            },
-        ), patch.object(
-            self.service,
-            "_gemini_suggest_trello_product_title",
-            side_effect=RuntimeError("Gemini không trả về nội dung AI product title."),
-        ), patch.object(
-            self.service,
-            "_trello_put_json",
-            return_value={"desc": "AI Suggested Etsy Title:"},
-        ) as put_json:
-            self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
-
-        put_json.assert_called_once()
-        self.assertIn("Hand Embroidered", card["_ai_suggested_title"])
-        self.assertIn("Drawstring Bag", card["_ai_suggested_title"])
-        self.assertIn("_ai_title_fallback_reason", card)
-        self.assertTrue(Path(card["_ai_title_backup_path"]).is_file())
-
-    def test_auto_trello_pennant_card_keeps_banner_category(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_pennant_card_keeps_banner_category(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "card-pennant",
                 "shortLink": "pennant",
                 "idList": "ready",
                 "name": "Small_pennant-shaped_white_linen_nursery_202605260834.jpeg",
-                "url": "https://trello.example/c/pennant",
+                "url": "https://erp.example/c/pennant",
                 "_image_attachments": [{"id": "att-pennant", "name": "small_pennant_bear_noah.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-pennant"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -667,10 +683,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             item["shot_labels"],
         )
 
-    def test_auto_trello_user_pennant_instruction_overrides_generic_card_name(self) -> None:
+    def test_auto_erp_user_pennant_instruction_overrides_generic_card_name(self) -> None:
         request = CreateJobRequest(
             type="image",
-            title="Auto image from Trello card",
+            title="Auto image from ERP card",
             count=4,
             prompt=(
                 "Tạo 12 ảnh riêng biệt cho chiếc cờ vải treo trang trí em bé giống chính xác ảnh tham khảo. "
@@ -684,13 +700,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "shortLink": "generic",
                 "idList": "ready",
                 "name": "Detailed_hand-embroidery_on_a_white_202605261049.jpeg",
-                "url": "https://trello.example/c/generic",
+                "url": "https://erp.example/c/generic",
                 "_image_attachments": [{"id": "att-generic", "name": "source.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-generic"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -701,6 +717,32 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Pastel fabric colorway lineup", item["shot_labels"])
         self.assertEqual("Banner image 1 Mẹ và bé chạm vào cờ thêu tên", item["shot_labels"][0])
         self.assertEqual("Banner image 12 Cờ trong hộp quà mở", item["shot_labels"][-1])
+
+    def test_embroidered_socks_rule_has_twelve_operator_shots(self) -> None:
+        rule = PRODUCT_SHOT_RULES["embroidered_socks"]
+        self.assertEqual("Embroidered Socks", rule["display_name"])
+        self.assertEqual(12, rule["target_count"])
+        self.assertEqual(12, len(rule["shots"]))
+        self.assertEqual("embroidered_socks", self.service._flow_operator_product_rule_key_from_text("Embroidered Socks"))
+        self.assertEqual("embroidered_socks", self.service._flow_operator_product_rule_key_from_text("tất thêu giáng sinh"))
+        # Punch-needle stocking cards keep their own rule.
+        self.assertEqual("pc_stocks", self.service._flow_operator_product_rule_key_from_text("Punch Needle Christmas Stocking"))
+        labels = [shot[0] for shot in rule["shots"]]
+        self.assertEqual("Christmas tree branch", labels[0])
+        self.assertEqual("Three colorways on wall hooks", labels[9])
+        self.assertEqual("Inside view from above", labels[-1])
+        briefs = " ".join(shot[2] for shot in rule["shots"])
+        self.assertIn("bulge naturally", briefs)
+        self.assertIn("no yellow cast", briefs)
+        self.assertIn("the thread through the needle's eye", briefs)
+        self.assertIn("rather than hanging on the tree", briefs)
+        self.assertIn("plain unembroidered cotton linen", briefs)
+        self.assertNotIn("collage", rule["shots"][1][2].split("Overall style")[0])
+        shots = self.service._flow_operator_product_rule_shot_suite("embroidered_socks")
+        self.assertEqual(12, len(shots))
+        self.assertIn("Product/category lock", shots[0]["brief"])
+        qa_prompt = self.service._erp_source_qa_prompt(CreateJobRequest(type="image", title="child", prompt="x", prompt_product="Embroidered Socks"))
+        self.assertIn("(d) an intentional interior or inside view", qa_prompt)
 
     def test_havi_product_shot_rules_supply_twelve_safe_shots_for_each_product(self) -> None:
         for product_key, rule in PRODUCT_SHOT_RULES.items():
@@ -731,21 +773,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("clearly visible wall hook", by_index[8])
         self.assertNotIn("clearly visible wall hook", by_index[12])
 
-    def test_auto_trello_uses_havi_plush_shot_rules_from_excel(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4, prompt="Gấu bông")
+    def test_auto_erp_uses_havi_plush_shot_rules_from_excel(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4, prompt="Gấu bông")
         cards = [
             {
                 "id": "card-plush",
                 "shortLink": "plush",
                 "idList": "ready",
                 "name": "Personalized_teddy_bear_gau_bong_202605261012.jpeg",
-                "url": "https://trello.example/c/plush",
+                "url": "https://erp.example/c/plush",
                 "_image_attachments": [{"id": "att-plush", "name": "gau_bong_teddy.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-plush"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -756,21 +798,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("HAVI product shot rule lock", item["prompt"])
         self.assertNotIn("Full doll/plush product", item["prompt"])
 
-    def test_auto_trello_uses_havi_tooth_fairy_pillow_shot_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=10, prompt="goi rang")
+    def test_auto_erp_uses_havi_tooth_fairy_pillow_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=10, prompt="goi rang")
         cards = [
             {
                 "id": "card-tooth-pillow",
                 "shortLink": "tooth-pillow",
                 "idList": "ready",
                 "name": "goi rang tooth fairy pillow",
-                "url": "https://trello.example/c/tooth-pillow",
+                "url": "https://erp.example/c/tooth-pillow",
                 "_image_attachments": [{"id": "att-tooth", "name": "tooth_fairy_pillow.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-tooth"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
         all_rule_shots = self.service._flow_operator_product_rule_shot_suite("tooth_fairy_pillow")
 
         self.assertEqual(1, len(items))
@@ -791,21 +833,120 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Supplemental", " ".join(item["shot_labels"]))
         self.assertNotIn("Baby Pillowcase category", item["design_analysis"])
 
-    def test_auto_trello_uses_havi_baby_album_shot_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12, prompt="baby album")
+    def test_auto_erp_uses_havi_baby_christmas_album_shot_rules(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            title="Auto image from ERP card",
+            count=12,
+            prompt="Baby Christmas Album",
+        )
+        cards = [
+            {
+                "id": "card-baby-christmas-album",
+                "shortLink": "baby-christmas-album",
+                "idList": "ready",
+                "name": "Baby Christmas Album",
+                "url": "https://erp.example/c/baby-christmas-album",
+                "_image_attachments": [
+                    {"id": "att-album", "name": "baby_christmas_album.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-album"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("baby_christmas_album")
+
+        self.assertEqual("baby_christmas_album", self.service._flow_operator_product_rule_key_from_text("Baby Christmas Album"))
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Baby Christmas Album category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Baby Christmas Album", item["prompt"])
+        self.assertEqual(
+            "Baby Christmas Album image 1 Christmas welcome table with closed and open albums",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Baby Christmas Album image 12 Woman hands embroidering matching cover motif",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("exactly two horizontal photos per visible page", item["prompt"])
+        self.assertIn("Santa hat", item["prompt"])
+        self.assertIn("exactly four horizontal photos total", item["prompt"])
+        self.assertIn("The needle eye must visibly contain thread", item["prompt"])
+        self.assertIn("Never use a yellow, amber, dark, or moody cast", item["prompt"])
+        self.assertIn("The explicitly numbered close-up detail collage shot is the only allowed four-panel image", item["prompt"])
+        self.assertNotIn("Baby Album category", item["design_analysis"])
+
+    def test_auto_erp_uses_havi_christmas_album_shot_rules(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            title="Auto image from ERP card",
+            count=12,
+            prompt="Christmas Album",
+        )
+        cards = [
+            {
+                "id": "card-christmas-album",
+                "shortLink": "christmas-album",
+                "idList": "ready",
+                "name": "Christmas Album (12).jpeg",
+                "url": "https://erp.example/c/christmas-album",
+                "_image_attachments": [
+                    {"id": "att-album", "name": "christmas_album.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-album"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("christmas_album")
+
+        self.assertEqual("christmas_album", self.service._flow_operator_product_rule_key_from_text("Christmas Album"))
+        self.assertEqual(
+            "christmas_album",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Album (12).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Christmas Album category", item["design_analysis"])
+        self.assertNotIn("Baby Christmas Album category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Christmas Album", item["prompt"])
+        self.assertEqual(
+            "Christmas Album image 1 Dark coffee table with tea on Christmas morning",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Christmas Album image 12 Premium album on bright Christmas table",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("steaming cup of tea", item["prompt"])
+        self.assertIn("exactly two horizontal photos", item["prompt"])
+        self.assertIn("two different cover fabric colors", item["prompt"])
+        self.assertIn("same embroidery design, placement, scale", item["prompt"])
+        self.assertIn("needle eye must visibly contain thread", item["prompt"])
+        self.assertIn("completely free of a yellow cast", item["prompt"])
+        self.assertIn("only allowed four-panel image", item["prompt"])
+
+    def test_auto_erp_uses_havi_baby_album_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12, prompt="baby album")
         cards = [
             {
                 "id": "card-baby-album",
                 "shortLink": "baby-album",
                 "idList": "ready",
                 "name": "hand_embroidered_baby_album_first_birthday",
-                "url": "https://trello.example/c/baby-album",
+                "url": "https://erp.example/c/baby-album",
                 "_image_attachments": [{"id": "att-album", "name": "baby_photo_album.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-album"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
         all_rule_shots = self.service._flow_operator_product_rule_shot_suite("baby_album")
 
         self.assertEqual(1, len(items))
@@ -828,21 +969,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("show a baby sitting on a sofa and looking through the album interior photo pages", item["prompt"])
         self.assertNotIn("Guest Book category", item["design_analysis"])
 
-    def test_auto_trello_uses_havi_crown_shot_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+    def test_auto_erp_uses_havi_crown_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         cards = [
             {
                 "id": "card-crown",
                 "shortLink": "crown",
                 "idList": "ready",
                 "name": "Olive_green_linen_crown_with_202606050851.jpeg",
-                "url": "https://trello.example/c/crown",
+                "url": "https://erp.example/c/crown",
                 "_image_attachments": [{"id": "att-crown", "name": "olive_green_linen_crown.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-crown"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -855,21 +996,444 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("pom-pom or felt-ball tips", item["prompt"])
         self.assertNotIn("Fabric Cross category", item["design_analysis"])
 
-    def test_auto_trello_uses_havi_drawstring_bag_shot_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+    def test_auto_erp_uses_havi_birthday_hat_fallback_rule(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        cards = [
+            {
+                "id": "card-birthday-hat",
+                "shortLink": "birthday-hat",
+                "idList": "ready",
+                "name": "mu_sinh_nhat_linen_theu_tay.jpeg",
+                "url": "https://erp.example/c/birthday-hat",
+                "_image_attachments": [{"id": "att-hat", "name": "birthday_hat_linen.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-hat"],
+            }
+        ]
+
+        signals = self.service._flow_operator_card_product_signals(request, cards[0])
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual("birthday_hat", signals["product_rule_key"])
+        self.assertEqual(1, len(items))
+        item = items[0]
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("birthday_hat")
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertIn("Birthday Hat category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Birthday Hat", item["prompt"])
+        self.assertEqual("Birthday Hat image 1 White wood birthday tabletop", item["shot_labels"][0])
+        self.assertIn("Birthday Hat image 6 Square close-up detail infographic", item["shot_labels"])
+        self.assertIn("Birthday Hat image 8 Four-panel birthday hat making process", item["shot_labels"])
+        self.assertIn("Birthday Hat image 11 Birthday hat on cake pedestal beside cake", item["shot_labels"])
+        self.assertEqual("Birthday Hat image 12 Birthday hat on round wood pedestal with linen drape", item["shot_labels"][-1])
+        self.assertNotIn("Supplemental", " ".join(item["shot_labels"]))
+        self.assertIn("Infographic text exception", item["prompt"])
+        self.assertIn("Only the explicitly numbered infographic, detail, or process shots", item["prompt"])
+        self.assertIn("Chi tiet can canh", item["prompt"])
+        self.assertIn("birthday hat, it must remain the same linen birthday hat", item["prompt"])
+        self.assertIn("pom-pom or felt-ball details", item["prompt"])
+        self.assertIn("Detected occasion/season: First birthday", item["prompt"])
+        self.assertIn("small cake or cake pedestal", item["prompt"])
+        self.assertNotIn("never make a collage", item["prompt"])
+        self.assertNotIn("Crown category", item["design_analysis"])
+
+    def test_auto_erp_adapts_decor_to_halloween_bag_context(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=14)
+        cards = [
+            {
+                "id": "card-halloween-bag",
+                "shortLink": "halloween-bag",
+                "idList": "ready",
+                "name": "Halloween trick or treat linen candy bag",
+                "url": "https://erp.example/c/halloween-bag",
+                "_image_attachments": [{"id": "att-halloween", "name": "trick_or_treat_bag.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-halloween"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Halloween Treat Bag category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Halloween Treat Bag", item["prompt"])
+        self.assertIn("Detected occasion/season: Halloween", item["prompt"])
+        self.assertIn("mini pumpkins", item["prompt"])
+        self.assertIn("wrapped candy in orange/black/purple", item["prompt"])
+
+    def test_auto_erp_uses_havi_halloween_pillow_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        cards = [
+            {
+                "id": "card-halloween-pillow",
+                "shortLink": "halloween-pillow",
+                "idList": "ready",
+                "name": "Halloween baby pillow with wool embroidery",
+                "url": "https://erp.example/c/halloween-pillow",
+                "_image_attachments": [{"id": "att-pillow", "name": "halloween_pillow_source.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-pillow"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("halloween_pillow")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Halloween Pillow category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Halloween Pillow", item["prompt"])
+        self.assertEqual("Halloween Pillow image 1 Two Halloween pillows on white rug with pumpkins", item["shot_labels"][0])
+        self.assertEqual("Halloween Pillow image 12 Pillow on sofa with airy Halloween decor", item["shot_labels"][-1])
+        self.assertIn("pink gingham and blue gingham", item["prompt"])
+        self.assertIn("2x2 grid collage", item["prompt"])
+        self.assertIn("wool embroidery thread", item["prompt"])
+        self.assertIn("baby teepee", item["prompt"])
+        self.assertIn("large sharp wool embroidery needle with a wooden handle", item["prompt"])
+        self.assertIn("Detected occasion/season: Halloween", item["prompt"])
+        self.assertNotIn("Halloween Treat Bag category", item["design_analysis"])
+
+    def test_auto_erp_uses_christmas_pillowcase_before_generic_pillow_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        cards = [
+            {
+                "id": "card-christmas-pillowcase",
+                "shortLink": "christmas-pillowcase",
+                "idList": "ready",
+                "name": "Christmas Pillowcase (12).jpeg",
+                "url": "https://erp.example/c/christmas-pillowcase",
+                "_image_attachments": [
+                    {"id": "att-pillow", "name": "punch_needle_christmas_pillow.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-pillow"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("christmas_pillowcase")
+
+        self.assertEqual(
+            "christmas_pillowcase",
+            self.service._flow_operator_product_rule_key_from_text("Christmas Pillowcase"),
+        )
+        self.assertEqual(
+            "christmas_pillowcase",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Pillowcase (12).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Christmas Pillowcase category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Christmas Pillowcase", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Baby Pillowcase uses", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Linen Pillowcase uses", item["prompt"])
+        self.assertEqual(
+            "Christmas Pillowcase image 1 Two coordinated Christmas pillows on soft white rug",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Christmas Pillowcase image 12 Front-facing pillow on sofa with Santa decorations",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("preserve exactly four corner pompoms on each pillow", item["prompt"])
+        self.assertIn("if the source has no pompoms, never add any pompoms", item["prompt"])
+        self.assertIn("if the source has no name, never add one", item["prompt"])
+        self.assertIn("exactly four macro photographs", item["prompt"])
+        self.assertIn("large sharp wooden-handled punch needle", item["prompt"])
+        self.assertIn("wool yarn visibly threaded through the rear or tail", item["prompt"])
+        self.assertNotIn("Detected occasion/season: Halloween", item["prompt"])
+
+    def test_auto_erp_adapts_decor_to_christmas_context(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        cards = [
+            {
+                "id": "card-christmas-bag",
+                "shortLink": "christmas-bag",
+                "idList": "ready",
+                "name": "Christmas Noel linen drawstring gift bag",
+                "desc": "Holiday listing photos for Christmas gift packaging with clean white daylight.",
+                "url": "https://erp.example/c/christmas-bag",
+                "_image_attachments": [{"id": "att-bag", "name": "embroidered_drawstring_pouch.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-bag"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertIn("Drawstring Bag category", item["design_analysis"])
+        self.assertIn("Detected occasion/season: Christmas", item["prompt"])
+        self.assertIn("evergreen sprigs", item["prompt"])
+        self.assertIn("matte ornaments", item["prompt"])
+        self.assertNotIn("Detected occasion/season: Halloween", item["prompt"])
+
+    def test_auto_erp_uses_pc_stocks_punch_needle_shot_rules(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            title="Auto image from ERP card",
+            count=12,
+            prompt="PC Stocks",
+        )
+        cards = [
+            {
+                "id": "card-pc-stocks",
+                "shortLink": "pc-stocks",
+                "idList": "ready",
+                "name": "PC Stocks (12).jpeg",
+                "url": "https://erp.example/c/pc-stocks",
+                "_image_attachments": [
+                    {"id": "att-stocking", "name": "punch_needle_christmas_stocking.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-stocking"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("pc_stocks")
+
+        self.assertEqual("pc_stocks", self.service._flow_operator_product_rule_key_from_text("PC Stocks"))
+        self.assertEqual(
+            "pc_stocks",
+            self.service._flow_operator_card_name_product_rule_key("PC Stocks (12).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("PC Stocks category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: PC Stocks", item["prompt"])
+        self.assertEqual(
+            "PC Stocks image 1 Stocking hanging on real Christmas tree branch",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "PC Stocks image 12 Hand-held close-up showing flat one-sided construction",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("thick raised wool punch-needle loop texture", item["prompt"])
+        self.assertIn("flat, one-sided decorative stocking panel", item["prompt"])
+        self.assertIn("no opening, pocket, interior cavity, or storage function", item["prompt"])
+        self.assertNotIn("looking naturally into the opening", item["prompt"])
+        self.assertNotIn("Fill it with small gifts", item["prompt"])
+        self.assertIn("large punch needle with a wooden handle", item["prompt"])
+        self.assertIn("one navy stocking, one forest-green stocking, and one deep-red stocking", item["prompt"])
+        self.assertIn("exactly five flat one-sided decorative stockings", item["prompt"])
+        self.assertIn("natural ivory, dusty pink, soft sage green, navy blue, and deep Christmas red", item["prompt"])
+        self.assertNotIn("Size Chart", item["prompt"])
+        self.assertNotIn("Cuff Width", item["prompt"])
+        self.assertNotIn("Foot Width", item["prompt"])
+        self.assertNotIn("Overall Height", item["prompt"])
+        self.assertNotIn("Infographic text exception", item["prompt"])
+        self.assertIn("Detected occasion/season: Christmas", item["prompt"])
+        self.assertNotIn("Ornament Round category", item["design_analysis"])
+
+    def test_auto_erp_uses_napkin_set_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=10)
+        cards = [
+            {
+                "id": "card-napkin-set",
+                "shortLink": "napkin-set",
+                "idList": "ready",
+                "name": "Napkin Set (6).jpeg",
+                "url": "https://erp.example/c/napkin-set",
+                "_image_attachments": [
+                    {"id": "att-napkins", "name": "white_linen_fall_napkins.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-napkins"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("napkin_set")
+
+        self.assertEqual("napkin_set", self.service._flow_operator_product_rule_key_from_text("Napkin Set"))
+        self.assertEqual("napkin_set", self.service._flow_operator_product_rule_key_from_text("fall linen napkins"))
+        self.assertEqual(
+            "napkin_set",
+            self.service._flow_operator_card_name_product_rule_key("Napkin Set (6).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(10, len(shots))
+        self.assertEqual(10, item["flow_agent_image_count"])
+        self.assertIn("Napkin Set category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Napkin Set", item["prompt"])
+        self.assertEqual(
+            "Napkin Set image 1 Single embroidered napkin centered on white dinner plate",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Napkin Set image 10 Aligned embroidered corners on white wood table",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("exactly six handmade white linen dinner napkins", item["prompt"])
+        self.assertIn("Never repeat one motif across several napkins", item["prompt"])
+        self.assertIn("one source napkin on each plate", item["prompt"])
+        self.assertIn("realistically threaded needle", item["prompt"])
+        self.assertIn("No collage, contact sheet, grid", item["prompt"])
+
+    def test_auto_erp_uses_halloween_banner_shot_rules_before_generic_banner(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=14)
+        cards = [
+            {
+                "id": "card-halloween-banner",
+                "shortLink": "halloween-banner",
+                "idList": "ready",
+                "name": "Halloween Banner (14).jpeg",
+                "url": "https://erp.example/c/halloween-banner",
+                "_image_attachments": [
+                    {"id": "att-banner", "name": "hand_embroidered_halloween_linen_banner.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-banner"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("halloween_banner")
+
+        self.assertEqual("halloween_banner", self.service._flow_operator_product_rule_key_from_text("Halloween Banner"))
+        self.assertEqual(
+            "halloween_banner",
+            self.service._flow_operator_card_name_product_rule_key("Halloween Banner (14).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Halloween Banner category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Halloween Banner", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Banner uses", item["prompt"])
+        self.assertEqual(
+            "Halloween Banner image 1 Small banner centered above decorated crib",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Halloween Banner image 12 Small banner hanging naturally on wardrobe or room door",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("same wooden hanging rod", item["prompt"])
+        self.assertIn("realistically small relative to doors, wardrobes, cribs", item["prompt"])
+        self.assertIn('exact words "Happy Halloween"', item["prompt"])
+        self.assertIn("exactly four macro photographs", item["prompt"])
+        self.assertIn("hand-stitched thread relief and linen fibers", item["prompt"])
+
+    def test_auto_erp_uses_ornament_round_christmas_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=14)
+        cards = [
+            {
+                "id": "card-ornament-round",
+                "shortLink": "ornament-round",
+                "idList": "ready",
+                "name": "Ornament_Round Christmas embroidered linen keepsake",
+                "url": "https://erp.example/c/ornament-round",
+                "_image_attachments": [{"id": "att-ornament", "name": "round_christmas_ornament.jpeg", "mimeType": "image/jpeg"}],
+                "_selected_attachment_ids": ["att-ornament"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        all_rule_shots = self.service._flow_operator_product_rule_shot_suite("ornament_round")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(all_rule_shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Ornament Round category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Ornament Round", item["prompt"])
+        self.assertEqual("Ornament Round image 1 Round ornament on white wood table with pine branch", item["shot_labels"][0])
+        self.assertEqual("Ornament Round image 12 Four-panel macro of embroidery frame and clasp", item["shot_labels"][-1])
+        self.assertIn("Detected occasion/season: Christmas", item["prompt"])
+        self.assertIn("Merry Christmas", item["prompt"])
+        self.assertIn("Planned prop text exception", item["prompt"])
+        self.assertIn("metal clasp or fastener", item["prompt"])
+        self.assertIn("raised hand-stitch texture", item["prompt"])
+        self.assertIn("four-panel process collage", item["prompt"])
+        self.assertNotIn("Wedding Hoop category", item["design_analysis"])
+
+    def test_auto_erp_reads_an_ornament_board_named_in_vietnamese(self) -> None:
+        # Bảng thật PROJ-0018 tên "XMAS Ornament Thêu Tròn" — không có chữ
+        # "round" nào, nên bộ alias sinh từ Excel không khớp và cả bảng đứng im.
+        self.assertEqual(
+            "ornament_round",
+            self.service._flow_operator_product_rule_key_from_text("XMAS Ornament Thêu Tròn"),
+        )
+        self.assertEqual(
+            "ornament_round",
+            self.service._flow_operator_product_rule_key_from_text("ornament theu tron"),
+        )
+        self.assertEqual(
+            "ornament_round",
+            self.service._flow_operator_card_name_product_rule_key("XMAS Ornament Thêu Tròn"),
+        )
+        self.assertEqual(12, self.service._flow_operator_product_rule_target_count("ornament_round"))
+
+    def test_auto_erp_ornament_card_name_beats_a_filename_that_says_hoop(self) -> None:
+        # Bẫy thật trên PROJ-0018: ảnh nguồn tên
+        # ``Embroidered_church_on_hoop_ornament_...`` nên đường chữ khớp
+        # ``wedding_hoop`` — 12 ảnh, sai bộ shot — trong khi bảng là ornament
+        # tròn 14 ảnh.  Tên thẻ phải thắng cái tên file.
+        card = {
+            "id": "TASK-2026-01006",
+            "shortLink": "TASK-2026-01006",
+            "idList": "open",
+            "name": "Idea XMAS Ornament Thêu Tròn",
+            "url": "https://erp.example/c/ornament-vn",
+            "_image_attachments": [
+                {
+                    "id": "att-ornament-vn",
+                    "name": "Embroidered_church_on_hoop_ornament_202607161015.jpeg",
+                    "mimeType": "image/jpeg",
+                }
+            ],
+            "_selected_attachment_ids": ["att-ornament-vn"],
+        }
+        request = CreateJobRequest(type="image", title="Auto image from ERP card")
+
+        signals = self.service._flow_operator_card_product_signals(request, card)
+
+        self.assertEqual("ornament_round", signals["product_rule_key"])
+
+    def test_auto_erp_birthday_hat_text_overrides_crown_visual_fallback(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        card = {
+            "id": "card-birthday-hat-visual",
+            "shortLink": "birthday-hat-visual",
+            "idList": "ready",
+            "name": "mu_sinh_nhat_linen_theu_tay.jpeg",
+            "url": "https://erp.example/c/birthday-hat-visual",
+            "_image_attachments": [{"id": "att-hat", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-hat"],
+            "_visual_product_rule_key": "crown",
+            "_visual_product_rule_confidence": 0.92,
+            "_visual_product_rule_visible_product": "soft fabric crown-like birthday hat",
+        }
+
+        signals = self.service._flow_operator_card_product_signals(request, card)
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual("birthday_hat", signals["product_rule_key"])
+        self.assertEqual(1, len(items))
+        self.assertIn("Birthday Hat category", items[0]["design_analysis"])
+        self.assertNotIn("Crown category", items[0]["design_analysis"])
+
+    def test_auto_erp_uses_havi_drawstring_bag_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         cards = [
             {
                 "id": "card-drawstring-bag",
                 "shortLink": "drawstring-bag",
                 "idList": "ready",
                 "name": "Sage_green_linen_drawstring_bag_tui_rut_day_202606080915.jpeg",
-                "url": "https://trello.example/c/drawstring-bag",
+                "url": "https://erp.example/c/drawstring-bag",
                 "_image_attachments": [{"id": "att-bag", "name": "embroidered_drawstring_pouch.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-bag"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
         all_rule_shots = self.service._flow_operator_product_rule_shot_suite("drawstring_bag")
 
         self.assertEqual(1, len(items))
@@ -891,21 +1455,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("not a hoop product", item["prompt"])
         self.assertNotIn("Banner category", item["design_analysis"])
 
-    def test_auto_trello_uses_havi_passport_cover_shot_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+    def test_auto_erp_uses_havi_passport_cover_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         cards = [
             {
                 "id": "card-passport-cover",
                 "shortLink": "passport-cover",
                 "idList": "ready",
                 "name": "Bọc passport",
-                "url": "https://trello.example/c/passport-cover",
+                "url": "https://erp.example/c/passport-cover",
                 "_image_attachments": [{"id": "att-passport", "name": "doi_Cozy_Lodge_thanh_ten_202606060853.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-passport"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
         all_rule_shots = self.service._flow_operator_product_rule_shot_suite("passport_cover")
 
         self.assertEqual(1, len(items))
@@ -923,21 +1487,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Drawstring Bag category", item["design_analysis"])
         self.assertNotIn("Show one single cotton linen drawstring bag standing naturally", item["prompt"])
 
-    def test_auto_trello_uses_havi_hair_bow_shot_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+    def test_auto_erp_uses_havi_hair_bow_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         cards = [
             {
                 "id": "card-hair-bow",
                 "shortLink": "hair-bow",
                 "idList": "ready",
                 "name": "no_buoc_toc_theu_tay_linen_202606090812.jpeg",
-                "url": "https://trello.example/c/hair-bow",
+                "url": "https://erp.example/c/hair-bow",
                 "_image_attachments": [{"id": "att-hair-bow", "name": "embroidered_hair_tie_bow.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-hair-bow"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
         all_rule_shots = self.service._flow_operator_product_rule_shot_suite("hair_bow")
 
         self.assertEqual(1, len(items))
@@ -962,15 +1526,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Passport Cover category", item["design_analysis"])
         self.assertNotIn("Drawstring Bag category", item["design_analysis"])
 
-    def test_auto_trello_visual_product_rule_overrides_random_card_name(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+    def test_auto_erp_visual_product_rule_overrides_random_card_name(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         cards = [
             {
                 "id": "card-dress",
                 "shortLink": "dress",
                 "idList": "ready",
                 "name": "A_single_white_linen_pillow_202605271042.jpeg",
-                "url": "https://trello.example/c/dress",
+                "url": "https://erp.example/c/dress",
                 "_image_attachments": [{"id": "att-dress", "name": "source.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-dress"],
                 "_visual_product_rule_key": "dress_baby",
@@ -979,7 +1543,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -996,21 +1560,130 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("This lovely cotton linen children's dress", item["prompt"])
         self.assertNotIn("Pastel fabric colorway lineup", item["shot_labels"])
 
-    def test_auto_trello_uses_havi_vows_book_active_rules_only(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4, prompt="Vows Book")
+    def test_auto_erp_uses_halloween_dress_baby_before_generic_dress_rule(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        cards = [
+            {
+                "id": "card-halloween-dress",
+                "shortLink": "halloween-dress",
+                "idList": "ready",
+                "name": "Halloween Dress Baby (12).jpeg",
+                "url": "https://erp.example/c/halloween-dress",
+                "_image_attachments": [
+                    {"id": "att-dress", "name": "embroidered_halloween_baby_dress.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-dress"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("halloween_dress_baby")
+
+        self.assertEqual(
+            "halloween_dress_baby",
+            self.service._flow_operator_product_rule_key_from_text("Halloween Dress Baby"),
+        )
+        self.assertEqual(
+            "halloween_dress_baby",
+            self.service._flow_operator_card_name_product_rule_key("Halloween Dress Baby (12).jpeg"),
+        )
+        self.assertEqual(
+            "halloween_dress_baby",
+            self.service._flow_operator_product_rule_key_from_text("Halloween Baby Dress"),
+        )
+        self.assertEqual(
+            "halloween_dress_baby",
+            self.service._flow_operator_card_name_product_rule_key("Halloween Baby Dress (12).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Halloween Dress Baby category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Halloween Dress Baby", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Dress Baby uses", item["prompt"])
+        self.assertEqual(
+            "Halloween Dress Baby image 1 Four pastel dresses on child mannequins in two rows",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Halloween Dress Baby image 12 Three-year-old wearing dress at bright Halloween party",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("same number, size, and placement of natural wooden buttons", item["prompt"])
+        self.assertIn("exactly eight distinct process panels", item["prompt"])
+        self.assertIn("Vietnamese seamstress", item["prompt"])
+        self.assertIn("exactly four high-resolution close-up photographs", item["prompt"])
+        self.assertIn("American Halloween trick-or-treat scene", item["prompt"])
+        self.assertNotIn("birthday party", item["prompt"].lower())
+        self.assertNotIn("back-to-school", item["prompt"].lower())
+
+    def test_auto_erp_uses_christmas_dress_baby_before_generic_dress_rule(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        cards = [
+            {
+                "id": "card-christmas-dress",
+                "shortLink": "christmas-dress",
+                "idList": "ready",
+                "name": "Christmas Dress Baby (12).jpeg",
+                "url": "https://erp.example/c/christmas-dress",
+                "_image_attachments": [
+                    {"id": "att-dress", "name": "embroidered_christmas_baby_dress.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-dress"],
+            }
+        ]
+
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("christmas_dress_baby")
+
+        self.assertEqual(
+            "christmas_dress_baby",
+            self.service._flow_operator_product_rule_key_from_text("Christmas Dress Baby"),
+        )
+        self.assertEqual(
+            "christmas_dress_baby",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Dress Baby (12).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Christmas Dress Baby category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Christmas Dress Baby", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Dress Baby uses", item["prompt"])
+        self.assertEqual(
+            "Christmas Dress Baby image 1 Four pastel Christmas dresses on child mannequins in two rows",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Christmas Dress Baby image 12 Two four-year-old children wearing dresses under Christmas tree",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("collar must remain clean white in every colorway", item["prompt"])
+        self.assertIn("same number, size, and placement of natural wooden buttons", item["prompt"])
+        self.assertIn("exactly eight distinct process panels", item["prompt"])
+        self.assertIn("Vietnamese seamstress", item["prompt"])
+        self.assertIn("exactly four high-resolution close-up photographs", item["prompt"])
+        self.assertIn("three-year-old girl wearing the exact source dress", item["prompt"])
+        self.assertNotIn("birthday party", item["prompt"].lower())
+        self.assertNotIn("back-to-school", item["prompt"].lower())
+
+    def test_auto_erp_uses_havi_vows_book_active_rules_only(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4, prompt="Vows Book")
         cards = [
             {
                 "id": "card-vows",
                 "shortLink": "vows",
                 "idList": "ready",
                 "name": "Wedding_Vows_Book_Bride_Groom_202605261100.jpeg",
-                "url": "https://trello.example/c/vows",
+                "url": "https://erp.example/c/vows",
                 "_image_attachments": [{"id": "att-vows", "name": "vows_book.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-vows"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -1020,21 +1693,251 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Cô dâu đọc vows riêng", item["prompt"])
         self.assertNotIn("2 cuốn trên pale surface", item["prompt"])
 
-    def test_auto_trello_prioritizes_specific_havi_pillowcase_rules(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4, prompt="Wedding Pillowcase")
+    def test_auto_erp_recognizes_vows_notebook_filename_as_vows_book(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
+        cards = [
+            {
+                "id": "card-vows-notebook",
+                "shortLink": "vows-notebook",
+                "idList": "ready",
+                "name": "Vows notebook Autumn (10).jpeg",
+                "url": "https://erp.example/c/vows-notebook",
+                "_image_attachments": [
+                    {
+                        "id": "att-vows-notebook",
+                        "name": "Vows notebook Autumn (10).jpeg",
+                        "mimeType": "image/jpeg",
+                    }
+                ],
+                "_selected_attachment_ids": ["att-vows-notebook"],
+            }
+        ]
+
+        rule_key = self.service._flow_operator_card_name_product_rule_key(cards[0]["name"])
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
+
+        self.assertEqual("vows_book", rule_key)
+        self.assertEqual(1, len(items))
+        self.assertTrue(items[0]["shot_labels"][0].startswith("Vows Book image 1 "))
+
+    def test_auto_erp_recognizes_halloween_notebook_rule(self) -> None:
+        self.assertEqual(
+            "halloween_notebook",
+            self.service._flow_operator_card_name_product_rule_key("Halloween Notebook (3).jpeg"),
+        )
+
+    def test_auto_erp_routes_album_and_notebook_names_without_guessing_ambiguous_cards(self) -> None:
+        self.assertEqual(
+            "album",
+            self.service._flow_operator_card_name_product_rule_key("Halloween Album"),
+        )
+        self.assertEqual(
+            "notebook",
+            self.service._flow_operator_card_name_product_rule_key("Autumn Notebook"),
+        )
+        self.assertEqual(
+            "",
+            self.service._flow_operator_card_name_product_rule_key("Thanksgiving Album Notebook"),
+        )
+        self.assertEqual(
+            "halloween_notebook",
+            self.service._flow_operator_card_name_product_rule_key("Halloween Notebook"),
+        )
+        self.assertEqual(
+            "christmas_album",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Album"),
+        )
+
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        ambiguous_card = {
+            "id": "card-ambiguous-album-notebook",
+            "name": "Autumn Album Notebook",
+            "_visual_product_rule_key": "album",
+            "_visual_product_rule_confidence": 0.99,
+            "_image_attachments": [
+                {"id": "att-book", "name": "embroidered_album_notebook.jpeg", "mimeType": "image/jpeg"}
+            ],
+        }
+        signals = self.service._flow_operator_card_product_signals(request, ambiguous_card)
+
+        self.assertTrue(signals["ambiguous_album_notebook_name"])
+        self.assertEqual("", signals["product_rule_key"])
+        self.assertEqual(12, len(self.service._flow_operator_product_rule_shot_suite("album")))
+        self.assertEqual(12, len(self.service._flow_operator_product_rule_shot_suite("notebook")))
+
+    def test_auto_erp_recognizes_wreath_sash_rule(self) -> None:
+        self.assertEqual(
+            "christmas_sash",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Sash"),
+        )
+        self.assertEqual(
+            "family_halloween_sash",
+            self.service._flow_operator_card_name_product_rule_key("Family Halloween Sash"),
+        )
+        self.assertEqual(
+            "halloween_wreath_sash",
+            self.service._flow_operator_card_name_product_rule_key("halloween wreath sash"),
+        )
+        self.assertEqual(
+            "wreath_sash",
+            self.service._flow_operator_card_name_product_rule_key("Autumn wreath sash"),
+        )
+
+    def test_auto_erp_uses_halloween_wreath_sash_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        card = {
+            "id": "card-halloween-wreath-sash",
+            "shortLink": "halloween-wreath-sash",
+            "idList": "ready",
+            "name": "Halloween Wreath Sash (7).jpeg",
+            "url": "https://erp.example/c/halloween-wreath-sash",
+            "_image_attachments": [
+                {"id": "att-sash", "name": "halloween_wreath_sash.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-sash"],
+        }
+
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("halloween_wreath_sash")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Halloween Wreath Sash category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Halloween Wreath Sash", item["prompt"])
+        self.assertEqual(
+            "Halloween Wreath Sash image 1 Hands embroidering Halloween design on linen",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Halloween Wreath Sash image 12 Sash tied around dark wooden banister post",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("exactly at the 6 o'clock position", item["prompt"])
+        self.assertIn("never printed, digitally applied, machine embroidered, or machine-flat", item["prompt"])
+        self.assertIn("This is the only output in the set that may be a collage", item["prompt"])
+        self.assertIn("never a bow", item["prompt"])
+
+    def test_auto_erp_uses_family_halloween_sash_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        card = {
+            "id": "card-family-halloween-sash",
+            "shortLink": "family-halloween-sash",
+            "idList": "ready",
+            "name": "Family Halloween Sash",
+            "url": "https://erp.example/c/family-halloween-sash",
+            "_image_attachments": [
+                {"id": "att-sash", "name": "family_halloween_wreath_sash.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-sash"],
+        }
+
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("family_halloween_sash")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Family Halloween Sash category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Family Halloween Sash", item["prompt"])
+        self.assertEqual(
+            "Family Halloween Sash image 1 Hands embroidering matching Halloween sash linen",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Family Halloween Sash image 12 Three neutral linen sash colorways on wooden table",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("never printed, digitally applied, machine embroidered, or machine-flat", item["prompt"])
+        self.assertIn("same total length, tail width, and knot size", item["prompt"])
+        self.assertIn("clearly longer than the wreath diameter", item["prompt"])
+        self.assertIn("exactly at the 6 o'clock position", item["prompt"])
+        self.assertIn("physically mounted flat against that surface with a hidden hook", item["prompt"])
+        self.assertNotIn("Four-panel embroidery weave hem and knot macro proof", " ".join(item["shot_labels"]))
+        self.assertNotIn("Create one square 2x2 grid", item["prompt"])
+        self.assertIn("This must be one standalone lifestyle photograph, never a collage", item["prompt"])
+        self.assertNotIn("Maple leaf wreath on dark front door at night", " ".join(item["shot_labels"]))
+        self.assertNotIn("Pumpkin maple leaf wreath above dark console", " ".join(item["shot_labels"]))
+        self.assertIn("Sash tied around dark wooden banister post", " ".join(item["shot_labels"]))
+        self.assertIn("Three neutral sash colorways on side-by-side fall wreaths", " ".join(item["shot_labels"]))
+        self.assertIn("three different neutral linen base colors", item["prompt"])
+        self.assertIn("Do not change the motif design, motif colors, or sash borders", item["prompt"])
+        self.assertIn("Welcome", item["prompt"])
+        self.assertIn("Planned prop text exception", item["prompt"])
+        self.assertIn("no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas", item["prompt"])
+        self.assertNotIn("Wreath Sash category", item["design_analysis"])
+
+    def test_auto_erp_ring_bearer_pillow_does_not_fallback_to_wedding_pillowcase(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        card = {
+            "id": "card-ring-bearer-pillow",
+            "shortLink": "ring-bearer-pillow",
+            "idList": "ready",
+            "name": "Ring Bearer Pillow",
+            "url": "https://erp.example/c/ring-bearer-pillow",
+            "desc": (
+                "AI Suggested Etsy Title:\n"
+                "Personalized Leaf Wreath Ring Bearer Pillow, Custom Wedding Ceremony Pillow, "
+                "Embroidered Linen Ring Cushion\n\n"
+                "AI Product Type:\nRing Bearer Pillow"
+            ),
+            "_image_attachments": [{"id": "att-ring", "name": "Tao_anh_goi_dung_nhan.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-ring"],
+        }
+
+        signals = self.service._flow_operator_card_product_signals(request, card)
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual("ring_bearer_pillow", signals["text_product_rule_key"])
+        self.assertEqual("ring_bearer_pillow", signals["product_rule_key"])
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertIn("Ring Bearer Pillow category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Ring Bearer Pillow", item["prompt"])
+        self.assertTrue(item["shot_labels"][0].startswith("Ring Bearer Pillow image 1 "))
+        self.assertNotIn("Wedding Pillowcase category", item["design_analysis"])
+        self.assertFalse(any(label.startswith("Wedding Pillowcase image") for label in item["shot_labels"]))
+
+    def test_auto_erp_clear_card_name_overrides_wrong_visual_product_rule(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
+        card = {
+            "id": "card-name-wins",
+            "shortLink": "card-name-wins",
+            "idList": "ready",
+            "name": "Ring Bearer Pillow",
+            "url": "https://erp.example/c/card-name-wins",
+            "_image_attachments": [{"id": "att-ring", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-ring"],
+            "_visual_product_rule_key": "wedding_pillowcase",
+            "_visual_product_rule_confidence": 0.94,
+            "_visual_product_rule_visible_product": "square wedding cushion",
+        }
+
+        signals = self.service._flow_operator_card_product_signals(request, card)
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual("ring_bearer_pillow", signals["card_name_product_rule_key"])
+        self.assertEqual("ring_bearer_pillow", signals["product_rule_key"])
+        self.assertIn("Ring Bearer Pillow category", items[0]["design_analysis"])
+        self.assertNotIn("Wedding Pillowcase category", items[0]["design_analysis"])
+
+    def test_auto_erp_prioritizes_specific_havi_pillowcase_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4, prompt="Wedding Pillowcase")
         cards = [
             {
                 "id": "card-wedding-pillow",
                 "shortLink": "wedding-pillow",
                 "idList": "ready",
                 "name": "Wedding_Pillowcase_Bride_Groom_202605261200.jpeg",
-                "url": "https://trello.example/c/wedding-pillow",
+                "url": "https://erp.example/c/wedding-pillow",
                 "_image_attachments": [{"id": "att-pillow", "name": "wedding_pillowcase.jpeg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["att-pillow"],
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         item = items[0]
@@ -1084,14 +1987,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("not as a new set starting at image 1", prompt)
         self.assertIn("does not reset the numbered shot range", prompt)
 
-    def test_auto_trello_generic_tao_filename_skips_without_product_rule(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_generic_tao_filename_skips_without_product_rule(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         card = {
             "id": "card-generic",
             "shortLink": "generic",
             "idList": "ready",
             "name": "tạo_hình_ảnh_một_chiếc_202605161423 (1).jpeg",
-            "url": "https://trello.example/c/generic",
+            "url": "https://erp.example/c/generic",
             "_image_attachments": [{"id": "att-generic", "name": "tạo_hình_ảnh_một_chiếc_202605161423 (1).jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["att-generic"],
         }
@@ -1099,21 +2002,43 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         signals = self.service._flow_operator_card_product_signals(request, card)
 
         self.assertFalse(signals["is_shirt"])
-        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
 
         self.assertEqual([], items)
-        self.assertEqual("missing_product_rule", card["_auto_trello_skip_code"])
-        self.assertIn("HAVI product shot rule", card["_auto_trello_skip_reason"])
-        self.assertIn("bo qua card nay", card["_auto_trello_skip_reason"])
+        self.assertEqual("missing_product_rule", card["_auto_erp_skip_code"])
+        self.assertIn("HAVI product shot rule", card["_auto_erp_skip_reason"])
+        self.assertIn("bo qua card nay", card["_auto_erp_skip_reason"])
 
-    def test_auto_trello_skips_unknown_rule_card_when_later_card_is_valid(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_baby_photo_frame_uses_hoop_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
+        card = {
+            "id": "card-baby-frame",
+            "shortLink": "baby-frame",
+            "idList": "ready",
+            "name": "khung dung anh baby",
+            "url": "https://erp.example/c/baby-frame",
+            "_image_attachments": [{"id": "att-frame", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-frame"],
+        }
+
+        signals = self.service._flow_operator_card_product_signals(request, card)
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual("hoops_with_photos", signals["product_rule_key"])
+        self.assertEqual(1, len(items))
+        self.assertNotIn("_auto_erp_skip_code", card)
+        self.assertIn("Hoops With Photos category", items[0]["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Hoops With Photos", items[0]["prompt"])
+        self.assertTrue(items[0]["shot_labels"][0].startswith("Hoops With Photos image 1 "))
+
+    def test_auto_erp_skips_unknown_rule_card_when_later_card_is_valid(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         generic_card = {
             "id": "card-generic",
             "shortLink": "generic",
             "idList": "ready",
             "name": "tao_hinh_image_202605161423.jpeg",
-            "url": "https://trello.example/c/generic",
+            "url": "https://erp.example/c/generic",
             "_image_attachments": [{"id": "att-generic", "name": "image.jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["att-generic"],
         }
@@ -1122,62 +2047,100 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "shortLink": "dress",
             "idList": "ready",
             "name": "Dress Baby linen product",
-            "url": "https://trello.example/c/dress",
+            "url": "https://erp.example/c/dress",
             "_image_attachments": [{"id": "att-dress", "name": "dress_baby.jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["att-dress"],
         }
 
-        items = self.service._trello_ai_prompt_items_for_image_cards([generic_card, dress_card], request, 1)
+        items = self.service._erp_ai_prompt_items_for_image_cards([generic_card, dress_card], request, 1)
 
         self.assertEqual(1, len(items))
-        self.assertEqual("card-dress", items[0]["trello_card_id"])
+        self.assertEqual("card-dress", items[0]["erp_task_id"])
         self.assertIn("HAVI product shot rule lock: Dress Baby", items[0]["prompt"])
 
-    def test_auto_trello_scan_reports_skipped_unknown_rule_card_without_failing(self) -> None:
+    def test_auto_erp_scan_reports_skipped_unknown_rule_card_without_failing(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="",
-            trello_board_id="board123",
-            trello_list_id="ready-list",
+            erp_project_id="PROJ-0049",
+            erp_status_id="ready-list",
         )
         generic_card = {
             "id": "card-generic",
             "shortLink": "generic",
             "idList": "ready-list",
             "name": "tao_hinh_image_202605161423.jpeg",
-            "url": "https://trello.example/c/generic",
+            "url": "https://erp.example/c/generic",
             "_image_attachments": [{"id": "att-generic", "name": "image.jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["att-generic"],
         }
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=[generic_card],
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ):
-            items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 1)
+            items, discovery = self.service._erp_prompt_items_for_image_cards(request, [], 1)
 
         self.assertEqual([], items)
         self.assertEqual(1, discovery["skipped_missing_product_rule_cards"])
         self.assertEqual(["card-generic"], discovery["skipped_missing_product_rule_card_ids"])
         self.assertIn("HAVI product shot rule", discovery["skipped_missing_product_rule_details"][0])
 
-    def test_auto_trello_generic_card_uses_visual_product_rule_instead_of_fallback(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_scan_reports_and_skips_complete_card(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="",
+            erp_project_id="PROJ-0049",
+            erp_status_id="ready-list",
+        )
+        complete_card = {
+            "id": "card-complete",
+            "shortLink": "complete",
+            "idList": "ready-list",
+            "name": "halloween wreath sash",
+            "url": "https://erp.example/c/complete",
+            "_image_attachments": [{"id": "source", "name": "source.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["source"],
+            "_flow_output_count": 12,
+        }
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service,
+            "_erp_resolve_board_list_id",
+            return_value="ready-list",
+        ), patch.object(
+            self.service,
+            "_erp_image_cards_on_board",
+            return_value=[complete_card],
+        ), patch.object(
+            self.service,
+            "_erp_status_name",
+            return_value="Ready for AI",
+        ):
+            items, discovery = self.service._erp_prompt_items_for_image_cards(request, [], 1)
+
+        self.assertEqual([], items)
+        self.assertEqual(1, discovery["skipped_complete_cards"])
+        self.assertEqual(["card-complete"], discovery["skipped_complete_card_ids"])
+        self.assertEqual("complete_output_set", complete_card["_auto_erp_skip_code"])
+
+    def test_auto_erp_generic_card_uses_visual_product_rule_instead_of_fallback(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         card = {
             "id": "card-generic-dress",
             "shortLink": "generic-dress",
             "idList": "ready",
             "name": "Full-length_professional_product_photography_of_202605281034.jpeg",
-            "url": "https://trello.example/c/generic-dress",
+            "url": "https://erp.example/c/generic-dress",
             "_image_attachments": [{"id": "att-dress", "name": "source.jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["att-dress"],
             "_visual_product_rule_key": "dress_baby",
@@ -1185,7 +2148,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "_visual_product_rule_visible_product": "baby linen dress",
         }
 
-        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
 
         self.assertEqual(1, len(items))
         self.assertIn("Dress Baby category", items[0]["design_analysis"])
@@ -1194,29 +2157,29 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(items[0]["shot_labels"][0].startswith("Dress Baby image 1 "))
         self.assertNotIn("Detail craft proof", items[0]["shot_labels"])
 
-    def test_auto_trello_generic_card_infers_dress_rule_from_visual_description(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_generic_card_infers_dress_rule_from_visual_description(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         card = {
             "id": "6a17f150f691950be79b94a8",
             "shortLink": "generic-visual-dress",
             "idList": "ready",
             "name": "Full-length_professional_product_photography_of_202605281034.jpeg",
-            "url": "https://trello.example/c/generic-visual-dress",
+            "url": "https://erp.example/c/generic-visual-dress",
             "_image_attachments": [{"id": "6a17f150f691950be79b95d2", "name": "source.jpeg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["6a17f150f691950be79b95d2"],
         }
 
         with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
             self.service,
-            "_trello_credentials",
-            return_value=("trello-key", "trello-token"),
+            "_erp_credentials",
+            return_value=("erp-key", "erp-token"),
         ), patch.object(
             self.service,
-            "_trello_download_attachment_bytes",
+            "_erp_download_attachment_bytes",
             return_value=(b"image", "image/jpeg"),
         ), patch.object(
             self.service,
-            "_gemini_classify_trello_source_product_rule",
+            "_gemini_classify_erp_source_product_rule",
             return_value={
                 "product_rule_key": "",
                 "confidence": 0.62,
@@ -1224,7 +2187,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "reason": "The main product is a small child garment with a bodice, skirt, pocket, and flutter sleeves.",
             },
         ):
-            items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+            items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
 
         self.assertEqual(1, len(items))
         self.assertEqual("dress_baby", card["_visual_product_rule_key"])
@@ -1234,7 +2197,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(items[0]["shot_labels"][0].startswith("Dress Baby image 1 "))
         self.assertNotIn("Detail craft proof", items[0]["shot_labels"])
 
-    def test_visual_product_rule_maps_photo_album_to_guest_book(self) -> None:
+    def test_visual_product_rule_maps_photo_album_to_album(self) -> None:
         parsed = self.service._flow_operator_product_rule_from_visual_payload(
             {
                 "product_rule_key": "",
@@ -1244,29 +2207,54 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             }
         )
 
-        self.assertEqual("guest_book", parsed["product_rule_key"])
+        self.assertEqual("album", parsed["product_rule_key"])
         self.assertTrue(parsed["inferred_from_visual_text"])
 
     def test_visual_product_rule_infers_all_havi_products_from_visual_description(self) -> None:
         examples = {
             "wedding_pillowcase": "square cushion embroidered with bride and groom names for a romantic wedding keepsake",
             "tooth_fairy_pillow": "tooth-shaped cream linen tooth fairy pillow with a white ribbon hanger and hand embroidered name for a first tooth keepsake",
+            "christmas_pillowcase": "Christmas baby pillowcase with raised wool embroidery, optional four corner pompoms, and festive nursery styling",
+            "halloween_pillow": "soft baby pillow with wool embroidered pumpkin ghost motif for a Halloween nursery crib",
             "baby_pillowcase": "soft rectangular cushion with nursery name embroidery for an infant crib",
             "linen_pillowcase": "rectangular cushion cover made from linen fabric with embroidery for home decor sofa styling",
             "ring_bearer_pillow": "small square cushion with ribbons holding wedding rings for the ceremony",
             "hoops_with_photos": "round wooden embroidery frame containing a baby portrait photo with stitched name and date",
             "wedding_hoop": "round wooden embroidery frame with floral stitched couple names for wedding decor",
             "bride_handkerchief": "embroidered bridal cloth square folded with lace edge for wedding tears keepsake",
+            "halloween_notebook": "fabric covered Halloween recipe notebook embroidered with pumpkins ghosts and autumn leaves",
             "vows_book": "small fabric covered booklet for personal vows with embroidered cover lettering",
+            "baby_christmas_album": "cotton linen baby Christmas photo album with hand embroidered cover, clear plastic photo pockets, Santa ornament evergreen and gingerbread decor",
+            "christmas_album": "hand embroidered cotton linen Christmas photo album with Christmas tree motif, clear photo pockets, festive ornaments and dried orange decor",
             "baby_album": "cotton linen baby photo album for a first birthday with hand embroidered cover and clear plastic photo pockets",
-            "guest_book": "fabric covered sign in album for wedding guests with embroidered cover",
+            "album": "hand embroidered linen photo album with a fabric cover, bound spine, and clear plastic photo pockets",
+            "notebook": "hand embroidered linen fabric covered notebook with bound paper pages and a stitched cover motif",
+            "guest_book": "fabric covered embroidered guest book for wedding guests to sign",
             "bouquet_ribbon": "long fabric strip tied to a bridal bouquet with stitched lettering",
+            "christmas_sash": "handmade Christmas wreath sash with two pointed linen tails, raised embroidery and text tied below an evergreen wreath with red berries",
+            "family_halloween_sash": "family Halloween wreath sash with two pointed white linen tails, embroidered ghost motif and text tied to a maple leaf wreath",
+            "halloween_wreath_sash": "handmade Halloween wreath sash with two long pointed linen tails and raised pumpkin embroidery tied at the bottom center of a dark twig wreath",
+            "wreath_sash": "two long pointed linen wreath sash tails tied around a green wreath with floral embroidery and an initial",
             "hair_bow": "cotton linen embroidered hair bow scrunchie with center knot and long tails for a ponytail",
             "passport_cover": "cotton linen passport cover holder with hand embroidered travel motif beside a boarding pass",
+            "pc_stocks": "compact hanging Christmas stocking with white cuff, heel, toe, hanging loop, and thick raised punch needle wool yarn motif",
+            "pn_ornament": "small Christmas linen ornament in a wooden hoop with metal clasp, hanging cord, and thick raised punch needle wool loop pile motif",
+            "ornament_round": "small round Christmas tree ornament with linen in a wooden mini hoop, metal clasp, hanging cord, and raised hand embroidery",
+            "jewelry_box": "collection of small rounded rectangular silver framed jewelry boxes with white linen hand embroidered lids, front clasps, and exactly two interior compartments",
+            "napkin_set": "set of six white linen dinner napkins with six distinct hand embroidered autumn flowers leaves and acorns",
+            "advent_calendar": "tall linen Christmas advent countdown wall hanging with numbered pockets, a wooden dowel, hanging cord, and hand embroidery",
+            "halloween_bag": "small linen Halloween trick-or-treat candy bag with one handle and hand embroidered pumpkin motif",
             "drawstring_bag": "cotton linen drawstring pouch with rope cords, gathered top, and hand embroidered lavender motif",
+            "christmas_banner": "small Christmas linen wall banner with wooden hanging rod, cord hanger, raised hand embroidery, and Noel decor",
+            "halloween_banner": "small Halloween linen wall banner with wooden hanging rod, cord, and raised hand embroidery",
             "banner": "flat triangular nursery wall hanging with top wooden dowel cord hanger and pointed V bottom",
+            "birthday_hat": "hand embroidered linen birthday hat with tie strings, pom-pom details, ruffle trim, and birthday party styling",
             "crown": "soft fabric birthday crown made of linen with pom-pom tips and embroidered details for a baby party",
+            "christmas_fabric_cross": "soft sewn Christmas fabric cross keepsake made of linen with raised hand embroidery, a hanging loop, and pine decor",
+            "embroidered_socks": "hand embroidered linen Christmas stocking with a folded cuff, hanging loop, and a small embroidered motif in colored thread, filled with candy and gifts",
             "fabric_cross": "soft sewn religious cross keepsake made of linen with embroidered name",
+            "christmas_dress_baby": "Christmas baby linen dress with a white collar, ruffled shoulders, hand embroidery, and two wooden back buttons",
+            "halloween_dress_baby": "Halloween baby linen dress with ruffled shoulders, hand embroidery, and two wooden back buttons",
             "dress_baby": "white linen sleeveless child dress on a hanger with ruffled sleeves and skirt",
             "plush": "soft stuffed animal toy bear with fabric pile seams and stitched face",
         }
@@ -1311,53 +2299,53 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertNotEqual("dress_baby", parsed["product_rule_key"])
 
-    def test_auto_trello_partial_card_generates_full_twelve_image_set(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_partial_card_generates_full_twelve_image_set(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "partial-card",
                 "shortLink": "partial",
                 "idList": "ready",
                 "name": "embroidered apron",
-                "url": "https://trello.example/c/partial",
+                "url": "https://erp.example/c/partial",
                 "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["source-att"],
-                "_flow_output_count": 3,
+                "_flow_output_count": 2,
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         self.assertEqual(12, items[0]["flow_agent_image_count"])
-        self.assertEqual(3, items[0]["flow_agent_existing_output_count"])
-        self.assertEqual(["source-att"], items[0]["trello_attachment_ids"])
-        self.assertIn("already has 3/12 Flow output", items[0]["prompt"])
+        self.assertEqual(2, items[0]["flow_agent_existing_output_count"])
+        self.assertEqual(["source-att"], items[0]["erp_attachment_ids"])
+        self.assertIn("already has 2/12 Flow output", items[0]["prompt"])
         self.assertIn("fresh full 12-image set", items[0]["prompt"])
         self.assertIn("do not subtract any existing output attachments", items[0]["prompt"])
         self.assertNotIn("Continue the same set by creating exactly 9 new missing image", items[0]["prompt"])
 
-    def test_auto_trello_fresh_ready_card_generates_full_twelve_image_set(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_fresh_ready_card_generates_full_twelve_image_set(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "complete-card",
                 "shortLink": "complete",
                 "idList": "ready",
                 "name": "embroidered pillowcase",
-                "url": "https://trello.example/c/complete",
+                "url": "https://erp.example/c/complete",
                 "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["source-att"],
                 "_flow_output_count": 0,
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         self.assertEqual(12, items[0]["flow_agent_image_count"])
         self.assertEqual(0, items[0]["flow_agent_existing_output_count"])
-        self.assertEqual(["source-att"], items[0]["trello_attachment_ids"])
+        self.assertEqual(["source-att"], items[0]["erp_attachment_ids"])
         self.assertIn("generate exactly 12", items[0]["prompt"])
         self.assertIn("clean clear white neutral daylight", items[0]["prompt"])
         self.assertIn("no yellow/orange/golden/tungsten", items[0]["prompt"])
@@ -1387,29 +2375,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             items[0]["shot_labels"],
         )
 
-    def test_auto_trello_eight_output_card_generates_full_twelve_image_set(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_eight_output_card_generates_full_twelve_image_set(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
-                "id": "complete-card",
-                "shortLink": "complete",
+                "id": "sparse-card",
+                "shortLink": "sparse",
                 "idList": "ready",
                 "name": "embroidered pillowcase",
-                "url": "https://trello.example/c/complete",
+                "url": "https://erp.example/c/complete",
                 "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["source-att"],
-                "_flow_output_count": 8,
+                "_flow_output_count": 2,
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         self.assertEqual(12, items[0]["flow_agent_image_count"])
-        self.assertEqual(8, items[0]["flow_agent_existing_output_count"])
-        self.assertIn("already has 8/12 Flow output", items[0]["prompt"])
+        self.assertEqual(2, items[0]["flow_agent_existing_output_count"])
+        self.assertIn("already has 2/12 Flow output", items[0]["prompt"])
         self.assertIn("fresh full 12-image set", items[0]["prompt"])
-        self.assertNotIn("Continue the same set by creating exactly 4 new missing image", items[0]["prompt"])
+        self.assertNotIn("Continue the same set by creating exactly 10 new missing image", items[0]["prompt"])
+        self.assertIn("source image is not a generated output", items[0]["prompt"])
         self.assertEqual(
             [
                 "Embroidery craft proof",
@@ -1432,50 +2421,45 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("never repeat the exact same readable name/text across all color variants", items[0]["prompt"])
         self.assertIn("otherwise all options must remain nameless", items[0]["prompt"])
 
-    def test_auto_trello_ten_output_card_generates_full_twelve_image_set(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_ten_output_card_is_finished_instead_of_regenerated(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "nearly-complete-card",
                 "shortLink": "nearly",
                 "idList": "ready",
                 "name": "embroidered pillowcase",
-                "url": "https://trello.example/c/nearly",
+                "url": "https://erp.example/c/nearly",
                 "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["source-att"],
                 "_flow_output_count": 10,
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
-        self.assertEqual(1, len(items))
-        self.assertEqual(12, items[0]["flow_agent_image_count"])
-        self.assertEqual(10, items[0]["flow_agent_existing_output_count"])
-        self.assertIn("already has 10/12 Flow output", items[0]["prompt"])
-        self.assertIn("fresh full 12-image set", items[0]["prompt"])
-        self.assertNotIn("Continue the same set by creating exactly 2 new missing image", items[0]["prompt"])
-        self.assertIn("source image is not a generated output", items[0]["prompt"])
-        self.assertEqual(12, len(items[0]["shot_labels"]))
-        self.assertEqual("Embroidery craft proof", items[0]["shot_labels"][0])
-        self.assertEqual("Color option display", items[0]["shot_labels"][-1])
+        # Trello-worker policy (2026-09-07): a card holding at least FLOW_ERP_QA_MIN_GOOD_IMAGES
+        # outputs is finished as it is; the Auto scan never regenerates a full set to top it up.
+        self.assertEqual([], items)
+        self.assertEqual("complete_output_set", cards[0]["_auto_erp_skip_code"])
+        self.assertIn("khong tao bu", cards[0]["_auto_erp_skip_reason"])
 
-    def test_auto_trello_hoop_uses_name_variants_instead_of_colorways(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
+    def test_auto_erp_hoop_uses_name_variants_instead_of_colorways(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
         cards = [
             {
                 "id": "hoop-card",
                 "shortLink": "hoop",
                 "idList": "ready",
                 "name": "wedding hoop personalized embroidery",
-                "url": "https://trello.example/c/hoop",
+                "url": "https://erp.example/c/hoop",
                 "_image_attachments": [{"id": "source-att", "name": "wedding_hoop_emma.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["source-att"],
                 "_flow_output_count": 0,
             }
         ]
 
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        items = self.service._erp_ai_prompt_items_for_image_cards(cards, request, 40)
 
         self.assertEqual(1, len(items))
         self.assertEqual(12, items[0]["flow_agent_image_count"])
@@ -1495,7 +2479,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "Wedding Hoop image 9 2 vòng tên khác — trên gỗ",
                 "Wedding Hoop image 10 Treo trên móc tường",
                 "Wedding Hoop image 11 Flat — cận chi tiết thêu #2",
-                "Wedding Hoop image 12 Đôi uyên ương cầm #2",
+                "Wedding Hoop image 12 Kệ nhỏ ngoài trời — reception",
             ],
             items[0]["shot_labels"],
         )
@@ -1558,43 +2542,43 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("Generated prompt", images[0].prompt)
         self.assertEqual({"width": 1024, "height": 1024}, images[0].dimensions)
 
-    def test_trello_archive_skips_without_credentials(self) -> None:
+    def test_erp_archive_skips_without_credentials(self) -> None:
         request = CreateJobRequest(type="image", prompt="cat")
         artifact = JobArtifact(label="Ảnh 1", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
-        with patch.dict(os.environ, {"TRELLO_API_KEY": "", "TRELLO_TOKEN": ""}, clear=False):
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+        with patch.dict(os.environ, {"ERP_API_KEY": "", "ERP_API_SECRET": ""}, clear=False):
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         self.assertEqual({"configured": False}, result)
 
-    def test_trello_archive_attaches_image_to_configured_card(self) -> None:
+    def test_erp_archive_attaches_image_to_configured_card(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="cat",
-            trello_card_id="https://trello.com/c/abc123/demo-card",
+            erp_task_id="https://erp.com/c/abc123/demo-card",
         )
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.dict(
             os.environ,
             {
-                "TRELLO_API_KEY": "key",
-                "TRELLO_TOKEN": "token",
-                "TRELLO_CARD_ID": "",
-                "TRELLO_LIST_ID": "",
-                "TRELLO_UPLOAD_MODE": "url",
+                "ERP_API_KEY": "key",
+                "ERP_API_SECRET": "token",
+                "ERP_TASK_ID": "",
+                "ERP_STATUS_ID": "",
+                "ERP_UPLOAD_MODE": "url",
             },
             clear=False,
         ), patch.object(
             self.service,
-            "_trello_attach_url",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         attach_url.assert_called_once()
         self.assertEqual("abc123", attach_url.call_args.args[2])
@@ -1602,199 +2586,56 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
-        self.assertEqual("abc123", result["card_id"])
+        self.assertEqual("abc123", result["task_id"])
 
-    def test_trello_archive_moves_card_to_content_review_after_twelve_outputs(self) -> None:
-        asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
-                    api_key="key",
-                    token="token",
-                    board_id="board123",
-                    card_id="https://trello.com/c/abc123/demo-card",
-                    upload_mode="url",
-                )
-            )
-        )
+
+
+
+
+    def test_erp_archive_does_not_create_new_card_when_source_attachment_has_no_card(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="cat",
-            trello_board_id="board123",
-            trello_card_id="https://trello.com/c/abc123/demo-card",
-        )
-        artifacts = [
-            JobArtifact(label=f"Anh {index + 1}", media_name=f"media-{index}", url=f"https://example.com/cat-{index}.jpg", mime_type="image/jpeg")
-            for index in range(12)
-        ]
-        job = JobRecord(type="image", status="running", title="test")
-        asyncio.run(self.store.add_job(job))
-
-        with patch.object(
-            self.service,
-            "_trello_attach_url",
-            side_effect=[
-                {"id": f"att-{index}", "name": f"flow-test-{index}.jpg", "url": f"https://trello.example/att-{index}"}
-                for index in range(12)
-            ],
-        ) as attach_url, patch.object(
-            self.service,
-            "_trello_image_card_by_id",
-            return_value={
-                "id": "abc123",
-                "name": "demo-card",
-                "_image_attachments": [{"id": "source", "name": "source.png", "mimeType": "image/png"}],
-                "_flow_output_count": 12,
-            },
-        ) as image_card, patch.object(
-            self.service,
-            "_trello_card_flow_output_count",
-            return_value=12,
-        ) as output_count, patch.object(
-            self.service,
-            "_trello_content_review_list_id",
-            return_value="review-list",
-        ) as review_list, patch.object(
-            self.service,
-            "_trello_move_card_to_list",
-            return_value={"id": "abc123", "idList": "review-list", "url": "https://trello.example/c/abc123"},
-        ) as move_card:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
-
-        self.assertEqual(12, attach_url.call_count)
-        image_card.assert_called_once_with("key", "token", "abc123")
-        output_count.assert_not_called()
-        review_list.assert_called_once_with("key", "token", "board123", "Content Review")
-        move_card.assert_called_once_with("key", "token", "abc123", "review-list")
-        self.assertEqual(12, result["sent"])
-        self.assertTrue(result["content_review"]["moved"])
-        self.assertEqual("review-list", result["content_review"]["list_id"])
-        saved = self.store.get_job(job.id)
-        messages = [entry.message for entry in saved.logs]
-        self.assertIn("Đang upload 12 ảnh kết quả lên Trello.", messages)
-        self.assertIn("Đang upload ảnh 1/12 lên Trello.", messages)
-        self.assertIn("Đã upload ảnh 12/12 lên Trello.", messages)
-        self.assertEqual("Đã upload 12/12 ảnh lên Trello.", saved.progress_hint.detail)
-
-    def test_trello_archive_moves_partial_card_when_total_outputs_reaches_twelve(self) -> None:
-        asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
-                    api_key="key",
-                    token="token",
-                    board_id="board123",
-                    card_id="https://trello.com/c/abc123/demo-card",
-                    upload_mode="url",
-                )
-            )
-        )
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            trello_board_id="board123",
-            trello_card_id="https://trello.com/c/abc123/demo-card",
-        )
-        artifacts = [
-            JobArtifact(label=f"Anh {index + 1}", media_name=f"media-{index}", url=f"https://example.com/cat-{index}.jpg", mime_type="image/jpeg")
-            for index in range(4)
-        ]
-        job = JobRecord(type="image", status="running", title="test")
-        asyncio.run(self.store.add_job(job))
-
-        with patch.object(
-            self.service,
-            "_trello_attach_url",
-            side_effect=[
-                {"id": f"att-{index}", "name": f"flow-test-{index}.jpg", "url": f"https://trello.example/att-{index}"}
-                for index in range(4)
-            ],
-        ), patch.object(
-            self.service,
-            "_trello_image_card_by_id",
-            return_value={
-                "id": "abc123",
-                "name": "demo-card",
-                "_image_attachments": [{"id": "source", "name": "source.png", "mimeType": "image/png"}],
-                "_flow_output_count": 12,
-            },
-        ) as image_card, patch.object(
-            self.service,
-            "_trello_card_flow_output_count",
-            return_value=12,
-        ) as output_count, patch.object(
-            self.service,
-            "_trello_content_review_list_id",
-            return_value="review-list",
-        ), patch.object(
-            self.service,
-            "_trello_move_card_to_list",
-            return_value={"id": "abc123", "idList": "review-list", "url": "https://trello.example/c/abc123"},
-        ) as move_card:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, artifacts))
-
-        image_card.assert_called_once_with("key", "token", "abc123")
-        output_count.assert_not_called()
-        move_card.assert_called_once_with("key", "token", "abc123", "review-list")
-        self.assertEqual(4, result["sent"])
-        self.assertTrue(result["content_review"]["moved"])
-
-    def test_trello_card_flow_output_count_excludes_original_source_image(self) -> None:
-        attachments = [
-            {"id": "source", "name": "original-source.png", "mimeType": "image/png"},
-            *[
-                {"id": f"flow-{index}", "name": f"flow-job123-{index}.jpg", "mimeType": "image/jpeg"}
-                for index in range(1, 13)
-            ],
-        ]
-
-        with patch.object(self.service, "_trello_get_json", return_value=attachments):
-            output_count = self.service._trello_card_flow_output_count("key", "token", "abc123")
-
-        self.assertEqual(12, output_count)
-
-    def test_trello_archive_does_not_create_new_card_when_source_attachment_has_no_card(self) -> None:
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            trello_list_id="ready-list",
-            trello_attachment_ids=["source-att"],
+            erp_status_id="ready-list",
+            erp_attachment_ids=["source-att"],
         )
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.dict(
             os.environ,
             {
-                "TRELLO_API_KEY": "key",
-                "TRELLO_TOKEN": "token",
-                "TRELLO_CARD_ID": "",
-                "TRELLO_LIST_ID": "",
-                "TRELLO_UPLOAD_MODE": "url",
+                "ERP_API_KEY": "key",
+                "ERP_API_SECRET": "token",
+                "ERP_TASK_ID": "",
+                "ERP_STATUS_ID": "",
+                "ERP_UPLOAD_MODE": "url",
             },
             clear=False,
         ), patch.object(
             self.service,
-            "_trello_create_card",
+            "_erp_create_card",
         ) as create_card, patch.object(
             self.service,
-            "_trello_attach_url",
+            "_erp_attach_url",
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         create_card.assert_not_called()
         attach_url.assert_not_called()
-        self.assertEqual("source_card_missing", result["error"])
+        self.assertEqual("source_task_missing", result["error"])
         self.assertEqual(0, result["sent"])
         self.assertEqual(1, result["failed"])
 
-    def test_trello_archive_with_source_module_does_not_fallback_to_config_card(self) -> None:
+    def test_erp_archive_with_source_module_does_not_fallback_to_config_card(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/configcard/default-card",
-                    list_id="ready-list",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/configcard/default-card",
+                    status="ready-list",
                     upload_mode="url",
                 )
             )
@@ -1802,123 +2643,40 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         request = CreateJobRequest(
             type="image",
             prompt="cat",
-            trello_list_id="ready-list",
+            erp_status_id="ready-list",
             automation_graph={
                 "modules": [
-                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
+                    {"id": "erp-source-1", "type": "erp_source", "title": "ERP Image Source"},
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                 ]
             },
         )
         artifact = JobArtifact(label="Anh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
-        with patch.object(self.service, "_trello_create_card") as create_card, patch.object(
+        with patch.object(self.service, "_erp_create_card") as create_card, patch.object(
             self.service,
-            "_trello_attach_url",
+            "_erp_attach_url",
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         create_card.assert_not_called()
         attach_url.assert_not_called()
-        self.assertEqual("source_card_missing", result["error"])
+        self.assertEqual("source_task_missing", result["error"])
         self.assertEqual(0, result["sent"])
         self.assertEqual(1, result["failed"])
 
-    def test_trello_archive_blocks_upload_when_source_validation_fails(self) -> None:
+
+
+    def test_erp_archive_uses_locked_source_task_over_stale_target(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/source123/source-card",
-                    upload_mode="url",
-                )
-            )
-        )
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            trello_card_id="https://trello.com/c/source123/source-card",
-            reference_image_paths=[str(self.uploads_dir / "source.jpg")],
-            automation_graph={
-                "modules": [
-                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
-                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
-                ]
-            },
-        )
-        artifact = JobArtifact(label="Anh 1", media_name="media", url="https://example.com/wrong.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
-        asyncio.run(self.store.add_job(job))
-
-        with patch.object(
-            self.service,
-            "_validate_trello_source_artifacts_before_upload",
-            new=AsyncMock(side_effect=RuntimeError("source mismatch")),
-        ) as validate, patch.object(
-            self.service,
-            "_trello_attach_url",
-        ) as attach_url:
-            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
-                asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
-
-        validate.assert_awaited_once()
-        attach_url.assert_not_called()
-
-    def test_trello_archive_validates_source_before_uploading_generated_images(self) -> None:
-        asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
-                    api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/source123/source-card",
-                    upload_mode="url",
-                )
-            )
-        )
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            trello_card_id="https://trello.com/c/source123/source-card",
-            reference_image_paths=[str(self.uploads_dir / "source.jpg")],
-            automation_graph={
-                "modules": [
-                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
-                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
-                ]
-            },
-        )
-        artifact = JobArtifact(label="Anh 1", media_name="media", url="https://example.com/right.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
-        asyncio.run(self.store.add_job(job))
-
-        with patch.object(
-            self.service,
-            "_validate_trello_source_artifacts_before_upload",
-            new=AsyncMock(return_value=None),
-        ) as validate, patch.object(
-            self.service,
-            "_trello_attach_url",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
-        ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
-
-        validate.assert_awaited_once()
-        attach_url.assert_called_once()
-        self.assertEqual(1, result["sent"])
-
-    def test_trello_archive_uses_locked_source_card_over_stale_target(self) -> None:
-        asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
-                    api_key="key",
-                    token="token",
-                    card_id="wrong-card",
+                    api_secret="secret",
+                    task_id="wrong-card",
                     upload_mode="file",
                     upscale_to_2k=False,
                 )
@@ -1929,26 +2687,33 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         request = CreateJobRequest(
             type="image",
             prompt="cat",
-            trello_card_id="wrong-card",
-            trello_source_card_id="source-card",
-            trello_source_attachment_ids=["source-att"],
+            erp_task_id="wrong-card",
+            erp_source_task_id="source-card",
+            erp_source_attachment_ids=["source-att"],
         )
         artifact = JobArtifact(label="Anh 1", media_name="media", local_path=str(generated), mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.object(
             self.service,
-            "_trello_attach_file_bytes",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_source_comment_id",
+            return_value="cmt-1",
+        ) as source_comment, patch.object(
+            self.service,
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         attach_bytes.assert_called_once()
         self.assertEqual("source-card", attach_bytes.call_args.args[2])
-        self.assertEqual("source-card", result["card_id"])
-        self.assertEqual("source-card", result["source_card_id"])
-        self.assertEqual(["source-att"], result["source_attachment_ids"])
+        self.assertEqual("source-card", result["task_id"])
+        self.assertEqual("source-card", result["source_task_id"])
+        # The declared source attachment is what locates the comment thread,
+        # and the image is posted as a reply inside it.
+        self.assertEqual(["source-att"], source_comment.call_args.args[3])
+        self.assertEqual("cmt-1", attach_bytes.call_args.args[7])
 
     def test_flow_upsample_payload_requests_2k_resolution(self) -> None:
         from PIL import Image
@@ -2078,33 +2843,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(flow_2k_bytes, result)
         ui_download.assert_awaited_once_with(client, "00000000-1111-2222-3333-444444444444")
 
-    def test_trello_archive_upsamples_image_to_2k_before_file_upload(self) -> None:
+    def test_erp_archive_upsamples_image_to_2k_before_file_upload(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="file",
                     upscale_to_2k=True,
                 )
             )
         )
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.dict(
             os.environ,
             {
-                "TRELLO_API_KEY": "",
-                "TRELLO_TOKEN": "",
-                "TRELLO_CARD_ID": "",
-                "TRELLO_LIST_ID": "",
-                "TRELLO_UPLOAD_MODE": "file",
+                "ERP_API_KEY": "",
+                "ERP_API_SECRET": "",
+                "ERP_TASK_ID": "",
+                "ERP_STATUS_ID": "",
+                "ERP_UPLOAD_MODE": "file",
             },
             clear=False,
+        ), patch.object(
+            self.service,
+            # The artifact carries only a URL, so the archive downloads the
+            # bytes itself before the 2K pass instead of posting the link.
+            "_read_remote_file",
+            return_value=(b"original-jpeg-bytes", "image/jpeg"),
         ), patch.object(
             self.service,
             "_upsample_artifact_bytes",
@@ -2120,18 +2891,18 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ),
         ) as upsample, patch.object(
             self.service,
-            "_trello_attach_file_bytes",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes, patch.object(
             self.service,
-            "_trello_attach_file_from_url",
+            "_erp_attach_file_from_url",
         ) as attach_from_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         upsample.assert_awaited_once()
         attach_bytes.assert_called_once()
         attach_from_url.assert_not_called()
-        # Positional args: key, token, card_id, file_bytes, mime, name, set_cover
+        # Positional args: key, token, task_id, file_bytes, mime, name, set_cover
         self.assertEqual(b"upscaled-jpeg-bytes", attach_bytes.call_args.args[3])
         self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
         self.assertEqual("abc123", attach_bytes.call_args.args[2])
@@ -2140,26 +2911,26 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_keeps_original_when_flow_upsample_keeps_original(self) -> None:
+    def test_erp_archive_keeps_original_when_flow_upsample_keeps_original(self) -> None:
         from PIL import Image
 
         source_image = io.BytesIO()
         Image.new("RGB", (512, 512), (210, 180, 140)).save(source_image, format="JPEG", quality=90)
         source_bytes = source_image.getvalue()
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="file",
                     upscale_to_2k=True,
                 )
             )
         )
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.dict(os.environ, {"FLOW_UPSAMPLE_API_ENABLED": "1"}, clear=False), patch.object(
@@ -2172,10 +2943,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             new=AsyncMock(return_value=source_bytes),
         ) as flow_upscale, patch.object(
             self.service,
-            "_trello_attach_file_bytes",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         self.assertGreaterEqual(flow_upscale.await_count, 1)
         attach_bytes.assert_called_once()
@@ -2184,30 +2955,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             self.assertEqual((512, 512), uploaded.size)
         self.assertEqual("image/jpeg", attach_bytes.call_args.args[4])
         saved = self.store.get_job(job.id)
-        self.assertTrue(any("khong resize gia 2K" in entry.message for entry in saved.logs))
+        self.assertTrue(any("không resize giả 2K" in entry.message for entry in saved.logs))
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_keeps_original_after_flow_upsample_failure(self) -> None:
+    def test_erp_archive_keeps_original_after_flow_upsample_failure(self) -> None:
         from PIL import Image
 
         source_file = self.downloads_dir / "flow-small.jpg"
         Image.new("RGB", (640, 480), (120, 170, 210)).save(source_file, format="JPEG", quality=90)
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="file",
                     upscale_to_2k=True,
                 )
             )
         )
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(source_file), mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.object(
@@ -2216,10 +2987,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             new=AsyncMock(side_effect=RuntimeError("No session found")),
         ), patch.object(
             self.service,
-            "_trello_attach_file_bytes",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         attach_bytes.assert_called_once()
         uploaded_bytes = attach_bytes.call_args.args[3]
@@ -2230,13 +3001,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_materializes_flow_url_before_file_upload(self) -> None:
+    def test_erp_archive_materializes_flow_url_before_file_upload(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="file",
                     upscale_to_2k=False,
                 )
@@ -2244,14 +3015,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         local_file = self.downloads_dir / "flow-image.jpg"
         local_file.write_bytes(b"flow-image-bytes")
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(
             label="Ảnh 1",
             media_name="media",
             url="https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name=media",
             mime_type="image/jpeg",
         )
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.object(
@@ -2260,13 +3031,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             new=AsyncMock(return_value=str(local_file)),
         ) as materialize, patch.object(
             self.service,
-            "_trello_attach_file_bytes",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes, patch.object(
             self.service,
-            "_trello_attach_url",
+            "_erp_attach_url",
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         materialize.assert_awaited_once()
         attach_bytes.assert_called_once()
@@ -2275,13 +3046,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_file_upload_does_not_set_cover(self) -> None:
+    def test_erp_archive_file_upload_does_not_set_cover(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="file",
                     upscale_to_2k=False,
                 )
@@ -2289,20 +3060,20 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         local_file = self.downloads_dir / "flow-image.jpg"
         local_file.write_bytes(b"flow-image-bytes")
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(local_file), mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.object(
             self.service,
-            "_trello_attach_file_bytes",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes, patch.object(
             self.service,
-            "_trello_attach_url",
+            "_erp_attach_url",
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         attach_bytes.assert_called_once()
         self.assertFalse(attach_bytes.call_args.args[6])
@@ -2310,21 +3081,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_skips_upsample_in_url_mode(self) -> None:
+    def test_erp_archive_skips_upsample_in_url_mode(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="url",
                     upscale_to_2k=True,
                 )
             )
         )
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.object(
@@ -2342,10 +3113,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             ),
         ) as upsample, patch.object(
             self.service,
-            "_trello_attach_url",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         # URL mode: respect the user's choice — no upsampling, no file upload.
         upsample.assert_not_called()
@@ -2353,43 +3124,42 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertEqual(1, result["sent"])
 
-    def test_trello_archive_url_upload_does_not_set_cover(self) -> None:
+    def test_erp_archive_url_upload_does_not_set_cover(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                     upload_mode="url",
                 )
             )
         )
-        request = CreateJobRequest(type="image", prompt="cat")
+        request = CreateJobRequest(type="image", prompt="cat", erp_task_id="https://erp.com/c/abc123/demo-card")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.object(
             self.service,
-            "_trello_attach_url",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+            "_erp_attach_url",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
         attach_url.assert_called_once()
         self.assertFalse(attach_url.call_args.args[5])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_update_trello_config_saves_without_exposing_credentials(self) -> None:
+    def test_update_erp_config_saves_without_exposing_credentials(self) -> None:
         result = asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    board_id="https://trello.com/b/board123/demo-board",
-                    card_id="https://trello.com/c/abc123/demo-card",
-                    upload_mode="url",
+                    api_secret="secret",
+                    project_id="PROJ-0049",
+                    task_id="https://erp.com/c/abc123/demo-card",
                 )
             )
         )
@@ -2397,38 +3167,37 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertTrue(result["credentials_saved"])
         self.assertNotIn("api_key", result)
-        self.assertNotIn("token", result)
-        self.assertEqual("board123", result["board_id"])
-        self.assertEqual("abc123", result["card_id"])
-        self.assertEqual("url", result["upload_mode"])
+        self.assertNotIn("api_secret", result)
+        self.assertEqual("PROJ-0049", result["project_id"])
+        self.assertEqual("abc123", result["task_id"])
 
-        saved = self.store.snapshot().trello_config
+        saved = self.store.snapshot().erp_config
         self.assertEqual("key", saved.api_key)
-        self.assertEqual("token", saved.token)
-        self.assertEqual("board123", saved.board_id)
-        self.assertEqual("abc123", saved.card_id)
+        self.assertEqual("secret", saved.api_secret)
+        self.assertEqual("PROJ-0049", saved.project_id)
+        self.assertEqual("abc123", saved.task_id)
 
-    def test_update_trello_config_persists_creds_to_env_local_file(self) -> None:
+    def test_update_erp_config_persists_creds_to_env_local_file(self) -> None:
         env_file = self.temp_root / ".env.local"
         with patch("flow_web.service.ENV_FILE", env_file) if False else patch(
             "flow_web.main.ENV_FILE", env_file
         ), patch.dict(
             os.environ,
             {
-                "TRELLO_API_KEY": "",
-                "TRELLO_TOKEN": "",
-                "TRELLO_BOARD_ID": "",
-                "TRELLO_CARD_ID": "",
-                "TRELLO_LIST_ID": "",
+                "ERP_API_KEY": "",
+                "ERP_API_SECRET": "",
+                "ERP_PROJECT_ID": "",
+                "ERP_TASK_ID": "",
+                "ERP_STATUS_ID": "",
             },
             clear=False,
         ):
             result = asyncio.run(
-                self.service.update_trello_config(
-                    TrelloConfigUpdateRequest(
+                self.service.update_erp_config(
+                    ERPConfigUpdateRequest(
                         api_key="wizard-key",
-                        token="wizard-token",
-                        board_id="https://trello.com/b/wizardboard/demo",
+                        api_secret="wizard-secret",
+                        project_id="PROJ-0032",
                         persist_to_env=True,
                     )
                 )
@@ -2436,20 +3205,20 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             self.assertTrue(result["persisted_to_env"])
             self.assertTrue(env_file.exists())
             contents = env_file.read_text(encoding="utf-8")
-            self.assertIn("TRELLO_API_KEY=wizard-key", contents)
-            self.assertIn("TRELLO_TOKEN=wizard-token", contents)
-            self.assertIn("TRELLO_BOARD_ID=wizardboard", contents)
+            self.assertIn("ERP_API_KEY=wizard-key", contents)
+            self.assertIn("ERP_API_SECRET=wizard-secret", contents)
+            self.assertIn("ERP_PROJECT_ID=PROJ-0032", contents)
             # Process env is also updated so the running app picks it up without restart.
-            self.assertEqual("wizard-key", os.environ.get("TRELLO_API_KEY", ""))
+            self.assertEqual("wizard-key", os.environ.get("ERP_API_KEY", ""))
 
-    def test_update_trello_config_persist_preserves_unrelated_env_lines(self) -> None:
+    def test_update_erp_config_persist_preserves_unrelated_env_lines(self) -> None:
         env_file = self.temp_root / ".env.local"
         env_file.write_text(
             "\n".join(
                 [
                     "# preexisting comment",
                     "OTHER_SECRET=keep-me",
-                    "TRELLO_API_KEY=old-key",
+                    "ERP_API_KEY=old-key",
                     "",
                     "GEMINI_API_KEY=gem-keep",
                 ]
@@ -2459,15 +3228,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         with patch("flow_web.main.ENV_FILE", env_file), patch.dict(
             os.environ,
-            {"TRELLO_API_KEY": "", "TRELLO_TOKEN": ""},
+            {"ERP_API_KEY": "", "ERP_API_SECRET": ""},
             clear=False,
         ):
             result = asyncio.run(
-                self.service.update_trello_config(
-                    TrelloConfigUpdateRequest(
+                self.service.update_erp_config(
+                    ERPConfigUpdateRequest(
                         api_key="new-key",
-                        token="new-token",
-                        board_id="https://trello.com/b/newboard/demo",
+                        api_secret="new-secret",
+                        project_id="PROJ-0033",
                         persist_to_env=True,
                     )
                 )
@@ -2479,153 +3248,157 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("# preexisting comment", contents)
         self.assertIn("OTHER_SECRET=keep-me", contents)
         self.assertIn("GEMINI_API_KEY=gem-keep", contents)
-        # The previously stored TRELLO_API_KEY is overwritten in place,
+        # The previously stored ERP_API_KEY is overwritten in place,
         # not duplicated at the end of the file.
-        self.assertNotIn("TRELLO_API_KEY=old-key", contents)
-        self.assertEqual(contents.count("TRELLO_API_KEY="), 1)
-        self.assertIn("TRELLO_API_KEY=new-key", contents)
+        self.assertNotIn("ERP_API_KEY=old-key", contents)
+        self.assertEqual(contents.count("ERP_API_KEY="), 1)
+        self.assertIn("ERP_API_KEY=new-key", contents)
         # New keys that weren't in the file before are appended cleanly.
-        self.assertIn("TRELLO_TOKEN=new-token", contents)
-        self.assertIn("TRELLO_BOARD_ID=newboard", contents)
+        self.assertIn("ERP_API_SECRET=new-secret", contents)
+        self.assertIn("ERP_PROJECT_ID=PROJ-0033", contents)
 
-    def test_trello_config_snapshot_falls_back_to_env_vars(self) -> None:
+    def test_erp_config_snapshot_falls_back_to_env_vars(self) -> None:
         # Chủ nhân setup 1 lần qua .env.local: state.json rỗng nhưng env vars
         # phải đủ để UI báo "Đã lưu" thay vì "Cần thiết lập".
-        empty_snapshot = self.service._trello_config_snapshot(self.store.snapshot().trello_config)
+        empty_snapshot = self.service._erp_config_snapshot(self.store.snapshot().erp_config)
         self.assertFalse(empty_snapshot["credentials_saved"])
         self.assertEqual("", empty_snapshot["credentials_source"])
 
         with patch.dict(
             os.environ,
             {
-                "TRELLO_API_KEY": "env-key",
-                "TRELLO_TOKEN": "env-token",
-                "TRELLO_BOARD_ID": "https://trello.com/b/envboard/demo",
-                "TRELLO_CARD_ID": "https://trello.com/c/envcard/demo",
-                "TRELLO_LIST_ID": "envlist",
-                "TRELLO_UPLOAD_MODE": "url",
+                "ERP_API_KEY": "env-key",
+                "ERP_API_SECRET": "env-token",
+                "ERP_PROJECT_ID": "PROJ-0031",
+                "ERP_TASK_ID": "https://erp.com/c/envcard/demo",
+                "ERP_STATUS_ID": "envlist",
             },
             clear=False,
         ):
-            envonly = self.service._trello_config_snapshot(self.store.snapshot().trello_config)
+            envonly = self.service._erp_config_snapshot(self.store.snapshot().erp_config)
 
         self.assertTrue(envonly["configured"])
         self.assertTrue(envonly["credentials_saved"])
         self.assertEqual("env", envonly["credentials_source"])
-        self.assertEqual("envboard", envonly["board_id"])
-        self.assertEqual("envcard", envonly["card_id"])
-        self.assertEqual("envlist", envonly["list_id"])
-        # upload_mode trong state.json mặc định "file" — env chỉ override khi
-        # state thực sự để trống, khớp với logic trong _archive_trello_artifacts.
-        self.assertIn(envonly["upload_mode"], {"file", "url"})
-        # Snapshot không bao giờ leak api_key/token raw
+        # App bị khoá vào đúng một ERP Project nên project_id mặc định trong
+        # state thắng env; env chỉ điền vào những ô state để trống.
+        self.assertEqual(self.service.ERP_PROJECT_ID, envonly["project_id"])
+        self.assertEqual("envcard", envonly["task_id"])
+        self.assertEqual("envlist", envonly["status"])
+        # Snapshot không bao giờ leak api_key/api_secret raw
         self.assertNotIn("api_key", envonly)
-        self.assertNotIn("token", envonly)
+        self.assertNotIn("api_secret", envonly)
 
-    def test_trello_config_snapshot_prefers_state_over_env(self) -> None:
+    def test_erp_config_snapshot_prefers_state_over_env(self) -> None:
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="state-key",
-                    token="state-token",
-                    board_id="https://trello.com/b/stateboard/demo",
+                    api_secret="state-secret",
+                    project_id="PROJ-0031",
                 )
             )
         )
         with patch.dict(
             os.environ,
-            {"TRELLO_API_KEY": "env-key", "TRELLO_TOKEN": "env-token"},
+            {"ERP_API_KEY": "env-key", "ERP_API_SECRET": "env-token"},
             clear=False,
         ):
-            snap = self.service._trello_config_snapshot(self.store.snapshot().trello_config)
+            snap = self.service._erp_config_snapshot(self.store.snapshot().erp_config)
 
         # State vẫn ưu tiên trước env nên credentials_source = "state".
         self.assertEqual("state", snap["credentials_source"])
         self.assertTrue(snap["credentials_saved"])
-        self.assertEqual("stateboard", snap["board_id"])
+        self.assertEqual("PROJ-0031", snap["project_id"])
 
-    def test_trello_archive_uses_app_saved_config(self) -> None:
+    def test_erp_archive_refuses_a_job_that_names_no_task(self) -> None:
+        """A job without a Task of its own must not inherit the saved one.
+
+        Each idea writes to its own card, so falling back to whatever card the
+        config happens to hold would drop one idea's images onto another's.
+        """
         asyncio.run(
-            self.service.update_trello_config(
-                TrelloConfigUpdateRequest(
+            self.service.update_erp_config(
+                ERPConfigUpdateRequest(
                     api_key="key",
-                    token="token",
-                    card_id="https://trello.com/c/abc123/demo-card",
-                    upload_mode="url",
+                    api_secret="secret",
+                    task_id="https://erp.com/c/abc123/demo-card",
                 )
             )
         )
         request = CreateJobRequest(type="image", prompt="cat")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
+        job = JobRecord(type="image", status="running", title="test", result=_approved(artifact))
         asyncio.run(self.store.add_job(job))
 
         with patch.dict(
             os.environ,
             {
-                "TRELLO_API_KEY": "",
-                "TRELLO_TOKEN": "",
-                "TRELLO_CARD_ID": "",
-                "TRELLO_LIST_ID": "",
-                "TRELLO_UPLOAD_MODE": "file",
+                "ERP_API_KEY": "",
+                "ERP_API_SECRET": "",
+                "ERP_TASK_ID": "",
+                "ERP_STATUS_ID": "",
             },
             clear=False,
         ), patch.object(
             self.service,
-            "_trello_attach_url",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
-        ) as attach_url:
-            result = asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+            "_erp_attach_url",
+        ) as attach_url, patch.object(
+            self.service,
+            "_erp_attach_file_bytes",
+        ) as attach_bytes:
+            result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
-        attach_url.assert_called_once()
-        self.assertEqual("abc123", attach_url.call_args.args[2])
-        self.assertEqual("https://example.com/cat.jpg", attach_url.call_args.args[3])
+        attach_url.assert_not_called()
+        attach_bytes.assert_not_called()
         self.assertTrue(result["configured"])
-        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["sent"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("source_task_missing", result["error"])
 
-    def test_trello_resolve_board_list_id_defaults_to_ready_for_ai(self) -> None:
+    def test_erp_resolve_board_list_id_defaults_to_open(self) -> None:
         lists = [
             {"id": "ideas-list", "name": "Ideas"},
-            {"id": "ready-list", "name": "Ready for AI"},
+            {"id": "open-list", "name": "Open"},
         ]
 
-        with patch.object(self.service, "_trello_board_lists", return_value=lists):
+        with patch.object(self.service, "_erp_project_lists", return_value=lists):
             self.assertEqual(
-                "ready-list",
-                self.service._trello_resolve_board_list_id("key", "token", "board123", ""),
+                "open-list",
+                self.service._erp_resolve_board_list_id("key", "token", "PROJ-0049", ""),
             )
             self.assertEqual(
                 "ideas-list",
-                self.service._trello_resolve_board_list_id("key", "token", "board123", "Ideas"),
+                self.service._erp_resolve_board_list_id("key", "token", "PROJ-0049", "Ideas"),
             )
             self.assertEqual(
-                "ready-list",
-                self.service._trello_resolve_board_list_id("key", "token", "board123", "ready-list"),
+                "open-list",
+                self.service._erp_resolve_board_list_id("key", "token", "PROJ-0049", "open-list"),
             )
 
-    def test_trello_image_card_scan_requires_list_scope(self) -> None:
-        with patch.object(self.service, "_trello_get_json") as get_json:
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "")
+    def test_erp_image_card_scan_requires_list_scope(self) -> None:
+        with patch.object(self.service, "_erp_get_json") as get_json:
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "")
 
         self.assertEqual([], cards)
         get_json.assert_not_called()
 
-    def test_trello_extra_source_lists_are_disabled_by_default(self) -> None:
+    def test_erp_extra_source_lists_are_disabled_by_default(self) -> None:
         with patch.dict(
             os.environ,
-            {"TRELLO_EXTRA_SOURCE_LIST_NAMES": "Ideas", "TRELLO_ALLOW_EXTRA_SOURCE_LISTS": ""},
+            {"ERP_EXTRA_SOURCE_LIST_NAMES": "Ideas", "ERP_ALLOW_EXTRA_SOURCE_LISTS": ""},
             clear=False,
         ):
-            self.assertEqual([], self.service._default_trello_extra_source_list_names())
+            self.assertEqual([], self.service._default_erp_extra_source_list_names())
 
         with patch.dict(
             os.environ,
-            {"TRELLO_EXTRA_SOURCE_LIST_NAMES": "Ideas", "TRELLO_ALLOW_EXTRA_SOURCE_LISTS": "true"},
+            {"ERP_EXTRA_SOURCE_LIST_NAMES": "Ideas", "ERP_ALLOW_EXTRA_SOURCE_LISTS": "true"},
             clear=False,
         ):
-            self.assertEqual(["Ideas"], self.service._default_trello_extra_source_list_names())
+            self.assertEqual(["Ideas"], self.service._default_erp_extra_source_list_names())
 
-    def test_trello_image_card_scan_includes_complete_cards_for_fresh_rerun(self) -> None:
+    def test_erp_image_card_scan_includes_complete_cards_for_fresh_rerun(self) -> None:
         cards_payload = [
             {"id": "done-card", "name": "Done", "idList": "ready-list"},
             {"id": "partial-card", "name": "Partial", "idList": "ready-list"},
@@ -2654,10 +3427,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         with patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             side_effect=[cards_payload, done_attachments, partial_attachments, fresh_attachments],
         ):
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual(["done-card", "partial-card", "fresh-card"], [card["id"] for card in cards])
         self.assertEqual("source", cards[0]["_image_attachments"][0]["id"])
@@ -2670,7 +3443,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["fresh-source"], cards[2]["_selected_attachment_ids"])
         self.assertEqual(0, cards[2]["_flow_output_count"])
 
-    def test_trello_image_card_scan_uses_single_generated_image_name_as_source(self) -> None:
+    def test_erp_image_card_scan_uses_single_generated_image_name_as_source(self) -> None:
         cards_payload = [{"id": "generated-card", "name": "Generated source", "idList": "ready-list"}]
         attachments = [
             {
@@ -2680,15 +3453,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             }
         ]
 
-        with patch.object(self.service, "_trello_get_json", side_effect=[cards_payload, attachments]):
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+        with patch.object(self.service, "_erp_get_json", side_effect=[cards_payload, attachments]):
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual(["generated-card"], [card["id"] for card in cards])
         self.assertEqual("generated-source", cards[0]["_image_attachments"][0]["id"])
         self.assertEqual(["generated-source"], cards[0]["_selected_attachment_ids"])
         self.assertEqual(0, cards[0]["_flow_output_count"])
 
-    def test_trello_image_card_scan_prefers_oldest_source_attachment(self) -> None:
+    def test_erp_image_card_scan_prefers_oldest_source_attachment(self) -> None:
         cards_payload = [{"id": "card-1", "name": "Product", "idList": "ready-list"}]
         attachments = [
             {"id": "old-source", "name": "old-source.png", "mimeType": "image/png", "date": "2026-05-20T08:00:00.000Z"},
@@ -2696,27 +3469,27 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {"id": "flow-output", "name": "flow-card-1.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T09:00:00.000Z"},
         ]
 
-        with patch.object(self.service, "_trello_get_json", side_effect=[cards_payload, attachments]):
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+        with patch.object(self.service, "_erp_get_json", side_effect=[cards_payload, attachments]):
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual(["card-1"], [card["id"] for card in cards])
         self.assertEqual("old-source", cards[0]["_image_attachments"][0]["id"])
         self.assertEqual(["old-source"], cards[0]["_selected_attachment_ids"])
         self.assertEqual(1, cards[0]["_flow_output_count"])
 
-    def test_auto_trello_default_scope_uses_ready_list_only(self) -> None:
+    def test_auto_erp_default_scope_uses_ready_list_only(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="",
-            trello_board_id="board123",
-            trello_list_id=self.service.DEFAULT_TRELLO_SOURCE_LIST_ID,
+            erp_project_id="PROJ-0049",
+            erp_status_id=self.service.DEFAULT_ERP_SOURCE_LIST_ID,
         )
         ready_card = {
             "id": "ready-card",
             "shortLink": "ready",
             "idList": "ready-list",
             "name": "baby_pillowcase ready product",
-            "url": "https://trello.example/c/ready",
+            "url": "https://erp.example/c/ready",
             "_image_attachments": [{"id": "ready-att", "name": "baby_pillowcase_ready.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["ready-att"],
         }
@@ -2725,56 +3498,56 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "shortLink": "ideas",
             "idList": "ideas-list",
             "name": "ideas product",
-            "url": "https://trello.example/c/ideas",
+            "url": "https://erp.example/c/ideas",
             "_image_attachments": [{"id": "ideas-att", "name": "ideas.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["ideas-att"],
         }
 
         def resolve_list(_key: str, _token: str, _board_id: str, value: str = "") -> str:
-            if value == self.service.DEFAULT_TRELLO_SOURCE_LIST_ID or self.service._compact_match_text(value) == "readyforai":
+            if value == self.service.DEFAULT_ERP_SOURCE_LIST_ID or self.service._compact_match_text(value) == "readyforai":
                 return "ready-list"
             if self.service._compact_match_text(value) == "ideas":
                 return "ideas-list"
             return ""
 
-        def image_cards(_key: str, _token: str, _board_id: str, list_id: str = "") -> list[dict]:
-            return {"ready-list": [ready_card], "ideas-list": [ideas_card]}.get(list_id, [])
+        def image_cards(_key: str, _token: str, _board_id: str, status: str = "") -> list[dict]:
+            return {"ready-list": [ready_card], "ideas-list": [ideas_card]}.get(status, [])
 
-        def list_name(_key: str, _token: str, list_id: str) -> str:
-            return {"ready-list": "Ready for AI", "ideas-list": "Ideas"}.get(list_id, "")
+        def list_name(_key: str, _token: str, status: str) -> str:
+            return {"ready-list": "Ready for AI", "ideas-list": "Ideas"}.get(status, "")
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             side_effect=resolve_list,
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             side_effect=image_cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             side_effect=list_name,
         ):
-            items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 0)
+            items, discovery = self.service._erp_prompt_items_for_image_cards(request, [], 0)
 
-        self.assertEqual(["ready-card"], [item["trello_card_id"] for item in items])
+        self.assertEqual(["ready-card"], [item["erp_task_id"] for item in items])
         self.assertEqual(["ready-list"], discovery["list_ids"])
         self.assertEqual("Ready for AI", discovery["list_name"])
 
-    def test_auto_trello_scan_skips_seen_cards_before_visual_analysis(self) -> None:
+    def test_auto_erp_scan_skips_seen_cards_before_visual_analysis(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="",
-            trello_board_id="board123",
-            trello_list_id="ready-list",
+            erp_project_id="PROJ-0049",
+            erp_status_id="ready-list",
         )
         seen_card = {
             "id": "seen-card",
             "shortLink": "seen",
             "idList": "ready-list",
             "name": "seen product",
-            "url": "https://trello.example/c/seen",
+            "url": "https://erp.example/c/seen",
             "_image_attachments": [{"id": "seen-att", "name": "seen.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["seen-att"],
         }
@@ -2783,49 +3556,49 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "shortLink": "fresh",
             "idList": "ready-list",
             "name": "fresh baby_pillowcase product",
-            "url": "https://trello.example/c/fresh",
+            "url": "https://erp.example/c/fresh",
             "_image_attachments": [{"id": "fresh-att", "name": "fresh_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["fresh-att"],
         }
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=[seen_card, fresh_card],
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
             "_flow_operator_enrich_card_with_visual_product_rule",
         ) as enrich:
-            items, discovery = self.service._trello_prompt_items_for_image_cards(request, [], 1, {"seen-card"})
+            items, discovery = self.service._erp_prompt_items_for_image_cards(request, [], 1, {"seen-card"})
 
-        self.assertEqual(["fresh-card"], [item["trello_card_id"] for item in items])
+        self.assertEqual(["fresh-card"], [item["erp_task_id"] for item in items])
         self.assertEqual(1, discovery["skipped_seen_cards"])
         enrich.assert_called_once()
         self.assertEqual("fresh-card", enrich.call_args.args[1]["id"])
 
-    def test_auto_trello_explicit_card_ignores_stale_attachment_id_for_oldest_source(self) -> None:
+    def test_auto_erp_explicit_card_ignores_stale_attachment_id_for_oldest_source(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="",
-            trello_board_id="board123",
-            trello_list_id="ready-list",
-            trello_card_id="ready-card",
-            trello_attachment_ids=["new-source"],
+            erp_project_id="PROJ-0049",
+            erp_status_id="ready-list",
+            erp_task_id="ready-card",
+            erp_attachment_ids=["new-source"],
         )
         card = {
             "id": "ready-card",
             "shortLink": "ready",
             "idList": "ready-list",
             "name": "ready baby_pillowcase product",
-            "url": "https://trello.example/c/ready",
+            "url": "https://erp.example/c/ready",
             "_image_attachments": [
                 {"id": "old-source", "name": "baby_pillowcase_old.jpg", "mimeType": "image/jpeg", "date": "2026-05-20T08:00:00.000Z"},
                 {"id": "new-source", "name": "baby_pillowcase_new.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T08:00:00.000Z"},
@@ -2834,24 +3607,24 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "_flow_output_count": 0,
         }
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_card_by_id",
+            "_erp_image_card_by_id",
             return_value=card,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ):
-            items, _discovery = self.service._trello_prompt_items_for_image_cards(request, [], 0)
+            items, _discovery = self.service._erp_prompt_items_for_image_cards(request, [], 0)
 
-        self.assertEqual(["old-source"], items[0]["trello_attachment_ids"])
+        self.assertEqual(["old-source"], items[0]["erp_attachment_ids"])
 
-    def test_trello_image_card_scan_counts_numbered_generated_series_as_outputs(self) -> None:
+    def test_erp_image_card_scan_counts_numbered_generated_series_as_outputs(self) -> None:
         cards_payload = [
             {"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"},
             {"id": "done-card", "name": "done pillow", "idList": "ready-list"},
@@ -2879,30 +3652,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         with patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             side_effect=[cards_payload, partial_attachments, done_attachments],
         ):
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual(["partial-card", "done-card"], [card["id"] for card in cards])
         self.assertEqual(2, cards[0]["_flow_output_count"])
         self.assertEqual(12, cards[1]["_flow_output_count"])
 
-    def test_trello_single_numbered_output_with_source_can_continue_missing_set(self) -> None:
+    def test_erp_single_numbered_output_with_source_can_continue_missing_set(self) -> None:
         cards_payload = [{"id": "partial-card", "name": "baby_pillowcase", "idList": "ready-list"}]
         attachments = [
             {"id": "source", "name": "baby_pillowcase.png", "mimeType": "image/png", "date": "2026-05-21T10:00:00.000Z"},
             {"id": "old-output", "name": "baby_pillowcase_13.png", "mimeType": "image/png", "date": "2026-05-21T10:30:00.000Z"},
         ]
 
-        with patch.object(self.service, "_trello_get_json", side_effect=[cards_payload, attachments]):
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+        with patch.object(self.service, "_erp_get_json", side_effect=[cards_payload, attachments]):
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual(["partial-card"], [card["id"] for card in cards])
         self.assertEqual(["source"], cards[0]["_selected_attachment_ids"])
         self.assertEqual(1, cards[0]["_flow_output_count"])
 
-    def test_trello_image_card_scan_skips_when_only_generated_series_remains(self) -> None:
+    def test_erp_image_card_scan_skips_when_only_generated_series_remains(self) -> None:
         cards_payload = [{"id": "output-only-card", "name": "baby_pillowcase", "idList": "ready-list"}]
         attachments = [
             {"id": "old-output-1", "name": "baby_pillowcase_9.png", "mimeType": "image/png"},
@@ -2911,15 +3684,15 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         with patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             side_effect=[cards_payload, attachments],
         ):
-            cards = self.service._trello_image_cards_on_board("key", "token", "board123", "ready-list")
+            cards = self.service._erp_image_cards_on_board("key", "token", "board123", "ready-list")
 
         self.assertEqual([], cards)
 
-    def test_auto_trello_ready_summary_explains_completed_ready_cards(self) -> None:
-        request = CreateJobRequest(type="image", trello_board_id="board123", trello_list_id="ready-list")
+    def test_auto_erp_ready_summary_explains_completed_ready_cards(self) -> None:
+        request = CreateJobRequest(type="image", erp_project_id="PROJ-0049", erp_status_id="ready-list")
         cards_payload = [
             {"id": "done-card", "name": "Done", "idList": "ready-list"},
             {"id": "first-batch-card", "name": "First batch", "idList": "ready-list"},
@@ -2951,27 +3724,27 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
         empty_attachments: list[dict] = []
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             side_effect=[cards_payload, done_attachments, first_batch_attachments, new_attachments, empty_attachments],
         ):
-            summary = self.service._auto_trello_ready_for_ai_summary(request)
+            summary = self.service._auto_erp_ready_for_ai_summary(request)
 
-        self.assertIn("Ready for AI co 4 card", summary)
-        self.assertIn("1 card da co du anh output theo rule nhung phien Auto moi van co the tao moi du bo", summary)
+        self.assertIn("Open co 4 card", summary)
+        self.assertIn("1 card da co du anh output theo rule nen Auto se bo qua", summary)
         self.assertIn("2 card co anh nguon va khi chay se tao moi du bo theo rule", summary)
         self.assertIn("1 card chua co anh nguon", summary)
 
-    def test_reset_ready_trello_outputs_deletes_only_generated_images(self) -> None:
-        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+    def test_reset_ready_erp_outputs_deletes_only_generated_images(self) -> None:
+        request = ResetReadyERPRequest(erp_project_id="PROJ-0049", erp_status_id="ready-list")
         cards_payload = [
-            {"id": "done-card", "name": "Done", "idList": "ready-list", "url": "https://trello.test/done"},
-            {"id": "new-card", "name": "New", "idList": "ready-list", "url": "https://trello.test/new"},
+            {"id": "done-card", "name": "Done", "idList": "ready-list", "url": "https://erp.test/done"},
+            {"id": "new-card", "name": "New", "idList": "ready-list", "url": "https://erp.test/new"},
         ]
         done_attachments = [
             {"id": "source", "name": "source.png", "mimeType": "image/png"},
@@ -2982,16 +3755,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ]
         new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             side_effect=[cards_payload, done_attachments, new_attachments],
-        ), patch.object(self.service, "_trello_delete_attachment", return_value={}) as delete_attachment:
-            result = asyncio.run(self.service.reset_ready_trello_outputs(request))
+        ), patch.object(self.service, "_erp_delete_attachment", return_value={}) as delete_attachment:
+            result = asyncio.run(self.service.reset_ready_erp_outputs(request))
 
         self.assertEqual(2, result["cards_seen"])
         self.assertEqual(1, result["cards_reset"])
@@ -3001,12 +3774,58 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["flow-1", "flow-2", "flow-3", "flow-4"], deleted_ids)
         self.assertNotIn("source", deleted_ids)
 
-    def test_ready_trello_status_reports_completed_and_runnable_cards(self) -> None:
-        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+    def test_reset_ready_erp_outputs_is_locked_to_worker_env_list(self) -> None:
+        request = ResetReadyERPRequest(
+            erp_project_id="wrong-browser-board",
+            erp_status_id="worker-1-list",
+        )
         cards_payload = [
-            {"id": "done-card", "name": "Done", "idList": "ready-list", "url": "https://trello.test/done"},
-            {"id": "new-card", "name": "New", "idList": "ready-list", "url": "https://trello.test/new"},
-            {"id": "empty-card", "name": "Empty", "idList": "ready-list", "url": "https://trello.test/empty"},
+            {"id": "worker-1-card", "name": "Worker 1", "idList": "worker-1-list"},
+            {"id": "worker-3-card", "name": "Worker 3", "idList": "worker-3-list"},
+        ]
+        worker_3_attachments = [
+            {"id": "source-3", "name": "source.png", "mimeType": "image/png"},
+            {"id": "output-3", "name": "flow-worker3-1.jpg", "mimeType": "image/jpeg"},
+        ]
+
+        with patch.dict(
+            os.environ,
+            {"ERP_PROJECT_ID": "worker-board", "ERP_STATUS_ID": "worker-3-list"},
+        ), patch.object(
+            self.service,
+            "_erp_credentials",
+            return_value=("key", "token"),
+        ), patch.object(
+            self.service,
+            "_erp_resolve_board_list_id",
+            return_value="worker-3-list",
+        ) as resolve_list, patch.object(
+            self.service,
+            "_erp_auto_source_list_ids",
+        ) as expand_lists, patch.object(
+            self.service,
+            "_erp_get_json",
+            side_effect=[cards_payload, worker_3_attachments],
+        ), patch.object(
+            self.service,
+            "_erp_delete_attachment",
+            return_value={},
+        ) as delete_attachment:
+            result = asyncio.run(self.service.reset_ready_erp_outputs(request))
+
+        self.assertEqual("worker-board", result["project_id"])
+        self.assertEqual(["worker-3-list"], result["list_ids"])
+        self.assertEqual(1, result["cards_seen"])
+        resolve_list.assert_called_once_with("key", "token", "worker-board", "worker-3-list")
+        expand_lists.assert_not_called()
+        delete_attachment.assert_called_once_with("key", "token", "worker-3-card", "output-3")
+
+    def test_ready_erp_status_reports_completed_and_runnable_cards(self) -> None:
+        request = ResetReadyERPRequest(erp_project_id="PROJ-0049", erp_status_id="ready-list")
+        cards_payload = [
+            {"id": "done-card", "name": "Done", "idList": "ready-list", "url": "https://erp.test/done"},
+            {"id": "new-card", "name": "New", "idList": "ready-list", "url": "https://erp.test/new"},
+            {"id": "empty-card", "name": "Empty", "idList": "ready-list", "url": "https://erp.test/empty"},
         ]
         done_attachments = [
             {"id": "source", "name": "source.png", "mimeType": "image/png"},
@@ -3026,16 +3845,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         new_attachments = [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}]
         empty_attachments: list[dict] = []
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             side_effect=[cards_payload, done_attachments, new_attachments, empty_attachments],
         ):
-            result = asyncio.run(self.service.ready_trello_status(request))
+            result = asyncio.run(self.service.ready_erp_status(request))
 
         self.assertEqual(3, result["cards_seen"])
         self.assertEqual(1, result["complete"])
@@ -3050,14 +3869,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(0, missing_counts["done-card"])
         self.assertEqual(12, missing_counts["new-card"])
 
-    def test_ready_trello_status_uses_board_card_attachments_when_available(self) -> None:
-        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+    def test_ready_erp_status_uses_board_card_attachments_when_available(self) -> None:
+        request = ResetReadyERPRequest(erp_project_id="PROJ-0049", erp_status_id="ready-list")
         cards_payload = [
             {
                 "id": "done-card",
                 "name": "Done",
                 "idList": "ready-list",
-                "url": "https://trello.test/done",
+                "url": "https://erp.test/done",
                 "attachments": [
                     {"id": "source", "name": "source.png", "mimeType": "image/png"},
                     {"id": "flow-1", "name": "flow-done-1.jpg", "mimeType": "image/jpeg"},
@@ -3078,35 +3897,35 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "id": "new-card",
                 "name": "New",
                 "idList": "ready-list",
-                "url": "https://trello.test/new",
+                "url": "https://erp.test/new",
                 "attachments": [{"id": "new-source", "name": "new-source.png", "mimeType": "image/png"}],
             },
         ]
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ) as get_json:
-            result = asyncio.run(self.service.ready_trello_status(request))
+            result = asyncio.run(self.service.ready_erp_status(request))
 
         self.assertEqual(2, result["cards_seen"])
         self.assertEqual(1, result["complete"])
         self.assertEqual(1, result["eligible"])
         self.assertEqual(1, get_json.call_count)
 
-    def test_ready_trello_status_treats_single_generated_image_name_as_source(self) -> None:
-        request = ResetReadyTrelloRequest(trello_board_id="board123", trello_list_id="ready-list")
+    def test_ready_erp_status_treats_single_generated_image_name_as_source(self) -> None:
+        request = ResetReadyERPRequest(erp_project_id="PROJ-0049", erp_status_id="ready-list")
         cards_payload = [
             {
                 "id": "generated-card",
                 "name": "Generated source",
                 "idList": "ready-list",
-                "url": "https://trello.test/generated",
+                "url": "https://erp.test/generated",
                 "attachments": [
                     {
                         "id": "generated-source",
@@ -3117,16 +3936,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             }
         ]
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ):
-            result = asyncio.run(self.service.ready_trello_status(request))
+            result = asyncio.run(self.service.ready_erp_status(request))
 
         self.assertEqual(1, result["cards_seen"])
         self.assertEqual(0, result["complete"])
@@ -3136,41 +3955,41 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["cards"][0]["source_count"])
         self.assertEqual(0, result["cards"][0]["output_count"])
 
-    def test_trello_candidate_previews_hide_raw_attachment_url(self) -> None:
-        previews = self.service._trello_candidate_image_previews(
+    def test_erp_candidate_previews_hide_raw_attachment_url(self) -> None:
+        previews = self.service._erp_candidate_image_previews(
             "card-1",
-            [{"id": "att-1", "name": "source.png", "url": "https://trello.local/source.png", "mimeType": "image/png"}],
+            [{"id": "att-1", "name": "source.png", "url": "https://erp.local/source.png", "mimeType": "image/png"}],
         )
 
-        self.assertEqual("/api/trello/cards/card-1/attachments/att-1/preview", previews[0]["preview_url"])
+        self.assertEqual("/api/erp/tasks/card-1/attachments/att-1/preview", previews[0]["preview_url"])
         self.assertNotIn("url", previews[0])
 
-    def test_trello_secret_redaction_masks_query_tokens(self) -> None:
-        message = "failed: https://api.trello.com/1/cards?key=mykey&token=mytoken token=mytoken"
+    def test_erp_secret_redaction_masks_query_tokens(self) -> None:
+        message = "failed: https://api.erp.com/1/cards?key=mykey&token=mytoken token=mytoken"
 
-        redacted = self.service._redact_trello_secret(message, "mykey", "mytoken")
+        redacted = self.service._redact_erp_secret(message, "mykey", "mytoken")
 
         self.assertNotIn("mykey", redacted)
         self.assertNotIn("mytoken", redacted)
         self.assertIn("[redacted]", redacted)
 
-    def test_download_trello_card_image_attachments_uses_selected_attachment_only(self) -> None:
+    def test_download_erp_task_image_attachments_uses_selected_attachment_only(self) -> None:
         attachments = [
-            {"id": "att-wrong", "name": "wrong.png", "url": "https://trello.local/wrong.png", "mimeType": "image/png"},
-            {"id": "att-right", "name": "right.png", "url": "https://trello.local/right.png", "mimeType": "image/png"},
+            {"id": "att-wrong", "name": "wrong.png", "url": "https://erp.local/wrong.png", "mimeType": "image/png"},
+            {"id": "att-right", "name": "right.png", "url": "https://erp.local/right.png", "mimeType": "image/png"},
         ]
         downloaded: list[str] = []
 
-        def fake_download(key: str, token: str, card_id: str, attachment: dict) -> tuple[bytes, str]:
+        def fake_download(key: str, token: str, task_id: str, attachment: dict) -> tuple[bytes, str]:
             downloaded.append(str(attachment.get("id") or ""))
             return b"image", "image/png"
 
-        with patch.object(self.service, "_trello_get_json", return_value=attachments), patch.object(
+        with patch.object(self.service, "_erp_get_json", return_value=attachments), patch.object(
             self.service,
-            "_trello_download_attachment_bytes",
+            "_erp_download_attachment_bytes",
             side_effect=fake_download,
         ):
-            paths = self.service._download_trello_card_image_attachments(
+            paths = self.service._download_erp_task_image_attachments(
                 "key",
                 "token",
                 "card-1",
@@ -3182,27 +4001,27 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["att-right"], downloaded)
         self.assertEqual(1, len(paths))
         self.assertTrue(Path(paths[0]).exists())
-        self.assertEqual("card-1", self.service._trello_source_downloads["job12345"]["card_id"])
-        self.assertEqual(["att-right"], self.service._trello_source_downloads["job12345"]["attachment_ids"])
+        self.assertEqual("card-1", self.service._erp_source_downloads["job12345"]["task_id"])
+        self.assertEqual(["att-right"], self.service._erp_source_downloads["job12345"]["attachment_ids"])
 
-    def test_download_trello_card_image_attachments_uses_oldest_source_by_default(self) -> None:
+    def test_download_erp_task_image_attachments_uses_oldest_source_by_default(self) -> None:
         attachments = [
-            {"id": "old-source", "name": "old.png", "url": "https://trello.local/old.png", "mimeType": "image/png", "date": "2026-05-20T08:00:00.000Z"},
-            {"id": "new-source", "name": "new.png", "url": "https://trello.local/new.png", "mimeType": "image/png", "date": "2026-05-22T08:00:00.000Z"},
-            {"id": "flow-output", "name": "flow-job-1.jpg", "url": "https://trello.local/flow.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T09:00:00.000Z"},
+            {"id": "old-source", "name": "old.png", "url": "https://erp.local/old.png", "mimeType": "image/png", "date": "2026-05-20T08:00:00.000Z"},
+            {"id": "new-source", "name": "new.png", "url": "https://erp.local/new.png", "mimeType": "image/png", "date": "2026-05-22T08:00:00.000Z"},
+            {"id": "flow-output", "name": "flow-job-1.jpg", "url": "https://erp.local/flow.jpg", "mimeType": "image/jpeg", "date": "2026-05-22T09:00:00.000Z"},
         ]
         downloaded: list[str] = []
 
-        def fake_download(key: str, token: str, card_id: str, attachment: dict) -> tuple[bytes, str]:
+        def fake_download(key: str, token: str, task_id: str, attachment: dict) -> tuple[bytes, str]:
             downloaded.append(str(attachment.get("id") or ""))
             return b"image", "image/png"
 
-        with patch.object(self.service, "_trello_get_json", return_value=attachments), patch.object(
+        with patch.object(self.service, "_erp_get_json", return_value=attachments), patch.object(
             self.service,
-            "_trello_download_attachment_bytes",
+            "_erp_download_attachment_bytes",
             side_effect=fake_download,
         ):
-            paths = self.service._download_trello_card_image_attachments(
+            paths = self.service._download_erp_task_image_attachments(
                 "key",
                 "token",
                 "card-1",
@@ -3213,18 +4032,18 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(["old-source"], downloaded)
         self.assertEqual(1, len(paths))
         self.assertTrue(Path(paths[0]).exists())
-        self.assertEqual("card-1", self.service._trello_source_downloads["job12345"]["card_id"])
-        self.assertEqual(["old-source"], self.service._trello_source_downloads["job12345"]["attachment_ids"])
+        self.assertEqual("card-1", self.service._erp_source_downloads["job12345"]["task_id"])
+        self.assertEqual(["old-source"], self.service._erp_source_downloads["job12345"]["attachment_ids"])
 
-    def test_download_trello_card_image_attachments_rejects_selected_flow_output(self) -> None:
+    def test_download_erp_task_image_attachments_rejects_selected_flow_output(self) -> None:
         attachments = [
-            {"id": "source", "name": "source.png", "url": "https://trello.local/source.png", "mimeType": "image/png"},
-            {"id": "flow-output", "name": "flow-job-1.jpg", "url": "https://trello.local/flow.jpg", "mimeType": "image/jpeg"},
+            {"id": "source", "name": "source.png", "url": "https://erp.local/source.png", "mimeType": "image/png"},
+            {"id": "flow-output", "name": "flow-job-1.jpg", "url": "https://erp.local/flow.jpg", "mimeType": "image/jpeg"},
         ]
 
-        with patch.object(self.service, "_trello_get_json", return_value=attachments):
+        with patch.object(self.service, "_erp_get_json", return_value=attachments):
             with self.assertRaisesRegex(RuntimeError, "ảnh output cũ"):
-                self.service._download_trello_card_image_attachments(
+                self.service._download_erp_task_image_attachments(
                     "key",
                     "token",
                     "card-1",
@@ -3233,55 +4052,55 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                     ["flow-output"],
                 )
 
-    def test_trello_matching_hint_defaults_to_ready_list(self) -> None:
-        request = CreateJobRequest(type="image", prompt="", trello_board_id="https://trello.com/b/board123/demo")
+    def test_erp_matching_hint_defaults_to_open_status(self) -> None:
+        request = CreateJobRequest(type="image", prompt="", erp_project_id="PROJ-0049")
         items = [{"product_key": "shirt", "product": "Shirt", "prompt": "prompt"}]
-        card = {"id": "ready-card", "name": "shirt", "shortLink": "ready", "url": "https://trello.com/c/ready", "idList": "ready-list"}
+        card = {"id": "open-card", "name": "shirt", "shortLink": "open", "url": "https://erp.com/c/open", "idList": "open-list"}
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "ideas-list", "name": "Ideas"},
-                {"id": "ready-list", "name": "Ready for AI"},
+                {"id": "open-list", "name": "Open"},
             ],
         ), patch.object(
             self.service,
-            "_trello_matching_image_card_on_board",
+            "_erp_matching_image_card_on_board",
             return_value=card,
         ) as match_card, patch.object(
             self.service,
-            "_trello_list_name",
-            return_value="Ready for AI",
+            "_erp_status_name",
+            return_value="Open",
         ):
-            hint = self.service._trello_matching_image_card_hint(request, items)
+            hint = self.service._erp_matching_image_card_hint(request, items)
 
-        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list")
-        self.assertEqual("ready-card", hint["card_id"])
-        self.assertEqual("ready-list", hint["list_id"])
-        self.assertEqual("Ready for AI", hint["list_name"])
+        match_card.assert_called_once_with("key", "token", "PROJ-0049", items, "open-list")
+        self.assertEqual("open-card", hint["task_id"])
+        self.assertEqual("open-list", hint["status"])
+        self.assertEqual("Open", hint["list_name"])
 
-    def test_trello_source_card_hint_ignores_explicit_card_outside_ready_list(self) -> None:
+    def test_erp_source_task_hint_ignores_explicit_card_outside_ready_list(self) -> None:
         request = CreateJobRequest(
             type="image",
             prompt="",
-            trello_board_id="https://trello.com/b/board123/demo",
-            trello_card_id="wrong-card",
+            erp_project_id="https://erp.com/b/board123/demo",
+            erp_task_id="wrong-card",
         )
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "other-list", "name": "Done"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_card_hint_by_id",
-            return_value={"card_id": "wrong-card", "card_name": "wrong", "list_id": "other-list"},
+            "_erp_task_hint_by_id",
+            return_value={"task_id": "wrong-card", "task_name": "wrong", "status": "other-list"},
         ):
-            hint = self.service._trello_source_card_hint(request)
+            hint = self.service._erp_source_task_hint(request)
 
         self.assertEqual({}, hint)
 
@@ -3292,25 +4111,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                     IntegrationConfigUpdateRequest(
                         gemini_api_key="gem-key",
                         gemini_model="gemini-2.5-flash",
-                        telegram_bot_token="telegram-token",
-                        telegram_chat_id="@review_channel",
                         playwright_browsers_path="/tmp/pw-browsers",
                     )
                 )
             )
 
             self.assertTrue(result["gemini"]["configured"])
-            self.assertTrue(result["telegram"]["configured"])
             self.assertTrue(result["runtime"]["playwright_browsers_path_set"])
             self.assertNotIn("gemini_api_key", result["gemini"])
-            self.assertNotIn("telegram_bot_token", result["telegram"])
             self.assertEqual("gemini-2.5-flash", result["gemini"]["model"])
-            self.assertEqual("@review_channel", result["telegram"]["chat_id"])
+            # Connector Telegram đã gỡ: snapshot không còn khối này.
+            self.assertNotIn("telegram", result)
             self.assertEqual("/tmp/pw-browsers", os.environ.get("PLAYWRIGHT_BROWSERS_PATH"))
 
         saved = self.store.snapshot().integration_config
         self.assertEqual("gem-key", saved.gemini_api_key)
-        self.assertEqual("telegram-token", saved.telegram_bot_token)
         self.assertEqual("/tmp/pw-browsers", saved.playwright_browsers_path)
 
     def test_prompt_assistant_uses_app_saved_gemini_settings(self) -> None:
@@ -3330,81 +4145,81 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("gemini", engine["engine"])
         self.assertEqual("gemini-2.5-pro", engine["model"])
 
-    def test_user_assistant_local_answer_explains_trello_ready_flow(self) -> None:
+    def test_user_assistant_local_answer_explains_erp_ready_flow(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
             result = asyncio.run(
                 self.service.answer_user_assistant(
-                    UserAssistantRequest(question="Trello đang lấy nhầm ảnh từ card khác thì xử lý sao?")
+                    UserAssistantRequest(question="ERP đang lấy nhầm ảnh từ card khác thì xử lý sao?")
                 )
             )
 
         self.assertEqual("local", result["engine"])
-        self.assertIn("Ready for AI", result["answer"])
-        self.assertIn("attachment", result["answer"].lower())
+        self.assertIn("trạng thái Open", result["answer"])
+        self.assertIn("url ảnh https", result["answer"].lower())
         self.assertTrue(result["suggested_actions"])
         self.assertNotIn("gem-key", result["context_summary"])
 
-    def test_user_assistant_returns_executable_actions_for_auto_trello_request(self) -> None:
+    def test_user_assistant_returns_executable_actions_for_auto_erp_request(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
             result = asyncio.run(
                 self.service.answer_user_assistant(
-                    UserAssistantRequest(question="tìm trên trello ảnh về gấu cho tôi rồi chạy auto trello")
+                    UserAssistantRequest(question="tìm trên erp ảnh về gấu cho tôi rồi chạy auto erp")
                 )
             )
 
         actions = result["suggested_actions"]
         action_names = [action.get("action") for action in actions]
         self.assertIn("apply_product_filter", action_names)
-        self.assertIn("run_auto_trello", action_names)
-        run_action = next(action for action in actions if action.get("action") == "run_auto_trello")
+        self.assertIn("run_auto_erp", action_names)
+        run_action = next(action for action in actions if action.get("action") == "run_auto_erp")
         self.assertTrue(run_action["requires_confirmation"])
         filter_action = next(action for action in actions if action.get("action") == "apply_product_filter")
         self.assertEqual("gấu", filter_action["payload"]["value"])
-        self.assertIn("Ready for AI", result["context_summary"])
+        self.assertIn("trạng thái Open", result["context_summary"])
 
-    def test_user_assistant_limits_auto_trello_when_user_asks_for_test(self) -> None:
+    def test_user_assistant_limits_auto_erp_when_user_asks_for_test(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
             result = asyncio.run(
                 self.service.answer_user_assistant(
-                    UserAssistantRequest(question="test trên trello ảnh về hoops_with_photos rồi chạy auto trello")
+                    UserAssistantRequest(question="test trên erp ảnh về hoops_with_photos rồi chạy auto erp")
                 )
             )
 
-        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_trello")
+        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_erp")
         self.assertEqual(1, run_action["payload"]["limit"])
         self.assertTrue(run_action["payload"]["test_mode"])
         self.assertIn("chỉ chạy 1", run_action["detail"])
 
-    def test_user_assistant_sets_requested_auto_trello_batch_limit(self) -> None:
+    def test_user_assistant_sets_requested_auto_erp_batch_limit(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
             result = asyncio.run(
                 self.service.answer_user_assistant(
-                    UserAssistantRequest(question="tạo 3 ảnh búp bê rồi chạy auto trello")
+                    UserAssistantRequest(question="tạo 3 ảnh búp bê rồi chạy auto erp")
                 )
             )
 
         filter_action = next(action for action in result["suggested_actions"] if action.get("action") == "apply_product_filter")
         self.assertEqual("búp bê", filter_action["payload"]["value"])
-        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_trello")
+        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_erp")
         self.assertEqual(3, run_action["payload"]["limit"])
         self.assertNotIn("test_mode", run_action["payload"])
 
-    def test_user_assistant_can_pin_explicit_trello_card_url(self) -> None:
+    def test_user_assistant_can_pin_explicit_erp_task_url(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
             result = asyncio.run(
                 self.service.answer_user_assistant(
-                    UserAssistantRequest(question="lấy ảnh đúng card https://trello.com/c/abc12345/ten-card rồi chạy auto")
+                    UserAssistantRequest(question="lấy ảnh đúng card https://erp.com/c/abc12345/ten-card rồi chạy auto")
                 )
             )
 
-        card_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_trello_card")
+        card_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_erp_task")
         self.assertEqual("abc12345", card_action["payload"]["value"])
-        self.assertIn("không tự chọn card khác", card_action["detail"])
+        self.assertIn("không tự chọn Task khác", card_action["detail"])
 
-    def test_user_assistant_reports_trello_candidate_outside_ready(self) -> None:
+    def test_user_assistant_reports_erp_candidate_outside_ready(self) -> None:
         asyncio.run(
-            self.store.replace_trello_config(
-                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            self.store.replace_erp_config(
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -3412,9 +4227,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "id": "card-bear",
                 "name": "gau_bong",
                 "shortLink": "bear",
-                "url": "https://trello.com/c/bear",
+                "url": "https://erp.com/c/bear",
                 "idList": "ideas-list",
-                "attachments": [{"id": "att-bear", "name": "gau-bong.png", "url": "https://trello.local/bear.png", "mimeType": "image/png"}],
+                "attachments": [{"id": "att-bear", "name": "gau-bong.png", "url": "https://erp.local/bear.png", "mimeType": "image/png"}],
             }
         ]
 
@@ -3422,41 +4237,41 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
             clear=False,
-        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        ), patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "ideas-list", "name": "Ideas"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ):
             result = asyncio.run(
                 self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về gấu bông"))
             )
 
-        self.assertEqual(1, len(result["trello_candidates"]))
-        candidate = result["trello_candidates"][0]
+        self.assertEqual(1, len(result["erp_candidates"]))
+        candidate = result["erp_candidates"][0]
         self.assertEqual("Ideas", candidate["list_name"])
         self.assertFalse(candidate["in_ready_list"])
-        self.assertEqual("/api/trello/cards/card-bear/attachments/att-bear/preview", candidate["image_previews"][0]["preview_url"])
+        self.assertEqual("/api/erp/tasks/card-bear/attachments/att-bear/preview", candidate["image_previews"][0]["preview_url"])
         self.assertIn("bấm đúng thumbnail ảnh", result["answer"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
-        self.assertNotIn("run_auto_trello", action_names)
-        self.assertIn("set_trello_card", action_names)
-        pin_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_trello_card")
+        self.assertNotIn("run_auto_erp", action_names)
+        self.assertIn("set_erp_task", action_names)
+        pin_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_erp_task")
         self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
         self.assertTrue(pin_action["payload"]["run_after_select"])
         self.assertTrue(pin_action["label"].startswith("Chọn & chạy"))
-        self.assertIn("Trello scan theo", result["context_summary"])
+        self.assertIn("ERP scan theo", result["context_summary"])
 
-    def test_user_assistant_can_pin_ready_trello_candidate(self) -> None:
+    def test_user_assistant_can_pin_ready_erp_candidate(self) -> None:
         asyncio.run(
-            self.store.replace_trello_config(
-                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            self.store.replace_erp_config(
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -3464,7 +4279,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "id": "card-bear",
                 "name": "gau_bong",
                 "shortLink": "bear",
-                "url": "https://trello.com/c/bear",
+                "url": "https://erp.com/c/bear",
                 "idList": "ready-list",
                 "attachments": [{"id": "att-bear", "name": "gau-bong.png", "mimeType": "image/png"}],
             }
@@ -3474,39 +4289,39 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
             clear=False,
-        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        ), patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "ideas-list", "name": "Ideas"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ):
             result = asyncio.run(
                 self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về gấu bông"))
             )
 
-        self.assertTrue(result["trello_candidates"][0]["in_ready_list"])
+        self.assertTrue(result["erp_candidates"][0]["in_ready_list"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
-        self.assertIn("run_auto_trello", action_names)
+        self.assertIn("run_auto_erp", action_names)
         pin_action = next(
             action
             for action in result["suggested_actions"]
-            if action.get("action") == "set_trello_card" and action.get("payload", {}).get("value") == "bear"
+            if action.get("action") == "set_erp_task" and action.get("payload", {}).get("value") == "bear"
         )
         self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
         self.assertTrue(pin_action["payload"]["run_after_select"])
         self.assertTrue(pin_action["label"].startswith("Chọn & chạy"))
-        self.assertIn("ảnh attachment cũ nhất", pin_action["detail"])
+        self.assertIn("URL ảnh đầu tiên", pin_action["detail"])
 
     def test_user_assistant_searches_child_shirt_candidates_by_synonym(self) -> None:
         asyncio.run(
-            self.store.replace_trello_config(
-                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            self.store.replace_erp_config(
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -3514,7 +4329,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "id": "card-shirt",
                 "name": "T_050421_C1_010_D3_L1_4",
                 "shortLink": "shirt1",
-                "url": "https://trello.com/c/shirt1",
+                "url": "https://erp.com/c/shirt1",
                 "idList": "shirt-list",
                 "attachments": [{"name": "youth-model.jpg", "mimeType": "image/jpeg"}],
             }
@@ -3524,33 +4339,33 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
             clear=False,
-        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        ), patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "shirt-list", "name": "T-Shirt"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ):
             result = asyncio.run(
                 self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về áo trẻ em"))
             )
 
-        self.assertEqual(1, len(result["trello_candidates"]))
-        self.assertEqual("T-Shirt", result["trello_candidates"][0]["list_name"])
+        self.assertEqual(1, len(result["erp_candidates"]))
+        self.assertEqual("T-Shirt", result["erp_candidates"][0]["list_name"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertIn("apply_product_filter", action_names)
-        self.assertNotIn("run_auto_trello", action_names)
-        self.assertIn("chưa ở Ready for AI", result["answer"])
+        self.assertNotIn("run_auto_erp", action_names)
+        self.assertIn("chưa ở Open", result["answer"])
 
     def test_user_assistant_searches_doll_candidates_by_vietnamese_alias(self) -> None:
         asyncio.run(
-            self.store.replace_trello_config(
-                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            self.store.replace_erp_config(
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -3558,7 +4373,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "id": "card-doll",
                 "name": "BDA_02",
                 "shortLink": "doll1",
-                "url": "https://trello.com/c/doll1",
+                "url": "https://erp.com/c/doll1",
                 "idList": "baby-doll-list",
                 "attachments": [{"id": "att-doll", "name": "front.jpg", "mimeType": "image/jpeg"}],
             }
@@ -3568,34 +4383,34 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
             clear=False,
-        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        ), patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "baby-doll-list", "name": "Baby Doll"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ):
             result = asyncio.run(
                 self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về búp bê"))
             )
 
-        self.assertEqual(1, len(result["trello_candidates"]))
-        candidate = result["trello_candidates"][0]
+        self.assertEqual(1, len(result["erp_candidates"]))
+        candidate = result["erp_candidates"][0]
         self.assertEqual("Baby Doll", candidate["list_name"])
         self.assertEqual("att-doll", candidate["image_previews"][0]["id"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
-        self.assertIn("set_trello_card", action_names)
-        self.assertNotIn("run_auto_trello", action_names)
+        self.assertIn("set_erp_task", action_names)
+        self.assertNotIn("run_auto_erp", action_names)
 
     def test_user_assistant_does_not_match_generic_shirt_for_child_shirt_query(self) -> None:
         asyncio.run(
-            self.store.replace_trello_config(
-                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            self.store.replace_erp_config(
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -3603,7 +4418,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "id": "card-shirt",
                 "name": "Adult T-Shirt Mockup",
                 "shortLink": "shirt1",
-                "url": "https://trello.com/c/shirt1",
+                "url": "https://erp.com/c/shirt1",
                 "idList": "shirt-list",
                 "attachments": [{"name": "black-shirt.jpg", "mimeType": "image/jpeg"}],
             }
@@ -3613,28 +4428,28 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
             clear=False,
-        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        ), patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "shirt-list", "name": "T-Shirt"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=cards_payload,
         ):
             result = asyncio.run(
                 self.service.answer_user_assistant(UserAssistantRequest(question="tôi muốn làm ảnh về áo trẻ em"))
             )
 
-        self.assertEqual([], result["trello_candidates"])
+        self.assertEqual([], result["erp_candidates"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
-        self.assertNotIn("run_auto_trello", action_names)
+        self.assertNotIn("run_auto_erp", action_names)
         self.assertIn("chưa tìm thấy card", result["answer"])
 
-    def test_auto_trello_keyword_prompt_match_ignores_prompt_body(self) -> None:
+    def test_auto_erp_keyword_prompt_match_ignores_prompt_body(self) -> None:
         item = {
             "product_key": "adult_shirt",
             "product": "Adult Shirt",
@@ -3644,10 +4459,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertFalse(self.service._prompt_batch_item_matches_query(item, "áo trẻ em"))
 
-    def test_user_assistant_removes_run_auto_when_no_trello_candidate(self) -> None:
+    def test_user_assistant_removes_run_auto_when_no_erp_candidate(self) -> None:
         asyncio.run(
-            self.store.replace_trello_config(
-                TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+            self.store.replace_erp_config(
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
 
@@ -3655,13 +4470,13 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             os.environ,
             {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""},
             clear=False,
-        ), patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        ), patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[{"id": "ready-list", "name": "Ready for AI"}],
         ), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_get_json",
             return_value=[],
         ):
             result = asyncio.run(
@@ -3670,7 +4485,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertIn("apply_product_filter", action_names)
-        self.assertNotIn("run_auto_trello", action_names)
+        self.assertNotIn("run_auto_erp", action_names)
         self.assertIn("chưa tìm thấy card", result["answer"])
         self.assertIn("chưa thấy card", result["context_summary"])
 
@@ -3687,7 +4502,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         with patch.object(self.service, "_generate_user_assistant_with_gemini", return_value="Gemini hướng dẫn trong app."):
             result = asyncio.run(
                 self.service.answer_user_assistant(
-                    UserAssistantRequest(question="Sheet prompt cần điền như nào?", context="đang ở Auto Trello")
+                    UserAssistantRequest(question="Sheet prompt cần điền như nào?", context="đang ở Auto ERP")
                 )
             )
 
@@ -3709,16 +4524,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("local", result["engine"])
         self.assertEqual("áo trẻ em", result["product_filter"])
-        self.assertIn("Trello", result["summary"])
+        self.assertIn("ERP", result["summary"])
         self.assertIn("Google Flow Agent", result["flow_prompt"])
         self.assertIn("generate exactly 12", result["flow_prompt"])
-        self.assertIn("selected Trello attachment", result["flow_prompt"])
+        self.assertIn("selected ERP attachment", result["flow_prompt"])
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertIn("apply_product_filter", action_names)
         self.assertIn("apply_flow_ai_prompt", action_names)
         self.assertIn("open_flow_project", action_names)
-        self.assertIn("run_auto_trello", action_names)
-        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_trello")
+        self.assertIn("run_auto_erp", action_names)
+        run_action = next(action for action in result["suggested_actions"] if action.get("action") == "run_auto_erp")
         self.assertTrue(run_action["requires_confirmation"])
         self.assertNotIn("gem-key", result["context_summary"])
 
@@ -3755,9 +4570,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("búp bê", product)
 
-    def test_user_assistant_does_not_extract_generic_trello_status_text(self) -> None:
+    def test_user_assistant_does_not_extract_generic_erp_status_text(self) -> None:
         product = self.service._extract_user_assistant_product_filter(
-            "kiểm tra Trello Ready for AI và cho biết app sẽ lấy ảnh nào, không chạy tạo ảnh"
+            "kiểm tra ERP Ready for AI và cho biết app sẽ lấy ảnh nào, không chạy tạo ảnh"
         )
 
         self.assertEqual("", product)
@@ -3783,7 +4598,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "title": "Flow AI Gemini",
             "summary": "Gemini đã lập kế hoạch operator.",
             "product_filter": "gấu bông",
-            "flow_prompt": "Use Google Flow Agent as the prompt writer and image-generation operator. Use the selected Trello attachment as the exact teddy bear product reference, analyze the product first, then write internal prompts and generate exactly 12 commercial product images with coherent teddy bear styling, clean white daylight, clean composition, realistic fabric texture, pastel fabric colorway variants, and no extra text or watermark.",
+            "flow_prompt": "Use Google Flow Agent as the prompt writer and image-generation operator. Use the selected ERP attachment as the exact teddy bear product reference, analyze the product first, then write internal prompts and generate exactly 12 commercial product images with coherent teddy bear styling, clean white daylight, clean composition, realistic fabric texture, pastel fabric colorway variants, and no extra text or watermark.",
             "steps": [{"label": "Tìm ảnh", "detail": "Dùng card Ready for AI.", "status": "sẵn sàng"}],
             "safety_notes": ["Không chạy nếu chưa thấy card đúng."],
         }
@@ -3841,119 +4656,6 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertFalse(resolved.flow_agent_auto_approve)
         self.assertEqual(3, resolved.count)
         self.assertEqual("square", resolved.aspect)
-
-    def test_telegram_review_pack_uses_app_saved_config(self) -> None:
-        asyncio.run(
-            self.service.update_integration_config(
-                IntegrationConfigUpdateRequest(
-                    telegram_bot_token="telegram-token",
-                    telegram_chat_id="@review_channel",
-                )
-            )
-        )
-        request = CreateJobRequest(type="image", prompt="cat")
-        artifact = JobArtifact(label="Ảnh 1", url="https://example.com/cat.jpg", mime_type="image/jpeg")
-        job = JobRecord(type="image", status="running", title="test")
-        asyncio.run(self.store.add_job(job))
-
-        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": ""}, clear=False), patch.object(
-            self.service,
-            "_send_telegram_photo",
-        ) as send_photo:
-            result = asyncio.run(self.service._send_telegram_review_pack(job.id, request, [artifact]))
-
-        send_photo.assert_called_once()
-        self.assertEqual("telegram-token", send_photo.call_args.args[0])
-        self.assertEqual("@review_channel", send_photo.call_args.args[1])
-        reply_markup = send_photo.call_args.args[4]
-        callback_values = [
-            button["callback_data"]
-            for row in reply_markup["inline_keyboard"]
-            for button in row
-        ]
-        self.assertIn(f"fw:approve:{job.id}:0", callback_values)
-        self.assertIn(f"fw:reject:{job.id}:0", callback_values)
-        self.assertTrue(result["configured"])
-        self.assertEqual(1, result["sent"])
-        self.assertEqual(1, result["pending_approvals"])
-
-    def test_sync_telegram_approvals_updates_job_and_approval_node(self) -> None:
-        asyncio.run(
-            self.service.update_integration_config(
-                IntegrationConfigUpdateRequest(
-                    telegram_bot_token="telegram-token",
-                    telegram_chat_id="@review_channel",
-                )
-            )
-        )
-        job = JobRecord(
-            type="image",
-            status="completed",
-            title="test",
-            result={
-                "automation_execution": {
-                    "mode": "graph",
-                    "nodes": [
-                        {"id": "flow-1", "type": "flow", "status": "completed", "output": {}},
-                        {"id": "approval-1", "type": "approval", "status": "running", "output": {}},
-                    ],
-                    "edges": [],
-                    "current_module_id": "approval-1",
-                    "completed": False,
-                }
-            },
-            artifacts=[JobArtifact(label="Ảnh 1", url="https://example.com/cat.jpg", mime_type="image/jpeg")],
-        )
-        asyncio.run(self.store.add_job(job))
-        updates = [
-            {
-                "update_id": 100,
-                "callback_query": {
-                    "id": "callback-1",
-                    "from": {"id": 7, "first_name": "Ellyn", "username": "ellyn"},
-                    "message": {"message_id": 42, "chat": {"id": -100}},
-                    "data": f"fw:approve:{job.id}:0",
-                },
-            }
-        ]
-
-        with patch.object(self.service, "_telegram_get_updates", side_effect=[updates, []]) as get_updates, patch.object(
-            self.service,
-            "_telegram_answer_callback_query",
-        ) as answer:
-            result = asyncio.run(self.service.sync_telegram_approvals())
-
-        self.assertTrue(result["configured"])
-        self.assertEqual(1, result["processed"])
-        get_updates.assert_any_call("telegram-token")
-        get_updates.assert_any_call("telegram-token", 101)
-        answer.assert_called_once()
-        saved = self.store.get_job(job.id)
-        self.assertEqual("approved", saved.result["telegram_approvals"]["0"]["status"])
-        self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
-        approval_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["type"] == "approval")
-        self.assertEqual("completed", approval_node["status"])
-        self.assertTrue(saved.result["automation_execution"]["completed"])
-
-    def test_telegram_approval_sync_loop_polls_until_cancelled(self) -> None:
-        calls = 0
-
-        async def fake_sync() -> dict[str, object]:
-            nonlocal calls
-            calls += 1
-            return {"configured": True, "processed": 0, "approvals": []}
-
-        async def run_loop() -> None:
-            task = asyncio.create_task(self.service.run_telegram_approval_sync_loop(interval_s=0.01))
-            with patch.object(self.service, "sync_telegram_approvals", side_effect=fake_sync):
-                while calls < 2:
-                    await asyncio.sleep(0.02)
-                task.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await task
-
-        asyncio.run(run_loop())
-        self.assertGreaterEqual(calls, 2)
 
     def test_prompt_source_preview_reads_pasted_google_sheet_rows(self) -> None:
         table = "\n".join(
@@ -4050,10 +4752,22 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             self.service,
             "_flow_profile_has_auth_cookies",
             return_value=True,
-        ):
+        ), patch.object(self.service, "_flow_session_cookie_expired", return_value=False):
             status = self.service.get_auth_status()
 
         self.assertTrue(status.authenticated)
+
+    def test_get_auth_status_reports_signed_out_once_the_session_cookie_died(self) -> None:
+        # A cookie store on disk used to be proof enough, which is how the
+        # dashboard came to claim "đã đăng nhập" while every job failed 401.
+        with patch.object(self.service, "_flow_modules", return_value=(None, lambda: True, None, None, None)), patch.object(
+            self.service,
+            "_flow_profile_has_auth_cookies",
+            return_value=True,
+        ), patch.object(self.service, "_flow_session_cookie_expired", return_value=True):
+            status = self.service.get_auth_status()
+
+        self.assertFalse(status.authenticated)
 
     def test_start_image_search_terms_include_file_stem(self) -> None:
         terms = self.service._start_image_search_terms(r"D:\flow\data\uploads\OIP-2.jfif")
@@ -4087,11 +4801,58 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual(["media-model", "media-shirt", "media-logo"], ordered)
 
-    def test_canonical_project_url_uses_vi_locale_route(self) -> None:
+    def test_canonical_project_url_uses_flow_google_navigation_host(self) -> None:
         self.assertEqual(
-            "https://labs.google/fx/vi/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+            "https://flow.google.com/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
             self.service._project_url("f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"),
         )
+
+    def test_flow_navigation_host_comes_from_one_environment_setting(self) -> None:
+        project_id = "f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"
+        with patch.dict(
+            os.environ,
+            {"FLOW_NAVIGATION_BASE_URL": "https://flow-fallback.example.test/base/"},
+            clear=False,
+        ):
+            self.assertEqual(
+                f"https://flow-fallback.example.test/base/project/{project_id}",
+                self.service._project_url(project_id),
+            )
+
+    def test_bearer_token_page_stays_on_labs_google(self) -> None:
+        """Token nằm ở phiên next-auth của labs.google, không nằm ở editor mới.
+
+        Trang ``flow.google.com`` không có ``__NEXT_DATA__`` lẫn
+        ``/fx/api/auth/session``.  Điều hướng lấy token sang đó thì không có
+        token, và mọi lệnh gọi Flow rơi xuống API key rồi trả 401 — đúng sự cố
+        đo được trên máy trung tâm ngày 08/09/2026.
+        """
+        project_id = "f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"
+        self.assertEqual(
+            f"https://labs.google/fx/tools/flow/project/{project_id}",
+            self.service._flow_token_page_url(project_id),
+        )
+
+    def test_bearer_token_page_ignores_the_navigation_host_setting(self) -> None:
+        """Đổi host mở giao diện không được kéo theo chỗ lấy token."""
+        project_id = "f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"
+        with patch.dict(
+            os.environ,
+            {"FLOW_NAVIGATION_BASE_URL": "https://flow-fallback.example.test/base/"},
+            clear=False,
+        ):
+            self.assertEqual(
+                f"https://labs.google/fx/tools/flow/project/{project_id}",
+                self.service._flow_token_page_url(project_id),
+            )
+
+    def test_bearer_token_page_without_a_project_is_empty(self) -> None:
+        self.assertEqual("", self.service._flow_token_page_url(""))
+
+    def test_flow_navigation_page_check_accepts_new_and_legacy_hosts(self) -> None:
+        self.assertTrue(self.service._is_flow_navigation_url("https://flow.google.com/project/pid"))
+        self.assertTrue(self.service._is_flow_navigation_url("https://labs.google/fx/tools/flow/project/pid"))
+        self.assertFalse(self.service._is_flow_navigation_url("https://example.test/project/pid"))
 
     def test_detects_placeholder_project_route(self) -> None:
         self.assertTrue(
@@ -4157,6 +4918,43 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Audio generation failed", detail)
         self.assertIn("silent videos", detail)
 
+    def test_humanize_flow_error_maps_a_missing_flow_session(self) -> None:
+        message = humanize_flow_error(
+            "HTTP 401 on batchGenerateImages: API keys are not supported by this API. "
+            "Expected OAuth2 access token or other authentication credentials that assert "
+            "a principal. See https://cloud.google.com/docs/authentication"
+        )
+
+        self.assertIn("hết hạn", message)
+        self.assertIn("Đăng nhập Flow", message)
+        self.assertNotIn("cloud.google.com", message)
+
+    def test_humanize_flow_error_maps_a_profile_held_by_the_login_window(self) -> None:
+        # The Flow login window holds the same profile the job needs, and
+        # Playwright reports that with a page of raw launch flags.
+        message = humanize_flow_error(
+            "BrowserType.launch_persistent_context: Opening in existing browser session. "
+            "This usually means that the profile is already in use by another instance of "
+            "Chromium.\nCall log:\n  - <launching> /Users/admin/Library/Caches/ms-playwright/"
+            "chromium-1234/chrome-mac-arm64/Google Chrome for Testing --disable-field-trial-config"
+        )
+
+        self.assertIn("đóng cửa sổ Chromium", message)
+        self.assertNotIn("launch_persistent_context", message)
+        self.assertNotIn("disable-field-trial-config", message)
+
+    def test_humanize_flow_error_maps_erp_attachment_limit(self) -> None:
+        # A card reused across runs fills up and Frappe answers with a
+        # traceback the owner cannot act on.
+        message = humanize_flow_error(
+            'ERP từ chối upload file (HTTP 417): {"exception":"frappe.exceptions.'
+            'AttachmentLimitReached: Đã đạt Giới hạn Đính kèm tối đa <strong>20</strong> '
+            'cho Task TASK-2026-00601."}'
+        )
+
+        self.assertIn("giới hạn số tệp đính kèm", message)
+        self.assertNotIn("frappe.exceptions", message)
+
     def test_humanize_flow_error_maps_audio_generation_failure(self) -> None:
         message = humanize_flow_error(
             "Audio generation failed. Please try a different prompt or send feedback. "
@@ -4201,6 +4999,95 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertIn("ảnh tham chiếu", notice)
         self.assertIn("người mẫu trưởng thành", notice)
+
+    def test_policy_preflight_notice_warns_when_the_prompt_says_thay_do(self) -> None:
+        # Ghim câu người ta gõ, không ghim chuỗi đã chuẩn hoá: "thay đồ" là
+        # đúng cách nói mà chính lời cảnh báo nêu tên, nên nó phải kích hoạt
+        # được cảnh báo ấy dù bộ chuẩn hoá bên dưới có đổi kiểu.
+        request = CreateJobRequest(
+            type="image",
+            prompt="thay đồ cho người trong ảnh",
+            reference_image_paths=["/tmp/model.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        notice = self.service._policy_preflight_notice(request)
+
+        self.assertIn("ảnh tham chiếu", notice)
+
+    def test_policy_preflight_notice_warns_when_the_prompt_says_lam_dep(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="làm đẹp ngoại hình cho ảnh này",
+            reference_image_paths=["/tmp/model.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        notice = self.service._policy_preflight_notice(request)
+
+        self.assertIn("ảnh tham chiếu", notice)
+
+    def test_policy_preflight_notice_stays_quiet_for_unrelated_d_words(self) -> None:
+        # Gấp ``đ`` thành ``d`` không được biến mọi câu có chữ đ thành cảnh báo:
+        # "màu đỏ" ra "mau do", không chạm mục nào trong ba bảng.
+        request = CreateJobRequest(
+            type="image",
+            prompt="màu đỏ của chiếc túi rút dây",
+            reference_image_paths=["/tmp/bag.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        self.assertEqual("", self.service._policy_preflight_notice(request))
+
+    def test_policy_text_folds_d_with_stroke_before_stripping_accents(self) -> None:
+        # ``đ`` là chữ cái riêng (U+0111), NFD không tách nó ra; không gấp trước
+        # thì bước lọc ASCII xoá thẳng nó và bảng POLICY_* mất chín mục.
+        self.assertEqual("lam dep", self.service._normalize_policy_text("làm đẹp"))
+        self.assertEqual("dong phuc", self.service._normalize_policy_text("Đồng phục"))
+
+    # ── Tập đóng, không lấy mẫu ────────────────────────────────────────
+    # Ba bảng POLICY_* cộng lại 48 mục; 15 mục có chữ ``d``; 9 trong số đó là
+    # ``d`` vốn là ``đ`` và chết sạch trước bản vá; 6 mục còn lại là ``d`` thật
+    # (toàn từ tiếng Anh) và bản vá không được phép đụng vào.
+    #
+    # Ghim CÂU NGƯỜI GÕ, không ghim chuỗi đã chuẩn hoá — ghim chuỗi sau chuẩn
+    # hoá thì test xanh với mọi bộ chuẩn hoá, kể cả bộ hỏng.
+
+    POLICY_TERMS_FROM_D_STROKE = (
+        ("dep trai hon", "làm cho anh ấy đẹp trai hơn"),
+        ("dep gai hon", "sửa cho cô ấy đẹp gái hơn"),
+        ("dep hon", "chỉnh mặt đẹp hơn chút"),
+        ("lam dep", "làm đẹp khuôn mặt giúp tôi"),
+        ("trang diem", "trang điểm nhẹ cho người mẫu"),
+        ("thay do", "thay đồ cho bạn nhỏ này"),
+        ("mac do", "cho bé mặc đồ mùa đông"),
+        ("thu do", "cho chị ấy thử đồ mới"),
+        ("dong phuc", "cho các em mặc đồng phục"),
+    )
+
+    POLICY_TERMS_WITH_A_REAL_D = ("body", "child", "dress", "kid", "model", "underage")
+
+    def test_every_policy_term_born_from_d_stroke_is_reachable(self) -> None:
+        for term, typed in self.POLICY_TERMS_FROM_D_STROKE:
+            with self.subTest(term=term):
+                self.assertIn(term, self.service._normalize_policy_text(typed))
+
+    def test_the_policy_terms_holding_a_d_are_a_closed_set(self) -> None:
+        # Không tin con số 9 vì đã đếm tay: dựng lại tập đóng từ chính ba bảng.
+        # Ai thêm một mục tiếng Việt có ``đ`` mà quên ghim nó thì test này đỏ.
+        terms = set(self.service.POLICY_MINOR_TERMS)
+        terms |= set(self.service.POLICY_APPEARANCE_TERMS)
+        terms |= set(self.service.POLICY_APPAREL_TERMS)
+        with_d = {term for term in terms if "d" in term}
+        pinned = {term for term, _ in self.POLICY_TERMS_FROM_D_STROKE}
+
+        self.assertEqual(with_d, pinned | set(self.POLICY_TERMS_WITH_A_REAL_D))
+
+    def test_policy_terms_with_a_real_d_survive_the_fold(self) -> None:
+        # Nhóm đối chứng: gấp ``đ`` không được đụng tới ``d`` thật.
+        for term in self.POLICY_TERMS_WITH_A_REAL_D:
+            with self.subTest(term=term):
+                self.assertIn(term, self.service._normalize_policy_text(f"ảnh {term} này"))
 
     def test_default_title_marks_video_from_image(self) -> None:
         request = CreateJobRequest(
@@ -4347,9 +5234,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
     def test_local_storyboard_plan_honors_explicit_count_for_short_script(self) -> None:
         request = StoryboardPlanRequest(
-            script="Một shop online nhận ảnh từ Trello, tạo ảnh bằng Flow, duyệt Telegram rồi lưu lại đúng card.",
+            script="Một shop online nhận ảnh từ ERP, tạo ảnh bằng Flow, duyệt Telegram rồi lưu lại đúng card.",
             style="software explainer",
-            must_include="Trello, Flow, Telegram",
+            must_include="ERP, Flow, Telegram",
             aspect="landscape",
             scene_count=3,
         )
@@ -4363,7 +5250,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Cao trào", scenes[2].beat)
 
     def test_gemini_storyboard_request_allows_large_json_outputs(self) -> None:
-        request = StoryboardPlanRequest(script="Một shop online chạy automation Trello, Flow và Telegram.", scene_count=3)
+        request = StoryboardPlanRequest(script="Một shop online chạy automation ERP, Flow và Telegram.", scene_count=3)
 
         payload = self.service._gemini_storyboard_request(request, [], 3)
 
@@ -4395,6 +5282,55 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
 
 class StateStoreRegressionTests(TempAppPathsMixin, unittest.TestCase):
+
+    def test_store_history_trim_never_drops_running_batch_or_queued_child(self) -> None:
+        store = StateStore()
+        batch = JobRecord(type="batch_image", status="running", title="Auto AI Trello: cho san pham moi lien tuc")
+        asyncio.run(store.add_job(batch))
+        for index in range(60):
+            asyncio.run(store.add_job(JobRecord(type="image", status="completed", title=f"Flow Agent {index + 1}/{index + 1} · card")))
+        queued = JobRecord(type="image", status="queued", title="Flow Agent 61/61 · card")
+        asyncio.run(store.add_job(queued))
+
+        jobs = asyncio.run(store.list_jobs())
+        # hvg-pc trim semantics: the 50-window holds the newest records and live jobs stay on top of it.
+        self.assertEqual(StateStore.JOB_HISTORY_LIMIT + 1, len(jobs))
+        self.assertEqual(queued.id, jobs[0].id)
+        self.assertIsNotNone(store.get_job(batch.id), "running batch must survive the history trim")
+        self.assertIsNotNone(store.get_job(queued.id))
+        completed_titles = [job.title for job in jobs if job.status == "completed"]
+        self.assertEqual(49, len(completed_titles))
+        self.assertEqual("Flow Agent 60/60 · card", completed_titles[0])
+
+    def test_store_history_trim_keeps_batch_that_owns_a_live_child(self) -> None:
+        store = StateStore()
+        child = JobRecord(type="image", status="queued", title="Flow Agent 1/1 · card")
+        batch = JobRecord(
+            type="batch_image",
+            status="completed",
+            title="Auto AI Trello: cho san pham moi lien tuc",
+            result={"child_job_ids": [child.id], "current_child_job_id": child.id},
+        )
+        asyncio.run(store.add_job(batch))
+        asyncio.run(store.add_job(child))
+        for index in range(60):
+            asyncio.run(store.add_job(JobRecord(type="image", status="failed", title=f"old {index}")))
+
+        jobs = asyncio.run(store.list_jobs())
+        self.assertEqual(StateStore.JOB_HISTORY_LIMIT + 2, len(jobs))
+        self.assertIsNotNone(store.get_job(batch.id), "batch owning a queued child must survive")
+        self.assertIsNotNone(store.get_job(child.id))
+
+    def test_store_history_trim_applies_plain_limit_when_nothing_is_live(self) -> None:
+        store = StateStore()
+        for index in range(60):
+            asyncio.run(store.add_job(JobRecord(type="image", status="completed", title=f"done {index}")))
+
+        jobs = asyncio.run(store.list_jobs())
+        self.assertEqual(50, len(jobs))
+        self.assertEqual("done 59", jobs[0].title)
+        self.assertEqual("done 10", jobs[-1].title)
+
     def setUp(self) -> None:
         self.start_temp_paths()
 
@@ -4419,6 +5355,7 @@ class StateStoreRegressionTests(TempAppPathsMixin, unittest.TestCase):
 
 
 class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCase):
+
     def setUp(self) -> None:
         self.start_temp_paths()
         self._batch_pause_env = patch.dict(
@@ -4451,6 +5388,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         with self.assertRaises(FlowAgentQuotaError):
             await self.service._raise_flow_agent_quota_if_visible(FakePage(), ignore_message="")
 
+    async def test_flow_agent_try_again_error_retries_via_ui(self) -> None:
+        detail = "Đã xảy ra lỗi. Hãy thử lại."
+
+        self.assertTrue(self.service._is_retryable_flow_agent_ui_error(detail))
+        self.assertEqual(8.0, self.service._flow_agent_ui_retry_delay_s(detail))
+
     async def test_generate_images_with_retry_falls_back_to_ui_when_image_model_rejected(self) -> None:
         request = CreateJobRequest(type="image", prompt="run", model="Nano Banana Pro", count=1)
         fake_client = SimpleNamespace()
@@ -4477,6 +5420,693 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         generate_once.assert_awaited_once_with(fake_client, request, [])
         reload_page.assert_awaited_once_with(fake_client)
         via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
+
+    async def test_generate_images_with_retry_falls_back_to_ui_on_invalid_argument(self) -> None:
+        # Google rejects the direct batchGenerateImages payload with a bare
+        # INVALID_ARGUMENT and no field detail; the browser path still works.
+        request = CreateJobRequest(type="image", prompt="run", model="Nano Banana Pro", count=1)
+        fake_client = SimpleNamespace()
+        fake_images = [SimpleNamespace(media_name="img-1")]
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        with patch.object(
+            self.service,
+            "_generate_images_once",
+            AsyncMock(side_effect=RuntimeError(
+                "HTTP 400 INVALID_ARGUMENT on batchGenerateImages: Request contains an invalid argument."
+            )),
+        ), patch.object(
+            self.service,
+            "_reload_flow_project_page",
+            AsyncMock(),
+        ) as reload_page, patch.object(
+            self.service,
+            "_generate_images_via_ui",
+            AsyncMock(return_value=fake_images),
+        ) as via_ui:
+            result = await self.service._generate_images_with_retry(fake_client, job.id, request, [])
+
+        self.assertEqual(fake_images, result)
+        reload_page.assert_awaited_once_with(fake_client)
+        via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
+
+    async def test_ingredient_picker_uploads_through_its_own_button(self) -> None:
+        """Bảng chọn có nút ``Upload media`` riêng — nạp thẳng vào đó.
+
+        Trông chờ ảnh đã nằm sẵn trong thư viện project là hỏng: cú tải lên thư
+        viện thất bại thì ô ảnh kẹt ở ``Uploading`` mãi.  Job ``72977963`` chờ
+        45 giây, soi 345 mục, lần nào cũng thấy ô của mình còn dang dở.
+        """
+        source = self.temp_root / "erp-1.png"
+        source.write_bytes(b"anh-erp-gia-lap")
+        da_nap: list[str] = []
+        da_tim: list[str] = []
+
+        class FakeChooser:
+            async def set_files(self, duong_dan: str) -> None:
+                da_nap.append(duong_dan)
+
+        class ChoHopChon:
+            async def __aenter__(self) -> "ChoHopChon":
+                return self
+
+            async def __aexit__(self, *_args: object) -> bool:
+                return False
+
+            @property
+            def value(self) -> object:
+                async def _lay() -> FakeChooser:
+                    return FakeChooser()
+
+                return _lay()
+
+        class Nut:
+            async def count(self) -> int:
+                return 1
+
+            async def click(self, **_kwargs: object) -> None:
+                return None
+
+        class CoNut:
+            @property
+            def first(self) -> Nut:
+                return Nut()
+
+        class KhongCo:
+            @property
+            def first(self) -> "KhongCo":
+                return self
+
+            async def count(self) -> int:
+                return 0
+
+        class FakePage:
+            def expect_file_chooser(self, **_kwargs: object) -> ChoHopChon:
+                return ChoHopChon()
+
+            def locator(self, selector: str) -> object:
+                da_tim.append(selector)
+                if "Upload media" in selector:
+                    return CoNut()
+                return KhongCo()
+
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            ok, detail = await self.service._tai_anh_trong_bang_chon(FakePage(), source)
+
+        self.assertTrue(ok, detail)
+        self.assertEqual([str(source)], da_nap)
+
+    async def test_prompt_box_probe_reads_what_sits_next_to_the_prompt(self) -> None:
+        """Soi thẳng ô nhập lệnh, đừng soi cây con của panel.
+
+        Job ``048f18e9`` chốt xong, ảnh chụp thấy rõ ô ảnh nằm cạnh câu lệnh,
+        mà bản soi panel đọc ra ``allMedia=0``: sau cú gắn Flow dựng lại panel
+        nên khung lệnh không còn là con của nó nữa.
+        """
+        da_goi: list[str] = []
+
+        class FakePage:
+            async def evaluate(self, _js: str, ten: str = "") -> dict:
+                da_goi.append(ten)
+                return {
+                    "khop_ten": True,
+                    "so_anh_khung": 1,
+                    "so_o_nhap": 2,
+                    "nhan": ["erp-048f18e9-1.png"],
+                }
+
+        ra = await self.service._soi_o_anh_khung_lenh(
+            FakePage(), "erp-048f18e9-1.png"
+        )
+
+        self.assertEqual(["erp-048f18e9-1.png"], da_goi, "phai chuyen ten anh sang JS")
+        self.assertTrue(ra["khop_ten"])
+        self.assertEqual(1, ra["so_anh_khung"])
+
+    async def test_prompt_box_probe_does_not_crash_the_job(self) -> None:
+        """Soi hỏng thì trả về số 0, đừng ném lỗi làm chết cả lượt.
+
+        Bản soi này chỉ là bằng chứng thêm.  Nó gãy thì job vẫn phải đi tiếp
+        tới nhánh dừng an toàn, chứ không phải nổ giữa đường.
+        """
+
+        class FakePage:
+            async def evaluate(self, _js: str, _ten: str = "") -> dict:
+                raise RuntimeError("Execution context was destroyed")
+
+        ra = await self.service._soi_o_anh_khung_lenh(FakePage(), "erp-1.png")
+
+        self.assertFalse(ra["khop_ten"])
+        self.assertEqual(0, ra["so_anh_khung"])
+        self.assertIn("loi", ra)
+
+    def test_prompt_box_that_grew_a_tile_counts_as_attached(self) -> None:
+        """Khung lệnh mọc thêm ô ảnh là đã gắn được."""
+        ok, detail = self.service._khung_lenh_da_nhan(
+            {"so_anh_khung": 0, "nhan": []},
+            {"so_anh_khung": 1, "nhan": ["erp-1.png"]},
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertIn("0->1", detail)
+
+    def test_prompt_box_name_is_proof_even_when_the_count_holds(self) -> None:
+        """Tên ảnh ERP hiện trong khung là bằng chứng thẳng.
+
+        Phiên Agent dùng chung còn ô ảnh cũ từ lượt trước, nên đếm 1->1 vẫn
+        có thể là đã gắn.  Đọc được tên thì khỏi đếm.
+        """
+        ok, detail = self.service._khung_lenh_da_nhan(
+            {"so_anh_khung": 1, "nhan": ["cu.png"]},
+            {"so_anh_khung": 1, "khop_ten": True, "nhan": ["erp-048f18e9-1.png"]},
+        )
+
+        self.assertTrue(ok, detail)
+        self.assertIn("erp-048f18e9-1.png", detail)
+
+    def test_prompt_box_with_nothing_new_stays_unproven(self) -> None:
+        """Không mọc thêm, không đọc được tên thì **chưa** tính là đã gắn.
+
+        Đây là cái chốt giữ cho job không đi tạo ảnh khi ảnh nguồn chưa vào.
+        Ô ảnh sót lại từ lượt trước không được tính thay cho ảnh lượt này.
+        """
+        ok, detail = self.service._khung_lenh_da_nhan(
+            {"so_anh_khung": 2, "nhan": ["cu.png"]},
+            {"so_anh_khung": 2, "khop_ten": False, "nhan": ["cu.png"]},
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("2->2", detail)
+
+    def test_prompt_box_check_survives_a_broken_probe(self) -> None:
+        """Bản soi gãy trả về dict thiếu khoá — vẫn phải ra "chưa gắn"."""
+        ok, _detail = self.service._khung_lenh_da_nhan({}, {"loi": "hong"})
+
+        self.assertFalse(ok)
+
+    def test_grid_signature_skips_the_wrapper_around_the_tiles(self) -> None:
+        """Chữ ký lưới phải là **ô ảnh**, không phải cái vỏ bọc cả lưới.
+
+        Job ``87c82090`` đọc ra ``cdk-virtual-scroll-viewport|Asset list`` rồi
+        đi kéo đúng cái vỏ ấy — kéo vỏ thì chẳng kéo được ảnh nào.
+        """
+        js = self.service._JS_CHU_KY_O_LUOI
+        self.assertIn("el.contains(khac)", js)
+        self.assertIn("ung_vien", js)
+
+    async def test_mouse_drag_walks_to_the_composer_and_never_clicks(self) -> None:
+        """Kéo bằng chuột thật, đi từng chặng, và **không** bấm thêm cú nào.
+
+        Kéo–thả HTML5 bắn xong gói vẫn rỗng (``goi mang: rong`` của job
+        ``90a17981``) vì lưới Flow là Angular CDK, kéo bằng sự kiện con trỏ.
+        Còn cú bấm sau khi thả thì mở ảnh ra và làm panel Tác nhân biến mất —
+        dãy ``16->0`` của job ``879299d2``.
+        """
+        buoc: list[tuple[str, float, float]] = []
+
+        class FakeMouse:
+            async def move(self, x: float, y: float, **_kwargs: object) -> None:
+                buoc.append(("move", x, y))
+
+            async def down(self, **_kwargs: object) -> None:
+                buoc.append(("down", 0.0, 0.0))
+
+            async def up(self, **_kwargs: object) -> None:
+                buoc.append(("up", 0.0, 0.0))
+
+            async def click(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("bam sau khi tha lam panel Tac nhan bien mat")
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, _script: str, _arg: object = None) -> object:
+                return {"ok": True, "o": {"x": 200.0, "y": 300.0}, "khung": {"x": 900.0, "y": 800.0}}
+
+            async def click(self, *_args: object, **_kwargs: object) -> None:
+                raise AssertionError("bam sau khi tha lam panel Tac nhan bien mat")
+
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            ok, detail = await self.service._keo_chuot_o_luoi_vao_khung(
+                FakePage(), chu_ky="flow-grid-tile-container|erp-1.png",
+            )
+
+        self.assertTrue(ok, detail)
+        self.assertEqual("move", buoc[0][0])
+        self.assertEqual((200.0, 300.0), buoc[0][1:])
+        self.assertEqual("down", buoc[1][0])
+        self.assertEqual("up", buoc[-1][0])
+        di = [x for x in buoc if x[0] == "move"]
+        self.assertGreaterEqual(
+            len(di), 5, "nhay mot phat toi dich thi CDK khong tinh la dang keo"
+        )
+        self.assertEqual((900.0, 800.0), di[-1][1:])
+
+    def test_mouse_drag_measures_the_visible_part_of_the_composer(self) -> None:
+        """Đo tâm **phần nhìn thấy**, không đo tâm thẻ.
+
+        Ô nhập lệnh mang prompt dài nên hộp bao cao hơn 4000 điểm ảnh; lấy tâm
+        thẻ là trỏ chuột ra ngoài màn hình, mà ngoài màn hình thì không thả
+        được vào đâu cả.
+        """
+        js = self.service._JS_DIEM_KEO
+        self.assertIn("Math.min(r.bottom, window.innerHeight)", js)
+        self.assertIn("Math.max(r.top, 0)", js)
+        self.assertIn("chu_ky_cua(el) === chu_ky", js)
+
+    async def test_agent_panel_probe_reads_the_drag_flags_and_the_buttons(self) -> None:
+        """Bản soi phải nói rõ ô lưới có ``draggable`` không và quanh khung có nút gì.
+
+        Bốn lượt sửa trước đều đoán mò cách Flow nhận ảnh, mỗi lượt một
+        vòng deploy mà log chỉ nói được "chưa ăn".  Dòng soi này là chỗ
+        duy nhất trả lời thẳng.
+        """
+        goi: list[object] = []
+
+        class FakePage:
+            url = "https://flow.google.com/project/demo"
+
+            async def evaluate(self, _script: str, arg: object = None) -> object:
+                goi.append(arg)
+                return {
+                    "o": 'div[drag=true] < flow-grid-tile-container < div',
+                    "khung": "textarea[role=textbox]@812",
+                    "nut": ['button"Add media"@1120,760', 'button"Gửi"@1380,762'],
+                    "input": 4,
+                    "file": 0,
+                }
+
+        dong = await self.service._soi_khung_tac_nhan(FakePage(), "erp-bcb3d1be-1.png")
+
+        self.assertEqual(["erp-bcb3d1be-1.png"], goi)
+        self.assertIn("drag=true", dong)
+        self.assertIn("flow-grid-tile-container", dong)
+        self.assertIn("2 nut quanh khung", dong)
+        self.assertIn("Add media", dong)
+        self.assertIn("input=4 file=0", dong)
+
+    async def test_add_media_button_matches_the_agent_ingredient_button(self) -> None:
+        """Nút gắn ảnh của panel Tác nhân tên là "Add ingredients to the prompt box".
+
+        Bản soi job ``95c7775f`` đọc đúng nhãn ấy. Ba mẫu cũ chỉ tìm "Add
+        media"/"Add image"/"Thêm" nên không mẫu nào khớp — app chưa từng
+        bấm trúng nút gắn ảnh của panel.
+        """
+        da_bam: list[str] = []
+
+        class FakeNut:
+            def __init__(self, selector: str) -> None:
+                self.selector = selector
+
+            async def count(self) -> int:
+                return 1 if "ingredient" in self.selector.lower() else 0
+
+            async def scroll_into_view_if_needed(self, *, timeout: int) -> None:
+                return None
+
+            async def click(self, *, force: bool = False, timeout: int = 0) -> None:
+                da_bam.append(self.selector)
+
+        class FakeLocator:
+            def __init__(self, selector: str) -> None:
+                self.first = FakeNut(selector)
+
+        class FakePage:
+            def locator(self, selector: str) -> object:
+                return FakeLocator(selector)
+
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            self.assertTrue(
+                await self.service._mo_menu_add_media(
+                    FakePage(), mau_nut=self.service.FLOW_AGENT_INGREDIENT_BUTTON
+                )
+            )
+
+        self.assertEqual(1, len(da_bam), da_bam)
+        self.assertIn("ingredient", da_bam[0].lower())
+
+    async def test_project_upload_never_clicks_the_ingredient_button(self) -> None:
+        """Đường tải ảnh lên project phải bỏ qua nút "Add ingredients".
+
+        Nút ấy gắn ảnh vào **ô nhập lệnh**, không đẩy ảnh vào thư viện
+        project.  Bấm nhầm thì lượt soi thư viện sau đó chờ suông hết 180
+        giây rồi mới chịu thua.
+        """
+        self.assertNotIn(
+            '[aria-label*="Add ingredient" i]', self.service.FLOW_ADD_MEDIA_BUTTON
+        )
+        self.assertIn(
+            '[aria-label*="Add ingredient" i]',
+            self.service.FLOW_AGENT_INGREDIENT_BUTTON,
+        )
+
+    async def test_project_library_probe_flags_a_project_id_mismatch(self) -> None:
+        """App hỏi project này mà tab mở project kia thì phải in ra cả hai.
+
+        Ảnh chụp job ``14c06030`` cho thấy ảnh ERP nằm sẵn trên lưới media,
+        vậy mà lượt soi thư viện vẫn báo "khong co media moi".  Hai mã khác
+        nhau là một trong hai lối giải thích — dòng soi phải nói ra được.
+        """
+
+        class FakeApi:
+            project_id = "aaaaaaaa-1111-2222-3333-444444444444"
+
+            async def get_project_data(self) -> dict:
+                return {
+                    "projectContents": {"media": [{"name": "media-1"}], "workflows": []},
+                    "medias": [],
+                }
+
+        class FakeClient:
+            _api = FakeApi()
+
+        class FakePage:
+            url = "https://flow.google.com/project/bbbbbbbb-5555-6666-7777-888888888888"
+
+        dong = await self.service._soi_thu_vien_project(FakeClient(), FakePage())
+
+        self.assertIn("aaaaaaaa", dong)
+        self.assertIn("bbbbbbbb", dong)
+        self.assertIn("projectContents", dong)
+        self.assertIn("media doc duoc=1", dong)
+
+    async def test_project_library_probe_survives_a_broken_api(self) -> None:
+        """Bản soi chỉ để đọc: API ngã thì in một dòng, không làm chết job."""
+
+        class FakeApi:
+            project_id = "aaaaaaaa"
+
+            async def get_project_data(self) -> dict:
+                raise RuntimeError("mat ket noi")
+
+        class FakeClient:
+            _api = FakeApi()
+
+        class FakePage:
+            url = ""
+
+        dong = await self.service._soi_thu_vien_project(FakeClient(), FakePage())
+
+        self.assertIn("doc that bai", dong)
+
+    async def test_upload_progress_probe_reports_the_percentages(self) -> None:
+        """Ô đang tải đọc ra bao nhiêu phần trăm thì phải in đúng bấy nhiêu.
+
+        Ảnh chụp lúc hỏng của job ``1dda531c`` có hai ô ``99%``: file đã
+        vào Flow rồi, app chỉ bỏ cuộc sớm.  Không có dòng này thì nhật ký
+        không phân biệt được "đang lên" với "không hề lên".
+        """
+
+        class FakePage:
+            async def evaluate(self, _script: str, arg: object = None) -> object:
+                return ["99%", "12%"]
+
+        dong = await self.service._soi_tien_do_tai_anh(FakePage())
+
+        self.assertIn("dang tai", dong)
+        self.assertIn("99%", dong)
+        self.assertIn("12%", dong)
+
+    async def test_upload_progress_probe_says_when_nothing_is_uploading(self) -> None:
+        """Không ô nào đang tải là tin xấu — phải nói thẳng, đừng im lặng."""
+
+        class FakePage:
+            async def evaluate(self, _script: str, arg: object = None) -> object:
+                return []
+
+        dong = await self.service._soi_tien_do_tai_anh(FakePage())
+
+        self.assertIn("khong thay o nao dang tai", dong)
+
+    async def test_upload_progress_probe_never_raises_when_the_page_errors(self) -> None:
+        """Bản soi chỉ để đọc: trang hỏng thì báo một dòng, không làm chết job."""
+
+        class FakePage:
+            async def evaluate(self, _script: str, arg: object = None) -> object:
+                raise RuntimeError("Execution context was destroyed")
+
+        dong = await self.service._soi_tien_do_tai_anh(FakePage())
+
+        self.assertIn("khong soi duoc tien do", dong)
+
+    async def test_new_project_media_wait_outlasts_a_slow_upload(self) -> None:
+        """Ảnh lên chậm vẫn phải nhận ra, và phải ghi tiến độ dọc đường.
+
+        Bản cũ chờ 25 giây rồi kết luận "thư viện project không có media
+        mới", trong khi ô ảnh còn đứng ở ``99%``.  Đó là bỏ cuộc chứ không
+        phải hỏng.
+        """
+        goi = {"n": 0}
+        nhat_ky: list[str] = []
+
+        class FakeApi:
+            async def get_project_data(self) -> dict:
+                goi["n"] += 1
+                if goi["n"] < 60:
+                    return {"projectContents": {"media": [], "workflows": []}}
+                return {"projectContents": {"media": [{"name": "media-moi"}], "workflows": []}}
+
+        class FakeClient:
+            _api = FakeApi()
+
+        class FakePage:
+            async def evaluate(self, _script: str, arg: object = None) -> object:
+                return ["99%"]
+
+        async def ghi(_job_id: str, message: str) -> None:
+            nhat_ky.append(message)
+
+        with (
+            patch("flow_web.service.asyncio.sleep", new=AsyncMock()),
+            patch.object(self.service.store, "append_log", ghi),
+        ):
+            ten = await self.service._wait_for_new_project_media(
+                FakeClient(),
+                set(),
+                timeout_s=self.service.FLOW_CHO_UPLOAD_S,
+                page=FakePage(),
+                job_id="job-cho-upload",
+            )
+
+        self.assertEqual("media-moi", ten)
+        self.assertGreater(goi["n"], 25, "phai soi qua moc 25 giay cua ban cu")
+        self.assertTrue(
+            any("99%" in dong for dong in nhat_ky),
+            "phai ghi tien do de biet la cham chu khong phai treo: %s" % nhat_ky,
+        )
+
+    async def test_new_project_media_wait_still_gives_up_eventually(self) -> None:
+        """Chờ lâu hơn không có nghĩa là chờ mãi: hết giờ vẫn phải trả về rỗng."""
+
+        class FakeApi:
+            async def get_project_data(self) -> dict:
+                return {"projectContents": {"media": [], "workflows": []}}
+
+        class FakeClient:
+            _api = FakeApi()
+
+        ten = await self.service._wait_for_new_project_media(
+            FakeClient(), set(), timeout_s=1.0,
+        )
+
+        self.assertEqual("", ten)
+
+    async def test_agent_panel_probe_never_raises_when_the_page_errors(self) -> None:
+        """Bản soi chỉ để đọc, hỏng thì báo một dòng chứ không được làm chết job."""
+
+        class FakePage:
+            url = "https://flow.google.com/project/demo"
+
+            async def evaluate(self, _script: str, arg: object = None) -> object:
+                raise RuntimeError("Execution context was destroyed")
+
+        dong = await self.service._soi_khung_tac_nhan(FakePage(), "erp-bcb3d1be-1.png")
+
+        self.assertIn("khong soi duoc khung", dong)
+
+    async def test_drop_script_cleans_up_the_drag_state_on_one_target(self) -> None:
+        """Thả xong phải ``dragleave``/``dragend``, và chỉ trên một đích.
+
+        Bản đầu leo năm lớp bọc: lớp sau ``dragenter`` **sau** cú ``drop``
+        của lớp trước, nên Flow tưởng còn đang kéo và giữ lớp phủ "thả tệp
+        vào đây" che kín trang.  Job ``8ab1f730`` đếm ``6->0`` và
+        ``allMedia=0`` — không phải trang trống, mà là trang bị che.
+        """
+        source = self.temp_root / "source.png"
+        source.write_bytes(b"anh-erp-gia-lap")
+        kich_ban: list[str] = []
+
+        class FakePage:
+            url = "https://flow.google.com/project/demo"
+
+            def on(self, _ten: str, _ham: object) -> None:
+                return None
+
+            def remove_listener(self, _ten: str, _ham: object) -> None:
+                return None
+
+            async def evaluate(self, script: str, _arg: object) -> dict[str, object]:
+                kich_ban.append(script)
+                return {"ok": True, "detail": "tha vao o nhap lenh (prompt) tai /project/demo"}
+
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            ok, _detail = await self.service._tha_anh_vao_khung_tac_nhan(FakePage(), source)
+
+        self.assertTrue(ok)
+        js = kich_ban[0]
+        for loai in ("dragenter", "dragover", "drop", "dragleave", "dragend"):
+            self.assertIn(f"'{loai}'", js, f"thieu su kien {loai}")
+        self.assertLess(
+            js.index("'drop'"),
+            js.index("'dragleave'"),
+            "phai don dep sau khi tha, khong phai truoc",
+        )
+        self.assertNotIn(
+            "parentElement",
+            js,
+            "khong leo len cac lop boc nua: su kien da bubbles + composed",
+        )
+
+    async def test_grid_drag_uses_one_datatransfer_and_never_clicks(self) -> None:
+        """Kéo ô lưới bằng sự kiện, không bằng chuột thật.
+
+        ``_select_flow_edit_target_image`` kéo bằng ``mouse.down/move/up``
+        rồi còn ``mouse.click`` thêm một cú vào đích.  Flow hiểu là bấm mở
+        ảnh nên đóng panel Tác nhân, và bản chụp sau đó rơi vào nhánh
+        "không thấy panel" — dãy ``16->0`` toàn số 0 của job ``879299d2``.
+        Kéo–thả HTML5 không đẻ ra cú bấm nào, mà một ``DataTransfer`` dùng
+        chung cho cả lượt thì Flow tự nhét dữ liệu của nó vào.
+        """
+        kich_ban: list[str] = []
+
+        class FakePage:
+            async def evaluate(self, script: str, _ten: str) -> dict[str, object]:
+                kich_ban.append(script)
+                return {
+                    "ok": True,
+                    "kieu": ["text/plain"],
+                    "detail": "keo o luoi erp-1.png vao khung; goi mang: text/plain",
+                }
+
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            ok, detail = await self.service._keo_o_luoi_vao_khung(FakePage(), "erp-1.png")
+
+        self.assertTrue(ok, detail)
+        self.assertIn("goi mang: text/plain", detail)
+        js = kich_ban[0]
+        self.assertIn("const goi = new DataTransfer()", js)
+        self.assertEqual(1, js.count("new DataTransfer()"), "mot goi cho ca luot")
+        self.assertLess(js.index("'dragstart'"), js.index("'drop'"))
+        self.assertIn("'dragend'", js)
+        for cam in (".click(", "mouse."):
+            self.assertNotIn(cam, js, f"khong duoc bam: {cam}")
+
+    async def test_grid_drag_reports_when_no_tile_carries_the_name(self) -> None:
+        """Không thấy ô nào mang tên ấy thì nói thẳng, đừng báo thành công."""
+
+        class FakePage:
+            async def evaluate(self, _script: str, _ten: str) -> dict[str, object]:
+                return {"ok": False, "detail": "khong thay o luoi mang ten erp-1.png"}
+
+        ok, detail = await self.service._keo_o_luoi_vao_khung(FakePage(), "erp-1.png")
+        self.assertFalse(ok)
+        self.assertIn("khong thay o luoi", detail)
+
+        ok2, detail2 = await self.service._keo_o_luoi_vao_khung(FakePage(), "  ")
+        self.assertFalse(ok2)
+        self.assertIn("khong co ten tep", detail2)
+
+    async def test_grid_drag_can_target_a_tile_by_exact_signature(self) -> None:
+        """Kéo theo chữ ký thì khớp **đúng bằng**, và không cần tên file.
+
+        Tên file trên máy là ``erp-<job>-1.png``, Flow đặt lại tên lúc nhận
+        nên ``.includes(ten)`` không bao giờ khớp — đó là câu
+        ``o luoi: khong thay o luoi`` in ra ở mọi job.
+        """
+        goi: list[dict[str, str]] = []
+
+        class FakePage:
+            async def evaluate(self, script: str, arg: dict[str, str]) -> dict[str, object]:
+                goi.append({"js": script, **arg})
+                return {"ok": True, "detail": "keo o luoi img|erp moi vao khung; goi mang: text/plain"}
+
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            ok, detail = await self.service._keo_o_luoi_vao_khung(
+                FakePage(), "", chu_ky="img|erp moi"
+            )
+
+        self.assertTrue(ok, detail)
+        self.assertEqual("img|erp moi", goi[0]["chu_ky"])
+        self.assertEqual("", goi[0]["ten"])
+        self.assertIn("chu_ky_cua(el) === chu_ky", goi[0]["js"])
+
+    async def test_edit_target_lookup_reads_aria_label_of_the_tile(self) -> None:
+        """Tra ảnh phải soi cả ``aria-label``: lưới Flow để tên file ở đó.
+
+        Ô lưới là ``FLOW-GRID-TILE-CONTAINER``, tên file nằm ở
+        ``aria-label`` của **thẻ bọc**, còn ``img`` bên trong thì không mang
+        tên.  Chỉ tra ``img[alt]``/``img[src]`` là trượt — đúng lý do 48 job
+        ngày 09/09 không kéo được ảnh đã nằm sẵn trên lưới.
+        """
+        kich_ban: list[str] = []
+
+        class FakePage:
+            async def evaluate(self, script: str, _arg: object) -> dict[str, object]:
+                kich_ban.append(script)
+                return {"ok": False, "detail": "media/workflow token not visible"}
+
+        await self.service._select_flow_edit_target_image(
+            FakePage(), "erp-98ffb814-1.jpg", require_agent_panel=True
+        )
+
+        js = kich_ban[0]
+        self.assertIn('`[aria-label*="${escaped}"]`', js)
+        self.assertIn("closest('[aria-label], [title]')", js)
+
+    async def test_drop_reports_the_requests_flow_fired_after_the_drop(self) -> None:
+        """Đếm request sau cú thả, vì ``UIInterceptor`` mù.
+
+        Interceptor chỉ nghe ``aisandbox-pa.googleapis.com`` nên câu
+        "khong co loi goi nao" trong log **không** chứng minh Flow đứng im.
+        Muốn biết Flow có nhận cú thả hay không thì phải nghe cả trang.
+        """
+        source = self.temp_root / "source.png"
+        source.write_bytes(b"anh-erp-gia-lap")
+
+        class FakeRequest:
+            def __init__(self, method: str, url: str) -> None:
+                self.method = method
+                self.url = url
+
+        class FakePage:
+            url = "https://flow.google.com/project/demo"
+
+            def __init__(self) -> None:
+                self.nghe: list[object] = []
+
+            def on(self, ten: str, ham: object) -> None:
+                if ten == "request":
+                    self.nghe.append(ham)
+
+            def remove_listener(self, ten: str, ham: object) -> None:
+                if ten == "request" and ham in self.nghe:
+                    self.nghe.remove(ham)
+
+            async def evaluate(self, _script: str, _arg: object) -> dict[str, object]:
+                for ham in list(self.nghe):
+                    ham(FakeRequest("POST", "https://flow.google.com/upload/media?x=1"))
+                    ham(FakeRequest("GET", "https://flow.google.com/asset.png"))
+                return {"ok": True, "detail": "tha vao o nhap lenh (prompt)"}
+
+        page = FakePage()
+        with patch("flow_web.service.asyncio.sleep", new=AsyncMock()):
+            ok, detail = await self.service._tha_anh_vao_khung_tac_nhan(page, source)
+
+        self.assertTrue(ok, detail)
+        self.assertIn("sau khi tha: 1 request", detail, "chi dem POST/PUT/PATCH")
+        self.assertIn("upload/media", detail)
+        self.assertEqual([], page.nghe, "phai go listener ra, dung de ro ri")
 
     async def test_wait_for_flow_agent_source_attachment_accepts_replaced_chip_count(self) -> None:
         class FakePage:
@@ -4600,12 +6230,579 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(ok)
         self.assertIn("no new ready attachment visible", detail)
 
+    def _attach_fake_page(self, add_results: list, banner_results: list):
+        class FakeChooser:
+            def __init__(self) -> None:
+                self.files: list[str] = []
+
+            async def set_files(self, path: str) -> None:
+                self.files.append(path)
+
+        class FakeChooserInfo:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def __aenter__(self) -> "FakeChooserInfo":
+                return self
+
+            async def __aexit__(self, *_exc: object) -> bool:
+                return False
+
+            @property
+            def value(self):
+                async def _value() -> FakeChooser:
+                    return self._page.chooser
+
+                return _value()
+
+        class FakeMouse:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def click(self, x: float, y: float) -> None:
+                self._page.clicks.append((x, y))
+
+        class FakeKeyboard:
+            async def press(self, _key: str) -> None:
+                return None
+
+        class FakeLocator:
+            async def count(self) -> int:
+                return 0
+
+        class FakePage:
+            frames: list = []
+
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+                self.clicks: list[tuple[float, float]] = []
+                self.chooser = FakeChooser()
+                self.mouse = FakeMouse(self)
+                self.keyboard = FakeKeyboard()
+                self.banner_dismissed = False
+
+            def on(self, *_args: object) -> None:
+                return None
+
+            def locator(self, _selector: str) -> FakeLocator:
+                return FakeLocator()
+
+            def expect_file_chooser(self, timeout: float = 0) -> FakeChooserInfo:
+                return FakeChooserInfo(self)
+
+            async def screenshot(self, **_kwargs: object) -> None:
+                return None
+
+            async def evaluate(self, script: str, *_args: object):
+                self.scripts.append(script)
+                if "flow-banner-dismiss" in script:
+                    labels = banner_results.pop(0) if banner_results else []
+                    if labels:
+                        self.banner_dismissed = True
+                    return {"dismissed": labels, "count": len(labels)}
+                if "agent-add-control" in script:
+                    # The composer control only becomes reachable after the banner is gone.
+                    return add_results[-1] if (self.banner_dismissed or len(add_results) == 1) else add_results[0]
+                return {}
+
+        return FakePage()
+
+    async def test_dismiss_flow_top_banner_clicks_banner_dismiss_button(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+                self.results = [["Dismissclose Dismiss banner"], []]
+
+            async def evaluate(self, script: str, *_args: object) -> dict:
+                self.scripts.append(script)
+                labels = self.results.pop(0) if self.results else []
+                return {"dismissed": labels, "count": len(labels)}
+
+        page = FakePage()
+        first = await self.service._dismiss_flow_top_banner(page)
+        second = await self.service._dismiss_flow_top_banner(page)
+
+        self.assertEqual("dismissed top banner: Dismissclose Dismiss banner", first)
+        self.assertEqual("", second)
+        self.assertIn("flow-banner-dismiss", page.scripts[0])
+        js = self.service.FLOW_DISMISS_BANNER_JS
+        self.assertIn("high\\s+demand", js)
+        self.assertIn("dismiss|banner", js)
+        # Never confuse the Agent panel's own Close button with the notice banner.
+        self.assertIn("session|panel|dialog", js)
+
+    async def test_flow_agent_add_control_probe_handles_banner_offset_and_header_add_media(self) -> None:
+        add_js = self.service.FLOW_AGENT_ADD_CONTROL_JS
+        chip_js = self.service.FLOW_AGENT_COMPOSER_CHIP_JS
+        self.assertIn("agent-add-control", add_js)
+        self.assertIn("belowFold", add_js)
+        self.assertIn("scrollIntoView", add_js)
+        self.assertIn("fallback_candidates", add_js)
+        self.assertIn("headerish", add_js)
+        self.assertIn("offscreen", add_js)
+        # A 57K-char prompt makes every composer ancestor taller than the viewport; the container walk must survive that.
+        self.assertNotIn("innerHeight * 0.96", add_js)
+        self.assertNotIn("innerHeight * 0.96", chip_js)
+        self.assertIn("explicitChips", chip_js)
+        self.assertIn(".chip-container", chip_js)
+        self.assertIn('[role="dialog"], [role="listbox"], [role="menu"]', chip_js)
+
+    async def test_flow_agent_attach_dismisses_banner_then_uses_composer_add_ingredients(self) -> None:
+        composer = {"x": 1255, "y": 885, "label": "What do you want to create?"}
+        header = {"x": 1119, "y": 107, "label": "add Add media menu", "score": 888, "offscreen": False}
+        ingredients = {"x": 1119, "y": 881, "label": "add Add ingredients to the prompt box", "score": 3900, "offscreen": False}
+        page = self._attach_fake_page(
+            add_results=[
+                {"ok": False, "candidates": [], "fallback_candidates": [header], "composer": composer, "detail": "no agent add/upload control near What do you want"},
+                {"ok": True, "candidates": [ingredients], "fallback_candidates": [header], "composer": composer, "detail": "add control: add Add ingredients to the prompt box"},
+            ],
+            banner_results=[[], ["Dismissclose Dismiss banner"]],
+        )
+        self.service._flow_agent_add_control_lookup_s = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "trello-source.jpg"
+            source.write_bytes(b"jpg")
+            with patch.object(
+                self.service,
+                "_flow_agent_label_at_point",
+                side_effect=lambda _page, _x, y: "add Add ingredients to the prompt box" if float(y) > 400 else "add Add media menu",
+            ), patch.object(
+                self.service, "_confirm_flow_agent_ingredient_picker", return_value="picker: Add to prompt clicked"
+            ) as picker, patch.object(self.service, "_install_flow_page_file_chooser_guard"):
+                ok, detail = await self.service._attach_flow_agent_source_file(page, str(source))
+
+        self.assertTrue(ok, detail)
+        self.assertIn("file chooser via add Add ingredients to the prompt box", detail)
+        self.assertIn("dismissed top banner", detail)
+        self.assertEqual([(1119, 881)], page.clicks)
+        self.assertEqual([str(source)], page.chooser.files)
+        picker.assert_awaited_once_with(page, "trello-source.jpg", timeout_s=30.0)
+        banner_calls = [index for index, script in enumerate(page.scripts) if "flow-banner-dismiss" in script]
+        add_calls = [index for index, script in enumerate(page.scripts) if "agent-add-control" in script]
+        self.assertTrue(banner_calls and add_calls and banner_calls[0] < add_calls[0])
+
+    async def test_flow_agent_attach_uses_header_add_media_only_as_last_resort(self) -> None:
+        composer = {"x": 1255, "y": 885, "label": "What do you want to create?"}
+        header = {"x": 1119, "y": 107, "label": "add Add media menu", "score": 888, "offscreen": False}
+        page = self._attach_fake_page(
+            add_results=[
+                {"ok": False, "candidates": [], "fallback_candidates": [header], "composer": composer, "detail": "no agent add/upload control near What do you want"},
+            ],
+            banner_results=[[], []],
+        )
+        self.service._flow_agent_add_control_lookup_s = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "trello-source.jpg"
+            source.write_bytes(b"jpg")
+            with patch.object(self.service, "_flow_agent_label_at_point", return_value="add Add media menu"), patch.object(
+                self.service, "_confirm_flow_agent_ingredient_picker", return_value="no ingredient picker (no option/add-to-prompt visible)"
+            ) as picker, patch.object(self.service, "_install_flow_page_file_chooser_guard"):
+                ok, detail = await self.service._attach_flow_agent_source_file(page, str(source))
+
+        self.assertTrue(ok, detail)
+        self.assertIn("file chooser via add Add media menu", detail)
+        self.assertEqual([(1119, 107)], page.clicks)
+        picker.assert_awaited_once_with(page, "trello-source.jpg", timeout_s=10.0)
+
+    async def test_flow_agent_attach_skips_add_control_below_the_fold(self) -> None:
+        composer = {"x": 1255, "y": 885, "label": "What do you want to create?"}
+        offscreen = {"x": 1119, "y": 941, "label": "add Add ingredients to the prompt box", "score": 3900, "offscreen": True}
+        page = self._attach_fake_page(
+            add_results=[
+                {"ok": True, "candidates": [offscreen], "fallback_candidates": [], "composer": composer, "detail": "add control: add Add ingredients to the prompt box (below the fold)"},
+            ],
+            banner_results=[[], []],
+        )
+        self.service._flow_agent_add_control_lookup_s = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "trello-source.jpg"
+            source.write_bytes(b"jpg")
+            with patch.object(self.service, "_install_flow_page_file_chooser_guard"), patch.object(
+                self.service, "_drop_file_on_flow_agent_composer", return_value=(False, "drop skipped")
+            ), patch.object(self.service, "_capture_flow_agent_debug_screenshot", return_value="screenshot=test.png"):
+                ok, detail = await self.service._attach_flow_agent_source_file(page, str(source))
+
+        self.assertFalse(ok)
+        self.assertIn("below the fold", detail)
+        self.assertEqual([], page.clicks)
+
+    async def test_flow_agent_panel_send_refuses_button_below_the_fold(self) -> None:
+        class FakeMouse:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[float, float]] = []
+
+            async def click(self, x: float, y: float) -> None:
+                self.clicks.append((x, y))
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.mouse = FakeMouse()
+                self.scripts: list[str] = []
+
+            async def evaluate(self, script: str, *_args: object) -> dict:
+                self.scripts.append(script)
+                if "flow-banner-dismiss" in script:
+                    return {"dismissed": [], "count": 0}
+                if "agent-panel-send" in script:
+                    return {"ok": True, "x": 1395, "y": 941, "offscreen": True, "detail": "arrow_forward Start generation"}
+                return {}
+
+        page = FakePage()
+        ok, detail = await self.service._click_flow_agent_panel_send(page)
+
+        self.assertFalse(ok)
+        self.assertIn("below the fold", detail)
+        self.assertEqual([], page.mouse.clicks)
+        self.assertTrue(any("flow-banner-dismiss" in script for script in page.scripts))
+
+    def test_flow_agent_failed_message_is_retryable_but_not_a_try_again_strike(self) -> None:
+        message = "The agent failed. Please try again."
+        self.assertTrue(self.service._is_flow_agent_failed_message(message))
+        self.assertTrue(self.service._is_flow_agent_failed_message("Tác nhân thất bại. Hãy thử lại."))
+        self.assertFalse(self.service._is_flow_agent_failed_message("Something else happened"))
+        # Must not feed the 10-strike counter that quota-blocks a profile for 24h.
+        self.assertFalse(self.service._is_flow_agent_try_again_error(message))
+        self.assertTrue(self.service._is_retryable_flow_agent_ui_error(f"flow agent failed twice, no new images: {message}"))
+        self.assertEqual(20.0, self.service._flow_agent_ui_retry_delay_s(f"flow agent failed twice: {message}"))
+
+    def _agent_wait_fakes(self, project_data_sequence: list, panel_text: str):
+        class FakeApi:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def get_project_data(self) -> dict:
+                index = min(self.calls, len(project_data_sequence) - 1)
+                self.calls += 1
+                return project_data_sequence[index]
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.clicks = 0
+                self.text_reads = 0
+                self.grid_items: list = []
+
+            async def evaluate(self, script: str, *_args: object):
+                if "flow-visible-text" in script:
+                    self.text_reads += 1
+                    return panel_text
+                if "agent-try-again-click" in script:
+                    self.clicks += 1
+                    return {"ok": True, "label": "Try again"}
+                if "visible-grid-keys" in script:
+                    return [item["src"] for item in self.grid_items]
+                if "visible-grid-images" in script:
+                    return list(self.grid_items)
+                return {}
+
+        page = FakePage()
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return page
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self._api = FakeApi()
+                self._bm = FakeBrowserManager()
+
+        return FakeClient(), page
+
+    async def test_wait_after_submit_presses_try_again_once_then_fails_without_grid_images(self) -> None:
+        empty = {"projectContents": {"media": [], "workflows": []}}
+        client, page = self._agent_wait_fakes([empty], "Twelve Part Creative Series\nThe agent failed. Please try again.\nTry again")
+        page.grid_items = [{"src": "https://flow.google.com/asb/old-1", "workflow_id": "", "width": 256, "height": 256}]
+        with self.assertRaises(FlowAgentFailedError) as raised:
+            await self.service._wait_for_flow_agent_images_after_submit(
+                client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=12.0, fallback_workflow_id="wf",
+                visible_before={"https://flow.google.com/asb/old-1"},
+            )
+        self.assertEqual(1, page.clicks)
+        self.assertIn("agent failed", str(raised.exception).lower())
+
+    async def test_wait_after_submit_returns_only_media_unknown_before_submit(self) -> None:
+        new_media = {
+            "projectContents": {
+                "media": [
+                    {"name": "old-media", "workflowId": "wf-old", "image": {"generatedImage": {"fifeUrl": "https://img/old", "prompt": "old"}}},
+                    {"name": "new-1", "workflowId": "wf", "image": {"generatedImage": {"fifeUrl": "https://img/new1", "prompt": "p"}}},
+                ],
+                "workflows": [],
+            }
+        }
+        client, page = self._agent_wait_fakes([new_media], "What do you want to create?")
+        images = await self.service._wait_for_flow_agent_images_after_submit(
+            client, page, {"old-media"}, prompt="p", target_count=1, timeout_s=12.0, fallback_workflow_id="wf", visible_before=set()
+        )
+        self.assertEqual(["new-1"], [image.media_name for image in images])
+        self.assertEqual(0, page.clicks)
+
+    async def test_wait_after_submit_ignores_grid_images_that_were_there_before_submit(self) -> None:
+        empty = {"projectContents": {"media": [], "workflows": []}}
+        client, page = self._agent_wait_fakes([empty], "What do you want to create?")
+        old_src = "https://flow.google.com/asb/previous-card"
+        page.grid_items = [{"src": old_src, "workflow_id": "", "width": 256, "height": 256}]
+        with self.assertRaises(RuntimeError) as raised:
+            await self.service._wait_for_flow_agent_images_after_submit(
+                client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=10.0, fallback_workflow_id="wf",
+                visible_before={old_src},
+            )
+        self.assertNotIsInstance(raised.exception, FlowAgentFailedError)
+
+    async def test_wait_after_submit_accepts_grid_images_that_appear_after_submit_when_api_is_down(self) -> None:
+        class BrokenApi:
+            async def get_project_data(self) -> dict:
+                raise RuntimeError("502 project too large")
+
+        client, page = self._agent_wait_fakes([{}], "What do you want to create?")
+        client._api = BrokenApi()
+        old_src = "https://flow.google.com/asb/previous-card"
+        page.grid_items = [
+            {"src": "https://flow.google.com/asb/new-1", "workflow_id": "", "width": 256, "height": 256},
+            {"src": "https://flow.google.com/asb/new-2", "workflow_id": "", "width": 256, "height": 256},
+            {"src": old_src, "workflow_id": "", "width": 256, "height": 256},
+        ]
+        images = await self.service._wait_for_flow_agent_images_after_submit(
+            client, page, {"old-media"}, prompt="p", target_count=2, timeout_s=20.0, fallback_workflow_id="wf",
+            visible_before={old_src},
+        )
+        self.assertEqual(["https://flow.google.com/asb/new-1", "https://flow.google.com/asb/new-2"], [image.fife_url for image in images])
+        self.assertTrue(all(image._raw.get("visible_ui_fallback") for image in images))
+        keys = await self.service._visible_flow_grid_image_keys(client)
+        self.assertEqual({"https://flow.google.com/asb/new-1", "https://flow.google.com/asb/new-2", old_src}, keys)
+
+    def _ui2k_fakes(self, generated: int, total_tiles: int):
+        service = self.service
+
+        class FakeDownload:
+            def __init__(self, name: str, payload: bytes) -> None:
+                self.suggested_filename = name
+                self._payload = payload
+
+            async def save_as(self, path: str) -> None:
+                Path(path).write_bytes(self._payload)
+
+        class FakeDownloadInfo:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def __aenter__(self) -> "FakeDownloadInfo":
+                return self
+
+            async def __aexit__(self, *_exc: object) -> bool:
+                return False
+
+            @property
+            def value(self):
+                async def _value() -> FakeDownload:
+                    return self._page.pending_download
+
+                return _value()
+
+        class FakeTile:
+            def __init__(self, page: "FakePage", index: int) -> None:
+                self._page, self._index = page, index
+
+            async def click(self, timeout: float = 0) -> None:
+                self._page.opened = self._index
+                self._page.menu_open = False
+
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def count(self) -> int:
+                return total_tiles
+
+            def nth(self, index: int) -> FakeTile:
+                return FakeTile(self._page, index)
+
+        class FakeMouse:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def click(self, x: float, y: float) -> None:
+                page = self._page
+                if y == 300 and 400 <= x < 400 + total_tiles:
+                    page.opened = int(x - 400)
+                    page.menu_open = False
+                elif (x, y) == (1192, 38):
+                    page.menu_open = True
+                elif (x, y) == (1231, 130) and page.menu_open:
+                    index = page.opened
+                    if index < generated:
+                        page.pending_download = FakeDownload(f"Gen_image_{index}_2K_2026.jpeg", service._test_jpeg_bytes(2048, seed=index))
+                    else:
+                        page.pending_download = FakeDownload("trello-source-1.jpg", service._test_jpeg_bytes(2048, seed=99))
+                    page.downloads.append(index)
+                    page.menu_open = False
+                elif (x, y) == (20, 87):
+                    page.opened = None
+
+        class FakeKeyboard:
+            async def press(self, _key: str) -> None:
+                return None
+
+        class FakePage:
+            url = "https://flow.google.com/project/proj-1"
+
+            def __init__(self) -> None:
+                self.opened = None
+                self.menu_open = False
+                self.downloads: list[int] = []
+                self.pending_download = None
+                self.mouse = FakeMouse(self)
+                self.keyboard = FakeKeyboard()
+
+            async def goto(self, *_a: object, **_k: object) -> None:
+                return None
+
+            def locator(self, _selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+            def expect_download(self, timeout: float = 0) -> FakeDownloadInfo:
+                return FakeDownloadInfo(self)
+
+            async def evaluate(self, script: str, *args: object):
+                if "textboxes" in script and "buttons" in script:
+                    return {"buttons": 6, "textboxes": 1, "url": self.url}
+                if "flow-banner-dismiss" in script:
+                    return {"dismissed": [], "count": 0}
+                if "flow-ui-tile-center" in script:
+                    index = int(args[0]) if args else 0
+                    if index >= total_tiles:
+                        return None
+                    return {"x": 400 + index, "y": 300, "w": 256, "h": 256, "total": total_tiles}
+                if "flow-ui-controls" in script:
+                    if self.opened is None:
+                        return [{"label": "add | Add media menu |", "x": 1119, "y": 38}]
+                    controls = [
+                        {"label": "download | Download media |", "x": 1192, "y": 38},
+                        {"label": "arrow_back | Back button to go to previous page |", "x": 20, "y": 87},
+                        {"label": "Done | Done editing |", "x": 1380, "y": 38},
+                    ]
+                    if self.menu_open:
+                        controls.append({"label": "1K Original size | |", "x": 1231, "y": 89})
+                        if self.opened < generated:
+                            controls.append({"label": "2K Upscaled | |", "x": 1231, "y": 130})
+                            controls.append({"label": "4K Upscaled | |", "x": 1231, "y": 171})
+                    return controls
+                return {}
+
+        page = FakePage()
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return page
+
+        class FakeClient:
+            project_id = "proj-1"
+
+            def __init__(self) -> None:
+                self._bm = FakeBrowserManager()
+
+        return FakeClient(), page
+
+    async def test_flow_ui_2k_download_collects_generated_images_then_stops_at_source_upload(self) -> None:
+        client, page = self._ui2k_fakes(generated=3, total_tiles=10)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"):
+            results = await self.service._download_flow_ui_upscaled_set(client, 5, job_id=job.id)
+
+        self.assertEqual(3, len(results))
+        # The 4th tile is the source upload: its menu only offers the original size, so nothing is downloaded and the loop stops.
+        self.assertEqual([0, 1, 2], page.downloads)
+        self.assertTrue(all(item["size"] == (2048, 2048) for item in results))
+        self.assertTrue(all(item["name"].startswith("Gen_image_") for item in results))
+        self.assertIsNone(page.opened)
+
+    async def test_flow_ui_2k_download_stops_when_enough_images_are_collected(self) -> None:
+        client, page = self._ui2k_fakes(generated=12, total_tiles=40)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"):
+            results = await self.service._download_flow_ui_upscaled_set(client, 4, job_id=job.id)
+        self.assertEqual(4, len(results))
+        self.assertEqual([0, 1, 2, 3], page.downloads)
+
+    async def test_flow_ui_2k_download_raises_after_three_failed_images(self) -> None:
+        client, page = self._ui2k_fakes(generated=12, total_tiles=40)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+
+        class TimingOutDownloadInfo:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            @property
+            def value(self):
+                async def _value():
+                    raise TimeoutError('Timeout 120000ms exceeded while waiting for event "download"')
+
+                return _value()
+
+        page.expect_download = lambda timeout=0: TimingOutDownloadInfo()
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"), patch.object(
+            self.service, "_capture_flow_agent_debug_screenshot", AsyncMock(return_value="")
+        ):
+            with self.assertRaises(FlowUiUpscaleUnavailableError) as raised:
+                await self.service._download_flow_ui_upscaled_set(client, 12, job_id=job.id)
+
+        self.assertIn("khong tra ban 2K", str(raised.exception))
+        self.assertEqual([0, 1, 2], page.downloads)
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("Da tai 0/12 ban 2K", logs)
+        self.assertTrue(self.service._auto_erp_should_stop_on_child_error(str(raised.exception)))
+        self.assertTrue(self.service._auto_erp_should_stop_on_child_error("Anh 3/12 khong co ban 2K that; app giu phan con lai"))
+
+    async def test_match_ui_upscaled_candidate_pairs_by_thumbnail_not_position(self) -> None:
+        candidates = [{"bytes": self.service._test_jpeg_bytes(2048, seed=seed)} for seed in (2, 0, 1)]
+        for seed in (0, 1, 2):
+            matched = self.service._match_ui_upscaled_candidate(self.service._test_jpeg_bytes(1024, seed=seed), candidates)
+            self.assertIsNotNone(matched, f"seed {seed} should match")
+            self.assertEqual(self.service._test_jpeg_bytes(2048, seed=seed), matched["bytes"])
+        self.assertIsNone(self.service._match_ui_upscaled_candidate(self.service._test_jpeg_bytes(1024, seed=7), candidates))
+
+    async def test_match_ui_upscaled_candidate_accepts_clearly_best_candidate_beyond_strict_distance(self) -> None:
+        source = self.service._test_jpeg_bytes(1024, seed=3)
+        source_sig = self.service._image_thumb_signature(source)
+        # Build a candidate whose signature is exactly 0.06 away (each channel shifted), and a far runner-up.
+        near = {"sig": [min(1.0, v + 0.06) if v < 0.5 else max(0.0, v - 0.06) for v in source_sig], "bytes": b"near"}
+        far = {"sig": [min(1.0, v + 0.3) if v < 0.5 else max(0.0, v - 0.3) for v in source_sig], "bytes": b"far"}
+        self.assertIs(near, self.service._match_ui_upscaled_candidate(source, [far, near]))
+        # Same distance but with a runner-up almost as close: refused.
+        rival = {"sig": [min(1.0, v + 0.07) if v < 0.5 else max(0.0, v - 0.07) for v in source_sig], "bytes": b"rival"}
+        self.assertIsNone(self.service._match_ui_upscaled_candidate(source, [rival, near]))
+        # Beyond the loose limit: refused even when alone.
+        too_far = {"sig": [min(1.0, v + 0.12) if v < 0.5 else max(0.0, v - 0.12) for v in source_sig], "bytes": b"toofar"}
+        self.assertIsNone(self.service._match_ui_upscaled_candidate(source, [too_far, far]))
+
+    async def test_upsample_artifact_bytes_prefers_flow_ui_2k_candidate(self) -> None:
+        source_path = self.data_dir / "ui2k-source.jpg"
+        source_path.write_bytes(self.service._test_jpeg_bytes(1024, seed=3))
+        artifact = JobArtifact(label="1", url="", local_path=str(source_path), mime_type="image/jpeg")
+        candidates = [{"bytes": self.service._test_jpeg_bytes(2048, seed=5)}, {"bytes": self.service._test_jpeg_bytes(2048, seed=3)}]
+        with patch.object(self.service, "_flow_upsample_api_enabled", return_value=False):
+            result = await self.service._upsample_artifact_bytes(artifact, "", ui_candidates=candidates)
+        self.assertEqual("flow_2k", result.source)
+        self.assertEqual((2048, 2048), result.target_size)
+        self.assertTrue(result.used_flow)
+        self.assertTrue(candidates[1]["used"])
+        self.assertNotIn("used", candidates[0])
+
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
-            script = ""
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+
+            @property
+            def script(self) -> str:
+                return "\n".join(self.scripts)
 
             async def evaluate(self, script: str) -> dict:
-                self.script = script
+                self.scripts.append(script)
+                if "composer-chip-probe" in script:
+                    return {"composer_chip_count": 0, "composer_chip_labels": [], "composer_chip_detail": "composerChips=0 chipRemove=0 chipMedia=0"}
                 return {
                     "visible": True,
                     "count": 1,
@@ -4633,6 +6830,36 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("composerReady", page.script)
         self.assertIn("inCurrentComposer", page.script)
         self.assertIn("allMedia", page.script)
+        self.assertIn("composer-chip-probe", page.script)
+        self.assertEqual(0, snapshot["composer_chip_count"])
+        self.assertIn("composerChips=0", snapshot["detail"])
+
+    async def test_flow_agent_source_attachment_accepts_new_composer_chip(self) -> None:
+        class FakePage:
+            async def evaluate(self, script: str, *_args: object) -> dict:
+                if "composer-chip-probe" in script:
+                    return {"composer_chip_count": 1, "composer_chip_labels": ["cancel close"], "composer_chip_detail": "composerChips=1 chipRemove=1 chipMedia=1"}
+                return {
+                    "visible": True,
+                    "count": 0,
+                    "ready_count": 0,
+                    "busy_count": 0,
+                    "composer_ready_count": 0,
+                    "composer_busy_count": 0,
+                    "ready_labels": [],
+                    "composer_ready_labels": [],
+                    "detail": "attachments=0 ready=0 media=0 chips=0 files=0 cards=0 allMedia=0",
+                }
+
+        ok, detail = await self.service._wait_for_flow_agent_source_attachment(
+            FakePage(),
+            {"visible": True, "count": 0, "ready_count": 0, "composer_chip_count": 0, "detail": "attachments=0"},
+            timeout_s=2,
+            source_file_name="trello-abc12345-1.jpeg",
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("composer chip added 0->1", detail)
 
     async def test_acquire_isolated_flow_agent_page_opens_fresh_agent_tab_each_time(self) -> None:
         class FakePage:
@@ -4657,7 +6884,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         browser = SimpleNamespace(context=context)
         client = SimpleNamespace(_bm=browser)
 
-        with patch.object(self.service, "_ensure_valid_flow_project_page", new=AsyncMock(return_value=None)) as ensure_page:
+        with patch.object(self.service, "_ensure_valid_flow_project_page", new=AsyncMock(return_value=(True, ""))) as ensure_page:
             first_page, first_detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
             second_page, second_detail = await self.service._acquire_isolated_flow_agent_page(client, "https://labs.google/fx/tools/flow/project/pid")
 
@@ -4667,84 +6894,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("new isolated project tab", second_detail)
         self.assertEqual(2, ensure_page.await_count)
 
-    async def test_trello_source_validation_retries_transient_gemini_json_failure(self) -> None:
-        source = self.uploads_dir / "source.jpg"
-        source.write_bytes(b"source")
-        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(self.downloads_dir / "out.jpg"), mime_type="image/jpeg")
-        Path(artifact.local_path).write_bytes(b"generated")
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            trello_enabled=True,
-            trello_card_id="source-card",
-            reference_image_paths=[str(source)],
-            automation_graph={
-                "modules": [
-                    {"id": "trello_source", "type": "trello_source", "enabled": True},
-                    {"id": "flow", "type": "flow", "enabled": True},
-                    {"id": "trello", "type": "trello", "enabled": True},
-                ]
-            },
-        )
-        job = JobRecord(type="image", status="running", title="test")
-        await self.store.add_job(job)
 
-        with patch.object(
-            self.service,
-            "_artifact_validation_image_bytes",
-            new=AsyncMock(return_value=(b"generated", "image/jpeg")),
-        ), patch.object(
-            self.service,
-            "_gemini_validate_trello_source_artifacts",
-            side_effect=[
-                RuntimeError("Gemini không trả về JSON kiểm tra ảnh hợp lệ."),
-                {"ok": True, "reason": "matches", "bad_indexes": [], "confidence": 0.9},
-            ],
-        ) as validate:
-            await self.service._validate_trello_source_artifacts_before_upload(job.id, request, [artifact])
-
-        self.assertEqual(2, validate.call_count)
-        saved = self.store.get_job(job.id)
-        self.assertTrue(any("thử lại lần 2" in entry.message for entry in saved.logs))
-
-    async def test_trello_source_validation_warns_without_blocking_on_gemini_json_outage(self) -> None:
-        source = self.uploads_dir / "source.jpg"
-        source.write_bytes(b"source")
-        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(self.downloads_dir / "out.jpg"), mime_type="image/jpeg")
-        Path(artifact.local_path).write_bytes(b"generated")
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            trello_enabled=True,
-            trello_card_id="source-card",
-            reference_image_paths=[str(source)],
-            automation_graph={
-                "modules": [
-                    {"id": "trello_source", "type": "trello_source", "enabled": True},
-                    {"id": "flow", "type": "flow", "enabled": True},
-                    {"id": "trello", "type": "trello", "enabled": True},
-                ]
-            },
-        )
-        job = JobRecord(type="image", status="running", title="test")
-        await self.store.add_job(job)
-
-        with patch.object(
-            self.service,
-            "_artifact_validation_image_bytes",
-            new=AsyncMock(return_value=(b"generated", "image/jpeg")),
-        ), patch.object(
-            self.service,
-            "_gemini_validate_trello_source_artifacts",
-            side_effect=RuntimeError("Gemini không trả về JSON kiểm tra ảnh hợp lệ."),
-        ) as validate:
-            await self.service._validate_trello_source_artifacts_before_upload(job.id, request, [artifact])
-
-        self.assertEqual(2, validate.call_count)
-        saved = self.store.get_job(job.id)
-        messages = [entry.message for entry in saved.logs]
-        self.assertTrue(any("vẫn upload" in message for message in messages))
-        self.assertTrue(any("cảnh báo kỹ thuật" in message for message in messages))
 
     async def test_plan_storyboard_returns_local_scenes_when_gemini_is_not_configured(self) -> None:
         with patch.object(self.service, "ensure_media_skill_library", AsyncMock(return_value={})), patch.object(
@@ -4878,6 +7028,76 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         build_client.assert_awaited_once()
         close_shared_browser.assert_not_called()
 
+    async def test_with_client_keeps_the_browser_to_itself_by_default(self) -> None:
+        # Most callers drive the page - the Agent panel, the prompt box, the
+        # download menu. Two of those at once read each other's output.
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold(_client: Any) -> str:
+            started.set()
+            await release.wait()
+            return "held"
+
+        with patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace())
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="shared-client")),
+        ):
+            holder = asyncio.create_task(self.service._with_client(hold))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self.service._with_client(lambda client: asyncio.sleep(0, result="second")),
+                    timeout=0.2,
+                )
+            release.set()
+            self.assertEqual("held", await asyncio.wait_for(holder, timeout=2))
+
+    async def test_with_client_can_hand_the_browser_back_before_running_the_work(self) -> None:
+        # The 2K batch is five and a half minutes of waiting on an HTTPS call
+        # with the browser idle underneath. Holding the session lock through
+        # that is what made running two idea cards at once nearly worthless.
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        order: list[str] = []
+        upscales_started = asyncio.Event()
+        upscales_may_finish = asyncio.Event()
+
+        async def upscale(_client: Any) -> str:
+            order.append("upscale-start")
+            upscales_started.set()
+            await upscales_may_finish.wait()
+            order.append("upscale-end")
+            return "upscaled"
+
+        async def generate(_client: Any) -> str:
+            order.append("generate")
+            upscales_may_finish.set()
+            return "generated"
+
+        with patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace())
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="shared-client")),
+        ):
+            batch = asyncio.create_task(
+                self.service._with_client(upscale, hold_session_lock=False)
+            )
+            await asyncio.wait_for(upscales_started.wait(), timeout=2)
+            second = await asyncio.wait_for(self.service._with_client(generate), timeout=2)
+            first = await asyncio.wait_for(batch, timeout=2)
+
+        self.assertEqual("upscaled", first)
+        self.assertEqual("generated", second)
+        # The next card got in and out while the upscales were still running.
+        self.assertEqual(["upscale-start", "generate", "upscale-end"], order)
+        self.assertFalse(self.service._browser_session_lock.locked())
+
     async def test_with_client_switches_to_next_profile_on_flow_agent_quota(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
         profiles = [
@@ -4912,7 +7132,41 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
 
-    async def test_with_client_switches_profile_after_repeated_flow_agent_try_again_errors(self) -> None:
+    async def test_with_client_switches_profile_when_source_attachment_is_not_visible(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Main", path=self.temp_root / "main-profile"),
+            FlowBrowserProfile(index=1, label="Backup", path=self.temp_root / "backup-profile"),
+        ]
+        clients = [SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]
+        calls: list[str] = []
+
+        async def use_client(client: Any) -> str:
+            calls.append(client.name)
+            if client.name == "client-1":
+                raise RuntimeError(
+                    "Auto AI ERP chua keo/upload duoc anh ERP vao Tac nhan Flow. "
+                    "no new ready attachment visible 0->0"
+                )
+            return client.name
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(side_effect=[SimpleNamespace(name="browser-1"), SimpleNamespace(name="browser-2")]),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(side_effect=clients),
+        ):
+            result = await self.service._with_client(use_client)
+
+        self.assertEqual("client-2", result)
+        self.assertEqual(["client-1", "client-2"], calls)
+        self.assertEqual(1, self.service._active_flow_profile_index)
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
+
+    async def test_with_client_tries_backup_profile_on_flow_agent_try_again_error(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
         profiles = [
             FlowBrowserProfile(index=0, label="Main", path=self.temp_root / "main-profile"),
@@ -4925,26 +7179,6 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             if client.name == "client-1":
                 raise RuntimeError("Đã xảy ra lỗi. Hãy thử lại.")
             return client.name
-
-        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
-            self.service,
-            "_flow_agent_try_again_threshold",
-            return_value=2,
-        ), patch.object(
-            self.service,
-            "_ensure_shared_browser",
-            AsyncMock(return_value=SimpleNamespace(name="browser-1")),
-        ), patch.object(
-            self.service,
-            "_build_client_from_shared_browser",
-            AsyncMock(return_value=SimpleNamespace(name="client-1")),
-        ):
-            with self.assertRaises(HTTPException) as first_ctx:
-                await self.service._with_client(use_client)
-
-        self.assertIn("1/2", str(first_ctx.exception.detail))
-        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
-        self.assertEqual(1, self.store.snapshot().flow_profile_agent_retry_error_counts[profiles[0].key])
 
         clients = [SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]
         with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
@@ -4963,10 +7197,123 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             result = await self.service._with_client(use_client)
 
         self.assertEqual("client-2", result)
+        self.assertEqual(["client-1", "client-2"], calls)
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
+        self.assertEqual(1, self.store.snapshot().flow_profile_agent_retry_error_counts[profiles[0].key])
+
+    def test_flow_profile_block_until_is_24h_after_the_strike(self) -> None:
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False):
+            # Rolling window: 2026-09-09 05:30 UTC -> 2026-09-10 05:30 UTC, not the next midnight UTC.
+            self.assertEqual(1788931800.0 + 86400.0, self.service._flow_profile_block_until(now=1788931800.0))
+            self.assertEqual("07:00 10/09", self.service._flow_profile_block_until_label(1788998400.0))
+            self.assertEqual(2, self.service._flow_agent_failed_switch_threshold())
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "3600"}, clear=False):
+            self.assertEqual(1788931800.0 + 3600.0, self.service._flow_profile_block_until(now=1788931800.0))
+
+    async def test_with_client_switches_profile_after_two_consecutive_flow_agent_failed_jobs(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Acc14", path=self.temp_root / "acc14"),
+            FlowBrowserProfile(index=1, label="Acc18", path=self.temp_root / "acc18"),
+        ]
+        job = JobRecord(type="image", status="running", title="card")
+        await self.store.add_job(job)
+        calls: list[str] = []
+
+        async def use_client(client: Any) -> str:
+            calls.append(client.name)
+            if client.name == "client-1":
+                raise FlowAgentFailedError("Flow Agent failed twice, no new images: The agent failed. Please try again.")
+            return client.name
+
+        started = time.time()
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False), patch.object(
+            self.service, "_flow_profile_specs", return_value=profiles
+        ), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(side_effect=[SimpleNamespace(name="b1"), SimpleNamespace(name="b1"), SimpleNamespace(name="b2")]),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(side_effect=[SimpleNamespace(name="client-1"), SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]),
+        ):
+            # First failed job: counted, not blocked, error surfaced to the job.
+            with self.assertRaises(HTTPException) as first:
+                await self.service._with_client(use_client, job_id=job.id)
+            self.assertIn("1/2", first.exception.detail)
+            self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
+            # Second consecutive failed job: Acc14 blocked until 07:00 VN, same job continues on Acc18.
+            result = await self.service._with_client(use_client, job_id=job.id)
+
+        self.assertEqual("client-2", result)
         self.assertEqual(["client-1", "client-1", "client-2"], calls)
         self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
-        self.assertNotIn(profiles[0].key, self.store.snapshot().flow_profile_agent_retry_error_counts)
+        blocked_until = self.store.snapshot().flow_profile_quota_blocked_until[profiles[0].key]
+        self.assertAlmostEqual(started + 86400.0, blocked_until, delta=30.0)
+        self.assertEqual(0, self.service._flow_profile_agent_failed_job_counts.get(profiles[0].key, 0))
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("1/2 card liên tiếp", logs)
+        self.assertIn("chuyển sang Acc18", logs)
+        self.assertIn("giờ VN", logs)
+
+    async def test_with_client_single_profile_stops_after_two_flow_agent_failed_jobs(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [FlowBrowserProfile(index=0, label="Acc15", path=self.temp_root / "acc15")]
+
+        async def use_client(client: Any) -> str:
+            raise FlowAgentFailedError("Flow Agent failed twice, no new images: The agent failed. Please try again.")
+
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False), patch.object(
+            self.service, "_flow_profile_specs", return_value=profiles
+        ), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace(name="b1"))
+        ), patch.object(
+            self.service, "_build_client_from_shared_browser", AsyncMock(return_value=SimpleNamespace(name="client-1"))
+        ):
+            with self.assertRaises(HTTPException) as first:
+                await self.service._with_client(use_client)
+            self.assertNotEqual(429, first.exception.status_code)
+            with self.assertRaises(HTTPException) as second:
+                await self.service._with_client(use_client)
+            self.assertEqual(429, second.exception.status_code)
+            self.assertIn("het quota Agent (Acc15)", second.exception.detail)
+            self.assertIn("gio VN", second.exception.detail)
+            # Every later job fails fast without touching Flow, so the Auto AI batch stops cleanly.
+            with self.assertRaises(HTTPException) as third:
+                await self.service._with_client(use_client)
+            self.assertEqual(429, third.exception.status_code)
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertTrue(self.service._auto_erp_should_stop_on_child_error(second.exception.detail))
+
+    async def test_with_client_success_resets_flow_agent_failed_job_counter(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Acc14", path=self.temp_root / "acc14"),
+            FlowBrowserProfile(index=1, label="Acc18", path=self.temp_root / "acc18"),
+        ]
+        outcomes = iter(["fail", "ok", "fail"])
+
+        async def use_client(client: Any) -> str:
+            if next(outcomes) == "fail":
+                raise FlowAgentFailedError("Flow Agent failed twice, no new images: The agent failed. Please try again.")
+            return client.name
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace(name="b1"))
+        ), patch.object(
+            self.service, "_build_client_from_shared_browser", AsyncMock(return_value=SimpleNamespace(name="client-1"))
+        ):
+            with self.assertRaises(HTTPException):
+                await self.service._with_client(use_client)
+            self.assertEqual("client-1", await self.service._with_client(use_client))
+            with self.assertRaises(HTTPException) as again:
+                await self.service._with_client(use_client)
+
+        self.assertIn("1/2", again.exception.detail)
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
 
     async def test_with_client_resets_flow_agent_try_again_counter_after_success(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
@@ -5049,6 +7396,28 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(429, second_ctx.exception.status_code)
         ensure_again.assert_not_awaited()
 
+    async def test_a_quota_block_ends_when_google_hands_the_quota_back(self) -> None:
+        # Khoá cứng 24 giờ dài hơn chu kỳ thật: quota về vào nửa đêm giờ Thái
+        # Bình Dương, nên profile hết quota lúc sáng bị app nhốt thêm gần năm
+        # tiếng sau khi Google đã trả — đo được đúng như vậy ngày 18-19/08.
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False):
+            with patch.object(self.service, "_seconds_until_flow_quota_reset", return_value=6.0 * 3600.0):
+                self.assertEqual(6.0 * 3600.0, self.service._flow_profile_block_seconds())
+            # Sát mốc reset thì vẫn chờ một khoảng, để khỏi thử lại liên tục
+            # nếu Google trả muộn hơn nửa đêm.
+            with patch.object(self.service, "_seconds_until_flow_quota_reset", return_value=30.0):
+                self.assertEqual(self.service.FLOW_QUOTA_MIN_BLOCK_S, self.service._flow_profile_block_seconds())
+
+    async def test_the_quota_block_length_can_still_be_pinned_by_env(self) -> None:
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "900"}, clear=False):
+            with patch.object(self.service, "_seconds_until_flow_quota_reset", return_value=6.0 * 3600.0):
+                self.assertEqual(900.0, self.service._flow_profile_block_seconds())
+
+    async def test_the_quota_reset_countdown_lands_on_pacific_midnight(self) -> None:
+        seconds = self.service._seconds_until_flow_quota_reset()
+        self.assertGreater(seconds, 0.0)
+        self.assertLessEqual(seconds, 24.0 * 3600.0)
+
     async def test_with_client_persists_quota_block_across_service_instances(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
         profiles = [
@@ -5125,7 +7494,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         page.bring_to_front.assert_awaited()
         page.goto.assert_awaited()
         self.assertEqual(
-            "https://labs.google/fx/vi/tools/flow",
+            "https://flow.google.com",
             page.goto.await_args.args[0],
         )
         page.evaluate.assert_awaited()
@@ -5150,7 +7519,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         page = SimpleNamespace(url="https://labs.google/fx/vi/tools/flow")
         browser = SimpleNamespace()
 
-        with patch.object(self.service, "_ensure_shared_browser", AsyncMock(return_value=browser)) as ensure_browser, patch.object(
+        with patch.object(self.service, "_current_windows_session_id", return_value=1), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=browser)
+        ) as ensure_browser, patch.object(
             self.service,
             "_open_login_flow_page",
             AsyncMock(return_value=page),
@@ -5161,6 +7532,218 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         open_login_page.assert_awaited_once_with(browser)
         self.assertTrue(payload["ok"])
         self.assertEqual("https://labs.google/fx/vi/tools/flow", payload["url"])
+
+    async def test_cdp_client_uses_repo_navigation_instead_of_flow_py_factory(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid-demo", cdp_url="http://127.0.0.1:9222"))
+        created: list[str] = []
+        fake_client = SimpleNamespace(close=AsyncMock(), name="repo-client")
+
+        class FakeFlowClient:
+            create = AsyncMock(side_effect=AssertionError("FlowClient.create must not open the legacy navigation host"))
+
+        class FakeBrowserManager:
+            @classmethod
+            def from_cdp(cls, cdp_url: str) -> "FakeBrowserManager":
+                created.append(cdp_url)
+                return cls()
+
+            async def start(self) -> None:
+                created.append("start")
+
+        def fake_modules(client_only: bool = False) -> tuple[object, object, object, object, object]:
+            if client_only:
+                return FakeFlowClient, None, None, None, None
+            return FakeBrowserManager, None, None, None, None
+
+        with patch.object(self.service, "_flow_modules", side_effect=fake_modules), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=fake_client),
+        ) as build_client:
+            result = await self.service._with_client(lambda client: asyncio.sleep(0, result=client.name))
+
+        self.assertEqual("repo-client", result)
+        self.assertEqual(["http://127.0.0.1:9222", "start"], created)
+        build_client.assert_awaited_once()
+        self.assertEqual("pid-demo", build_client.await_args.kwargs["project_id"])
+        FakeFlowClient.create.assert_not_awaited()
+        fake_client.close.assert_awaited_once()
+
+    async def test_flow_py_bearer_lookup_reads_the_token_on_labs_google(self) -> None:
+        """Đang đứng sẵn ở trang token thì đọc luôn, không điều hướng thừa.
+
+        Bài này trước đây chốt ngược: nó nhận trang ``flow.google.com`` là chỗ
+        đọc token.  Đo trên máy trung tâm ngày 08/09/2026 thì editor mới không
+        có phiên next-auth, token trả rỗng, và mọi lệnh gọi Flow trả 401.  Chỗ
+        đọc token là labs.google.
+        """
+        project_id = "f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"
+        token_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+        page = SimpleNamespace(
+            url=token_url,
+            goto=AsyncMock(),
+            evaluate=AsyncMock(return_value="ya29.test-token"),
+        )
+        browser = SimpleNamespace(page=AsyncMock(return_value=page))
+        self.service._patch_flow_runtime_compat()
+        from flow._api import FlowAPI
+
+        api = FlowAPI(browser, project_id=project_id)
+        api._project_page_url = f"https://flow.google.com/project/{project_id}"
+
+        token = await api._get_bearer_token()
+
+        self.assertEqual("ya29.test-token", token)
+        page.goto.assert_not_awaited()
+
+    async def test_flow_py_bearer_lookup_leaves_the_new_editor_to_read_the_token(self) -> None:
+        """Đang ở editor mới thì phải sang labs.google rồi mới đọc."""
+        project_id = "f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"
+        project_url = f"https://flow.google.com/project/{project_id}"
+        token_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+        page = SimpleNamespace(
+            url=project_url,
+            goto=AsyncMock(),
+            evaluate=AsyncMock(return_value="ya29.test-token"),
+        )
+        browser = SimpleNamespace(page=AsyncMock(return_value=page))
+        self.service._patch_flow_runtime_compat()
+        from flow._api import FlowAPI
+
+        api = FlowAPI(browser, project_id=project_id)
+        api._project_page_url = project_url
+
+        token = await api._get_bearer_token()
+
+        self.assertEqual("ya29.test-token", token)
+        page.goto.assert_awaited()
+        self.assertEqual(token_url, page.goto.await_args.args[0])
+
+    def _stub_shared_browser_launch(self) -> Dict[str, Any]:
+        """Bắt lấy lời gọi BrowserManager mà không mở Chromium thật."""
+        seen: Dict[str, Any] = {}
+
+        class FakeBrowserManager:
+            def __init__(self, headless: bool = True, profile_dir: Any = None) -> None:
+                seen["headless"] = headless
+                self._ctx = object()
+
+            async def start(self) -> None:
+                seen["started"] = True
+
+            async def stop(self) -> None:
+                seen["stopped"] = True
+
+        return {"seen": seen, "manager": FakeBrowserManager}
+
+    async def test_headless_no_longer_gives_up_the_shared_browser(self) -> None:
+        # Tắt cửa sổ không được phép kéo theo mất luôn trình duyệt dùng chung
+        # và cả danh sách profile - đó là cái giá của lối cũ.
+        self.assertTrue(self.service._should_keep_flow_browser_open(AppConfig(headless=True)))
+        self.assertTrue(self.service._should_keep_flow_browser_open(AppConfig(headless=False)))
+        self.assertFalse(
+            self.service._should_keep_flow_browser_open(AppConfig(cdp_url="http://127.0.0.1:9222"))
+        )
+
+    async def test_shared_browser_runs_hidden_when_configured(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=True))
+        stub = self._stub_shared_browser_launch()
+        with patch.object(
+            self.service, "_flow_modules", return_value=(stub["manager"], None, None, None, None)
+        ), patch.object(self.service, "_ensure_playwright_browsers_available"), patch.object(
+            self.service, "_close_placeholder_flow_tabs", AsyncMock()
+        ):
+            await self.service._ensure_shared_browser()
+        self.assertTrue(stub["seen"]["headless"])
+
+    async def test_hand_work_still_gets_a_window_even_when_hidden(self) -> None:
+        # Đăng nhập Google là việc người dùng phải tự làm; ẩn cửa sổ đi thì
+        # không còn đường nào đăng nhập nữa.
+        await self.store.replace_config(AppConfig(project_id="pid", headless=True))
+        stub = self._stub_shared_browser_launch()
+        with patch.object(
+            self.service, "_flow_modules", return_value=(stub["manager"], None, None, None, None)
+        ), patch.object(self.service, "_ensure_playwright_browsers_available"), patch.object(
+            self.service, "_close_placeholder_flow_tabs", AsyncMock()
+        ):
+            await self.service._ensure_shared_browser(visible=True)
+        self.assertFalse(stub["seen"]["headless"])
+
+    async def test_a_browser_opened_the_other_way_is_not_reused(self) -> None:
+        # Một profile Chromium không mở hai kiểu cùng lúc, nên đổi chế độ là
+        # phải dựng lại chứ không dùng lại cửa sổ đang có.
+        self.service._shared_browser = SimpleNamespace(_ctx=object())
+        self.service._shared_browser_profile_key = ""
+        self.service._shared_browser_headless = False
+        with patch.object(self.service, "_shared_browser", self.service._shared_browser):
+            self.assertFalse(await self.service._shared_browser_is_usable(None, True))
+
+    async def test_hidden_windows_open_the_full_chromium(self) -> None:
+        # ``chrome-headless-shell`` mở được hồ sơ nhưng labs.google không cấp
+        # phiên đăng nhập cho nó, nên chạy ẩn phải gọi bản Chromium đầy đủ.
+        seen: Dict[str, Any] = {}
+
+        async def fake_launch(_self: Any, user_data_dir: Any, **kwargs: Any) -> str:
+            seen.update(kwargs)
+            seen["profile"] = user_data_dir
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        self.assertEqual("ctx", await launcher(object(), "/hồ/sơ", headless=True))
+        self.assertEqual("chromium", seen.get("channel"))
+
+    async def test_a_visible_window_is_left_exactly_as_it_was(self) -> None:
+        seen: Dict[str, Any] = {}
+
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            seen.update(kwargs)
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        await launcher(object(), "/hồ/sơ", headless=False)
+        self.assertNotIn("channel", seen)
+
+    async def test_a_machine_without_the_full_chromium_still_runs(self) -> None:
+        # Máy chỉ có bản rút gọn thì thà chạy được còn hơn chết đứng.
+        attempts: list[Dict[str, Any]] = []
+
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            attempts.append(kwargs)
+            if kwargs.get("channel"):
+                raise RuntimeError("chromium chưa được cài")
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        self.assertEqual("ctx", await launcher(object(), "/hồ/sơ", headless=True))
+        self.assertEqual(["chromium", None], [attempt.get("channel") for attempt in attempts])
+
+    async def test_a_chosen_browser_is_never_overruled(self) -> None:
+        seen: Dict[str, Any] = {}
+
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            seen.update(kwargs)
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        await launcher(object(), "/hồ/sơ", headless=True, channel="chrome")
+        self.assertEqual("chrome", seen.get("channel"))
+
+    def test_the_launcher_is_only_wrapped_once(self) -> None:
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        self.assertTrue(getattr(launcher, "__flow_v2_full_chromium__", False))
+
+    async def test_open_flow_login_surface_asks_for_a_visible_window(self) -> None:
+        page = SimpleNamespace(url="https://labs.google/fx/vi/tools/flow")
+        with patch.object(self.service, "_current_windows_session_id", return_value=1), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace())
+        ) as ensure_browser, patch.object(
+            self.service, "_open_login_flow_page", AsyncMock(return_value=page)
+        ):
+            await self.service.open_flow_login_surface()
+        self.assertEqual({"visible": True}, ensure_browser.await_args.kwargs)
 
     async def test_open_flow_login_surface_fails_in_windows_session_zero(self) -> None:
         with patch("flow_web.service.os.name", "nt"), patch.object(
@@ -5180,7 +7763,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         page = SimpleNamespace(url="https://labs.google/fx/vi/tools/flow/project/pid-demo", bring_to_front=AsyncMock())
         browser = SimpleNamespace()
 
-        with patch.object(self.service, "_ensure_shared_browser", AsyncMock(return_value=browser)) as ensure_browser, patch.object(
+        with patch.object(self.service, "_current_windows_session_id", return_value=1), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=browser)
+        ) as ensure_browser, patch.object(
             self.service,
             "_repair_placeholder_flow_tabs",
             AsyncMock(),
@@ -5191,7 +7776,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ) as acquire_page, patch.object(
             self.service,
             "_ensure_valid_flow_project_page",
-            AsyncMock(),
+            AsyncMock(return_value=(True, "")),
         ) as ensure_project, patch.object(
             self.service,
             "_foreground_native_flow_window",
@@ -5406,7 +7991,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[video_job]))
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
@@ -5420,7 +8005,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("Veo 3.1 - Fast", fake_client.generate_video.await_args.kwargs["model"])
         saved = self.store.get_job(job.id)
         self.assertIsNotNone(saved)
-        self.assertEqual("completed", saved.status)
+        self.assertEqual("completed", saved.status, saved.error)
         self.assertEqual(1, len(saved.artifacts))
         self.assertEqual("https://example.com/video.mp4", saved.artifacts[0].url)
         self.assertEqual("video/mp4", saved.artifacts[0].mime_type)
@@ -5471,7 +8056,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         only_one_job = SimpleNamespace(media_name="media-123", workflow_id="wf-123")
         fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[only_one_job]))
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client):
@@ -5499,7 +8084,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         fake_client = SimpleNamespace(generate_video=fake_generate_video)
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         async def fake_wait_for(awaitable, timeout=None):
@@ -5552,7 +8137,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[video_job]))
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
@@ -5692,7 +8277,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             generate_image=AsyncMock(return_value=[fake_image]),
         )
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
@@ -5827,7 +8412,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             generate_image=AsyncMock(side_effect=AssertionError("UI image generation should not be used")),
         )
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client):
@@ -5887,7 +8472,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             _api=SimpleNamespace(generate_image=AsyncMock(return_value=fake_images)),
         )
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client):
@@ -5911,7 +8496,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                     {"id": "source-1", "type": "source", "title": "Prompt Source", "settings": {"sourceType": "sheets"}},
                     {"id": "normalize-1", "type": "normalize", "title": "Normalize Prompt"},
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "card-1"}},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive", "settings": {"erpTask": "card-1"}},
                     {"id": "telegram-1", "type": "telegram", "title": "Telegram Review", "settings": {"telegramChat": "chat-1"}},
                     {"id": "approval-1", "type": "approval", "title": "Approval"},
                 ]
@@ -5936,16 +8521,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
         calls: list[str] = []
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_archive(job_id, module_request, artifacts):
-            calls.append("trello")
-            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
-
-        async def fake_telegram(job_id, module_request, artifacts):
-            calls.append("telegram")
-            return {"configured": True, "sent": len(artifacts), "chat_id": module_request.telegram_chat_id}
+            calls.append("erp")
+            return {"configured": True, "sent": len(artifacts), "task_id": module_request.erp_task_id}
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
             self.service,
@@ -5953,63 +8534,68 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             AsyncMock(return_value=fake_images),
         ), patch.object(
             self.service,
-            "_archive_trello_artifacts",
+            "_archive_erp_artifacts",
             side_effect=fake_archive,
-        ), patch.object(
-            self.service,
-            "_send_telegram_review_pack",
-            side_effect=fake_telegram,
         ):
             await self.service._run_flow_job(job.id, request)
 
         saved = self.store.get_job(job.id)
         self.assertIsNotNone(saved)
         self.assertEqual("completed", saved.status)
-        self.assertEqual(["trello", "telegram"], calls)
+        # Nothing left the machine: the reviewer has not decided yet, so the
+        # ERP write is still ahead of the job rather than behind it.
+        self.assertEqual([], calls)
         execution = saved.result["automation_execution"]
         self.assertEqual("graph", execution["mode"])
         self.assertFalse(execution["completed"])
+        # Review happens on the dashboard, so the declared Telegram module
+        # drops out and the ERP node sits behind the approval gate. Bước xoá
+        # watermark đã bỏ hẳn từ 10/9, nên Flow đi thẳng sang duyệt.
         self.assertEqual(
-            ["source", "normalize", "flow", "trello", "telegram", "approval"],
+            ["source", "normalize", "flow", "approval", "erp"],
             [node["type"] for node in execution["nodes"]],
         )
-        self.assertTrue(all(node["status"] == "completed" for node in execution["nodes"] if node["type"] != "approval"))
         approval_node = next(node for node in execution["nodes"] if node["type"] == "approval")
         self.assertEqual("running", approval_node["status"])
         self.assertTrue(approval_node["output"]["awaiting_user_approval"])
+        self.assertEqual("dashboard", approval_node["output"]["review_surface"])
+        erp_node = next(node for node in execution["nodes"] if node["type"] == "erp")
+        self.assertEqual("pending", erp_node["status"])
         flow_node = next(node for node in execution["nodes"] if node["type"] == "flow")
         self.assertEqual(1, flow_node["output"]["artifact_count"])
-        telegram_node = next(node for node in execution["nodes"] if node["type"] == "telegram")
-        self.assertEqual("chat-1", telegram_node["output"]["chat_id"])
-        trello_node = next(node for node in execution["nodes"] if node["type"] == "trello")
-        self.assertEqual("card-1", trello_node["output"]["card_id"])
+        self.assertTrue(
+            all(
+                node["status"] == "completed"
+                for node in execution["nodes"]
+                if node["type"] not in {"approval", "erp"}
+            )
+        )
 
-    async def test_trello_source_feeds_flow_and_archives_to_same_card_directly(self) -> None:
+    async def test_erp_source_feeds_flow_and_archives_to_same_card_directly(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        source_image = self.uploads_dir / "trello-source.jpg"
+        source_image = self.uploads_dir / "erp-source.jpg"
         source_image.write_bytes(b"source-image")
         request = CreateJobRequest(
             type="image",
-            prompt="turn the Trello product photo into an Etsy lifestyle image",
+            prompt="turn the ERP product photo into an Etsy lifestyle image",
             count=1,
-            telegram_enabled=True,
-            trello_enabled=True,
+            erp_enabled=True,
             automation_graph={
                 "modules": [
                     {"id": "source-1", "type": "source", "title": "Prompt Source"},
                     {
-                        "id": "trello-source-1",
-                        "type": "trello_source",
-                        "title": "Trello Image Source",
+                        "id": "erp-source-1",
+                        "type": "erp_source",
+                        "title": "ERP Image Source",
                         "settings": {
-                            "trelloCard": "https://trello.com/c/abc123/product-card",
-                            "trelloAttachmentLimit": 2,
+                            "erpTask": "https://erp.com/c/abc123/product-card",
+                            "erpAttachmentLimit": 2,
                         },
                     },
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     {"id": "telegram-1", "type": "telegram", "title": "Telegram Review"},
                     {"id": "approval-1", "type": "approval", "title": "Approval"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "wrong-card"}},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive", "settings": {"erpTask": "wrong-card"}},
                 ]
             },
         )
@@ -6030,7 +8616,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_generate_images(client, job_id, module_request, reference_media_names):
@@ -6038,91 +8624,88 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             captured["reference_media_names"] = list(reference_media_names)
             return [fake_image]
 
-        async def fake_telegram(job_id, module_request, artifacts):
-            return {"configured": True, "sent": len(artifacts), "chat_id": module_request.telegram_chat_id}
-
         archive_cards: list[str] = []
 
         async def fake_archive(job_id, module_request, artifacts):
-            archive_cards.append(module_request.trello_card_id)
-            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+            archive_cards.append(module_request.erp_task_id)
+            return {"configured": True, "sent": len(artifacts), "task_id": module_request.erp_task_id}
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_download_trello_card_image_attachments",
+            "_erp_auto_source_list_ids",
+            return_value=[],
+        ), patch.object(
+            self.service,
+            "_download_erp_task_image_attachments",
             return_value=[str(source_image)],
         ), patch.object(
             self.service,
             "_resolve_image_reference_media",
-            AsyncMock(return_value=["trello-media"]),
+            AsyncMock(return_value=["erp-media"]),
         ), patch.object(
             self.service,
             "_generate_images_with_retry",
             side_effect=fake_generate_images,
         ), patch.object(
             self.service,
-            "_send_telegram_review_pack",
-            side_effect=fake_telegram,
-        ), patch.object(
-            self.service,
-            "_archive_trello_artifacts",
+            "_archive_erp_artifacts",
             side_effect=fake_archive,
         ):
             await self.service._run_flow_job(job.id, request)
-
-        generated_request = captured["request"]
-        self.assertEqual("abc123", generated_request.trello_card_id)
-        self.assertEqual([str(source_image)], generated_request.reference_image_paths)
-        self.assertEqual(["base"], generated_request.reference_image_roles)
-        self.assertEqual(["trello-media"], captured["reference_media_names"])
+            await self.service.apply_dashboard_approval(job.id, 0, "approved", "Test reviewer")
 
         saved = self.store.get_job(job.id)
+        self.assertIn("request", captured, saved.error if saved is not None else "job missing")
+        generated_request = captured["request"]
+        self.assertEqual("abc123", generated_request.erp_task_id)
+        self.assertEqual([str(source_image)], generated_request.reference_image_paths)
+        self.assertEqual(["base"], generated_request.reference_image_roles)
+        self.assertEqual(["erp-media"], captured["reference_media_names"])
+
         self.assertIsNotNone(saved)
-        self.assertEqual("abc123", saved.input["trello_card_id"])
+        self.assertEqual("abc123", saved.input["erp_task_id"])
         execution = saved.result["automation_execution"]
-        trello_source_node = next(node for node in execution["nodes"] if node["id"] == "trello-source-1")
-        self.assertEqual("completed", trello_source_node["status"])
-        self.assertEqual(1, trello_source_node["output"]["reference_image_count"])
-        telegram_node = next(node for node in execution["nodes"] if node["id"] == "telegram-1")
-        self.assertEqual("skipped", telegram_node["status"])
-        self.assertEqual("trello_direct_review", telegram_node["output"]["reason"])
+        erp_source_node = next(node for node in execution["nodes"] if node["id"] == "erp-source-1")
+        self.assertEqual("completed", erp_source_node["status"])
+        self.assertEqual(1, erp_source_node["output"]["reference_image_count"])
+        self.assertFalse(any(node["type"] == "telegram" for node in execution["nodes"]))
         approval_node = next(node for node in execution["nodes"] if node["id"] == "approval-1")
         self.assertEqual("completed", approval_node["status"])
-        self.assertTrue(approval_node["output"]["trello_direct_review"])
-        trello_node = next(node for node in execution["nodes"] if node["id"] == "trello-1")
-        self.assertEqual("completed", trello_node["status"])
-        self.assertEqual("abc123", trello_node["output"]["card_id"])
+        self.assertEqual(1, approval_node["output"]["dashboard_approval_summary"]["approved"])
+        erp_node = next(node for node in execution["nodes"] if node["id"] == "erp-1")
+        self.assertEqual("completed", erp_node["status"])
+        self.assertEqual("abc123", erp_node["output"]["task_id"])
         self.assertEqual(["abc123"], archive_cards)
-        self.assertEqual("abc123", saved.result["trello_direct_review"]["card_id"])
+        self.assertEqual("approved", saved.result["dashboard_approvals"]["0"]["status"])
 
-    async def test_trello_source_overrides_stale_request_card_before_archive(self) -> None:
+    async def test_erp_source_overrides_stale_request_card_before_archive(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        source_image = self.uploads_dir / "trello-source-stale.jpg"
+        source_image = self.uploads_dir / "erp-source-stale.jpg"
         source_image.write_bytes(b"source-image")
         request = CreateJobRequest(
             type="image",
-            prompt="turn the Trello product photo into an Etsy lifestyle image",
+            prompt="turn the ERP product photo into an Etsy lifestyle image",
             count=1,
-            trello_card_id="wrong-card",
-            trello_enabled=True,
+            erp_task_id="wrong-card",
+            erp_enabled=True,
             automation_graph={
                 "modules": [
                     {
-                        "id": "trello-source-1",
-                        "type": "trello_source",
-                        "title": "Trello Image Source",
+                        "id": "erp-source-1",
+                        "type": "erp_source",
+                        "title": "ERP Image Source",
                         "settings": {
-                            "trelloBoard": "https://trello.com/b/board123/demo-board",
-                            "trelloList": "ready-list",
-                            "trelloCard": "https://trello.com/c/source123/source-card",
+                            "erpProject": "https://erp.com/b/board123/demo-board",
+                            "erpStatus": "ready-list",
+                            "erpTask": "https://erp.com/c/source123/source-card",
                         },
                     },
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "wrong-card"}},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive", "settings": {"erpTask": "wrong-card"}},
                 ]
             },
         )
@@ -6142,74 +8725,75 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_generate_images(client, job_id, module_request, reference_media_names):
-            captured["flow_card"] = module_request.trello_card_id
+            captured["flow_card"] = module_request.erp_task_id
             return [fake_image]
 
         async def fake_archive(job_id, module_request, artifacts):
-            captured["archive_card"] = module_request.trello_card_id
-            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+            captured["archive_card"] = module_request.erp_task_id
+            return {"configured": True, "sent": len(artifacts), "task_id": module_request.erp_task_id}
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_card_hint_by_id",
-            return_value={"card_id": "source123", "list_id": "ready-list", "list_name": "Ready for AI"},
+            "_erp_task_hint_by_id",
+            return_value={"task_id": "source123", "status": "ready-list", "list_name": "Ready for AI"},
         ), patch.object(
             self.service,
-            "_download_trello_card_image_attachments",
+            "_download_erp_task_image_attachments",
             return_value=[str(source_image)],
         ) as download_images, patch.object(
             self.service,
             "_resolve_image_reference_media",
-            AsyncMock(return_value=["trello-media"]),
+            AsyncMock(return_value=["erp-media"]),
         ), patch.object(
             self.service,
             "_generate_images_with_retry",
             side_effect=fake_generate_images,
         ), patch.object(
             self.service,
-            "_archive_trello_artifacts",
+            "_archive_erp_artifacts",
             side_effect=fake_archive,
         ):
             await self.service._run_flow_job(job.id, request)
+            await self.service.apply_dashboard_approval(job.id, 0, "approved", "Test reviewer")
 
         self.assertEqual("source123", download_images.call_args.args[2])
         self.assertEqual("source123", captured["flow_card"])
         self.assertEqual("source123", captured["archive_card"])
         saved = self.store.get_job(job.id)
-        self.assertEqual("source123", saved.input["trello_card_id"])
-        self.assertEqual("source123", saved.input["trello_source_card_id"])
-        trello_modules = [
+        self.assertEqual("source123", saved.input["erp_task_id"])
+        self.assertEqual("source123", saved.input["erp_source_task_id"])
+        erp_modules = [
             module
             for module in saved.input["automation_graph"]["modules"]
-            if module["type"] in {"trello_source", "trello"}
+            if module["type"] in {"erp_source", "erp"}
         ]
-        self.assertTrue(all(module["settings"]["trelloCard"] == "source123" for module in trello_modules))
+        self.assertTrue(all(module["settings"]["erpTask"] == "source123" for module in erp_modules))
 
-    async def test_trello_source_request_locks_downloaded_card_and_attachment(self) -> None:
+    async def test_erp_source_request_locks_downloaded_card_and_attachment(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(
             type="image",
-            prompt="make a product image from Trello",
+            prompt="make a product image from ERP",
             count=1,
-            trello_card_id="source-card",
-            trello_enabled=True,
+            erp_task_id="source-card",
+            erp_enabled=True,
             automation_graph={
                 "modules": [
-                    {"id": "trello-source-1", "type": "trello_source", "title": "Trello Image Source"},
+                    {"id": "erp-source-1", "type": "erp_source", "title": "ERP Image Source"},
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                 ]
             },
         )
@@ -6224,63 +8808,66 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             {
                 "id": "source-att",
                 "name": "source.jpg",
-                "url": "https://trello.local/source.jpg",
+                "url": "https://erp.local/source.jpg",
                 "mimeType": "image/jpeg",
                 "date": "2026-05-20T08:00:00.000Z",
             },
             {
                 "id": "flow-old",
                 "name": "flow-old-1.jpg",
-                "url": "https://trello.local/flow.jpg",
+                "url": "https://erp.local/flow.jpg",
                 "mimeType": "image/jpeg",
                 "date": "2026-05-22T08:00:00.000Z",
             },
         ]
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_get_json",
+            "_erp_auto_source_list_ids",
+            return_value=[],
+        ), patch.object(
+            self.service,
+            "_erp_get_json",
             return_value=attachments,
         ), patch.object(
             self.service,
-            "_trello_download_attachment_bytes",
+            "_erp_download_attachment_bytes",
             return_value=(b"source-image", "image/jpeg"),
         ):
-            updated = await self.service._request_with_trello_source_images(job.id, request)
+            updated = await self.service._request_with_erp_source_images(job.id, request)
 
-        self.assertEqual("source-card", updated.trello_card_id)
-        self.assertEqual("source-card", updated.trello_source_card_id)
-        self.assertEqual(["source-att"], updated.trello_attachment_ids)
-        self.assertEqual(["source-att"], updated.trello_source_attachment_ids)
+        self.assertEqual("source-card", updated.erp_task_id)
+        self.assertEqual("source-card", updated.erp_source_task_id)
+        self.assertEqual(["source-att"], updated.erp_attachment_ids)
+        self.assertEqual(["source-att"], updated.erp_source_attachment_ids)
         self.assertEqual(1, len(updated.reference_image_paths))
         execution = self.store.get_job(job.id).result["automation_execution"]
-        trello_source_node = next(node for node in execution["nodes"] if node["id"] == "trello-source-1")
-        self.assertEqual("source-card", trello_source_node["output"]["source_card_id"])
-        self.assertEqual(["source-att"], trello_source_node["output"]["source_attachment_ids"])
+        erp_source_node = next(node for node in execution["nodes"] if node["id"] == "erp-source-1")
+        self.assertEqual("source-card", erp_source_node["output"]["source_task_id"])
+        self.assertEqual(["source-att"], erp_source_node["output"]["source_attachment_ids"])
 
-    async def test_trello_source_resolves_board_link_to_image_card(self) -> None:
+    async def test_erp_source_resolves_board_link_to_image_card(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        source_image = self.uploads_dir / "trello-board-source.jpg"
+        source_image = self.uploads_dir / "erp-board-source.jpg"
         source_image.write_bytes(b"source-image")
         request = CreateJobRequest(
             type="image",
-            prompt="make a product image from the Trello board card",
+            prompt="make a product image from the ERP board card",
             count=1,
-            telegram_enabled=False,
-            trello_enabled=True,
+            erp_enabled=True,
             automation_graph={
                 "modules": [
                     {
-                        "id": "trello-source-1",
-                        "type": "trello_source",
-                        "title": "Trello Image Source",
+                        "id": "erp-source-1",
+                        "type": "erp_source",
+                        "title": "ERP Image Source",
                         "settings": {
-                            "trelloBoard": "https://trello.com/b/board123/demo-board",
-                            "trelloList": "list-1",
+                            "erpProject": "https://erp.com/b/PROJ-0049/demo-board",
+                            "erpStatus": "list-1",
                         },
                     },
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                 ]
             },
         )
@@ -6300,7 +8887,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_generate_images(client, job_id, module_request, reference_media_names):
@@ -6308,72 +8895,76 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return [fake_image]
 
         async def fake_archive(job_id, module_request, artifacts):
-            captured["archive_card"] = module_request.trello_card_id
-            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
+            captured["archive_card"] = module_request.erp_task_id
+            return {"configured": True, "sent": len(artifacts), "task_id": module_request.erp_task_id}
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="list-1",
         ), patch.object(
             self.service,
-            "_trello_first_image_card_id_on_board",
+            "_erp_first_image_card_id_on_board",
             return_value="card-from-board",
         ) as find_card, patch.object(
             self.service,
-            "_download_trello_card_image_attachments",
+            "_download_erp_task_image_attachments",
             return_value=[str(source_image)],
         ) as download_images, patch.object(
             self.service,
             "_resolve_image_reference_media",
-            AsyncMock(return_value=["trello-media"]),
+            AsyncMock(return_value=["erp-media"]),
         ), patch.object(
             self.service,
             "_generate_images_with_retry",
             side_effect=fake_generate_images,
         ), patch.object(
             self.service,
-            "_archive_trello_artifacts",
+            "_archive_erp_artifacts",
             side_effect=fake_archive,
         ):
             await self.service._run_flow_job(job.id, request)
 
-        find_card.assert_called_once_with("key", "token", "board123", "list-1")
+        # The board link names another project; the app still only touches the
+        # one project it is configured for.
+        find_card.assert_called_once_with("key", "token", "PROJ-0013", "list-1")
         download_images.assert_called_once()
         self.assertEqual("card-from-board", download_images.call_args.args[2])
         generated_request = captured["request"]
-        self.assertEqual("board123", generated_request.trello_board_id)
-        self.assertEqual("card-from-board", generated_request.trello_card_id)
-        self.assertEqual("card-from-board", generated_request.trello_source_card_id)
-        self.assertEqual("card-from-board", captured["archive_card"])
+        self.assertEqual("PROJ-0013", generated_request.erp_project_id)
+        self.assertEqual("card-from-board", generated_request.erp_task_id)
+        self.assertEqual("card-from-board", generated_request.erp_source_task_id)
+        # The Task the images will go back to is settled here, but nothing is
+        # written yet — the archive waits behind the dashboard approval.
+        self.assertNotIn("archive_card", captured)
         saved = self.store.get_job(job.id)
-        self.assertEqual("card-from-board", saved.input["trello_card_id"])
-        self.assertEqual("card-from-board", saved.input["trello_source_card_id"])
-        trello_source_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["id"] == "trello-source-1")
-        self.assertEqual("board123", trello_source_node["output"]["board_id"])
-        self.assertEqual("card-from-board", trello_source_node["output"]["card_id"])
+        self.assertEqual("card-from-board", saved.input["erp_task_id"])
+        self.assertEqual("card-from-board", saved.input["erp_source_task_id"])
+        erp_source_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["id"] == "erp-source-1")
+        self.assertEqual("PROJ-0013", erp_source_node["output"]["project_id"])
+        self.assertEqual("card-from-board", erp_source_node["output"]["task_id"])
 
-    async def test_trello_source_rejects_explicit_card_outside_ready_list(self) -> None:
+    async def test_erp_source_rejects_explicit_card_outside_ready_list(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(
             type="image",
-            prompt="make a product image from Trello",
+            prompt="make a product image from ERP",
             count=1,
-            trello_board_id="https://trello.com/b/board123/demo-board",
-            trello_card_id="wrong-card",
+            erp_project_id="https://erp.com/b/board123/demo-board",
+            erp_task_id="wrong-card",
             automation_graph={
                 "modules": [
                     {
-                        "id": "trello-source-1",
-                        "type": "trello_source",
-                        "title": "Trello Image Source",
+                        "id": "erp-source-1",
+                        "type": "erp_source",
+                        "title": "ERP Image Source",
                         "settings": {
-                            "trelloBoard": "https://trello.com/b/board123/demo-board",
-                            "trelloCard": "https://trello.com/c/wrong-card/wrong",
+                            "erpProject": "https://erp.com/b/board123/demo-board",
+                            "erpTask": "https://erp.com/c/wrong-card/wrong",
                         },
                     },
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
@@ -6383,29 +8974,29 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         job = JobRecord(type="image", status="running", title="test", input=request.model_dump(mode="json"))
         await self.store.add_job(job)
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_board_lists",
+            "_erp_project_lists",
             return_value=[
                 {"id": "other-list", "name": "Done"},
                 {"id": "ready-list", "name": "Ready for AI"},
             ],
         ), patch.object(
             self.service,
-            "_trello_card_hint_by_id",
-            return_value={"card_id": "wrong-card", "card_name": "wrong", "list_id": "other-list"},
+            "_erp_task_hint_by_id",
+            return_value={"task_id": "wrong-card", "task_name": "wrong", "status": "other-list"},
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
-            "_download_trello_card_image_attachments",
+            "_download_erp_task_image_attachments",
         ) as download_images:
             with self.assertRaises(RuntimeError) as ctx:
-                await self.service._request_with_trello_source_images(job.id, request)
+                await self.service._request_with_erp_source_images(job.id, request)
 
-        self.assertIn("không nằm trong cột Ready for AI", str(ctx.exception))
+        self.assertIn("không nằm trong cột Open", str(ctx.exception))
         download_images.assert_not_called()
 
     async def test_approval_module_pauses_and_resumes_downstream_modules(self) -> None:
@@ -6414,15 +9005,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             type="image",
             prompt="cat",
             count=1,
-            telegram_enabled=True,
-            trello_enabled=True,
+            erp_enabled=True,
             automation_graph={
                 "modules": [
                     {"id": "source-1", "type": "source", "title": "Prompt Source"},
                     {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "telegram-1", "type": "telegram", "title": "Telegram Review", "settings": {"telegramChat": "chat-1"}},
                     {"id": "approval-1", "type": "approval", "title": "Approval"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive", "settings": {"trelloCard": "card-1"}},
+                    {"id": "erp-1", "type": "erp", "title": "ERP Archive", "settings": {"erpTask": "card-1"}},
                 ]
             },
         )
@@ -6445,16 +9034,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
         calls: list[str] = []
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_archive(job_id, module_request, artifacts):
-            calls.append("trello")
-            return {"configured": True, "sent": len(artifacts), "card_id": module_request.trello_card_id}
-
-        async def fake_telegram(job_id, module_request, artifacts):
-            calls.append("telegram")
-            return {"configured": True, "sent": len(artifacts), "chat_id": module_request.telegram_chat_id}
+            calls.append("erp")
+            return {"configured": True, "sent": len(artifacts), "task_id": module_request.erp_task_id}
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
             self.service,
@@ -6462,113 +9047,38 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             AsyncMock(return_value=fake_images),
         ), patch.object(
             self.service,
-            "_archive_trello_artifacts",
+            "_archive_erp_artifacts",
             side_effect=fake_archive,
-        ), patch.object(
-            self.service,
-            "_send_telegram_review_pack",
-            side_effect=fake_telegram,
         ):
             await self.service._run_flow_job(job.id, request)
 
             saved = self.store.get_job(job.id)
             self.assertIsNotNone(saved)
-            self.assertEqual(["telegram"], calls)
+            self.assertEqual([], calls)
             execution = saved.result["automation_execution"]
             approval_node = next(node for node in execution["nodes"] if node["id"] == "approval-1")
-            trello_node = next(node for node in execution["nodes"] if node["id"] == "trello-1")
+            erp_node = next(node for node in execution["nodes"] if node["id"] == "erp-1")
             self.assertEqual("running", approval_node["status"])
-            self.assertEqual("pending", trello_node["status"])
+            self.assertEqual("pending", erp_node["status"])
             self.assertFalse(execution["completed"])
 
-            await self.service._apply_telegram_approval(
+            await self.service.apply_dashboard_approval(
                 job.id,
                 0,
                 "approved",
-                {
-                    "id": "callback-1",
-                    "from": {"first_name": "Reviewer"},
-                    "message": {"message_id": 42, "chat": {"id": "chat-1"}},
-                },
             )
 
         saved = self.store.get_job(job.id)
         self.assertIsNotNone(saved)
-        self.assertEqual(["telegram", "trello"], calls)
+        self.assertEqual(["erp"], calls)
         execution = saved.result["automation_execution"]
         approval_node = next(node for node in execution["nodes"] if node["id"] == "approval-1")
-        trello_node = next(node for node in execution["nodes"] if node["id"] == "trello-1")
+        erp_node = next(node for node in execution["nodes"] if node["id"] == "erp-1")
         self.assertEqual("completed", approval_node["status"])
-        self.assertEqual("completed", trello_node["status"])
+        self.assertEqual("completed", erp_node["status"])
         self.assertTrue(execution["completed"])
-        self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
-        self.assertEqual("card-1", saved.result["trello"]["card_id"])
-
-    async def test_late_telegram_reaction_does_not_flip_completed_approval(self) -> None:
-        request = CreateJobRequest(
-            type="image",
-            prompt="cat",
-            count=1,
-            telegram_enabled=True,
-            trello_enabled=True,
-            automation_graph={
-                "modules": [
-                    {"id": "source-1", "type": "source", "title": "Prompt Source"},
-                    {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                    {"id": "telegram-1", "type": "telegram", "title": "Telegram Review"},
-                    {"id": "approval-1", "type": "approval", "title": "Approval"},
-                    {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
-                ]
-            },
-        )
-        job = JobRecord(
-            type="image",
-            status="completed",
-            title="approved job",
-            input=request.model_dump(mode="json"),
-            result={
-                "telegram_approvals": {"0": {"artifact_index": 0, "status": "approved"}},
-                "telegram_approval_summary": {
-                    "total": 1,
-                    "approved": 1,
-                    "rejected": 0,
-                    "pending": 0,
-                    "resolved": 1,
-                    "status": "completed",
-                },
-                "trello": {"configured": True, "sent": 1, "failed": 0, "card_id": "card-1"},
-                "automation_execution": {
-                    "mode": "graph",
-                    "nodes": [
-                        {"id": "approval-1", "type": "approval", "status": "completed", "output": {}},
-                        {"id": "trello-1", "type": "trello", "status": "completed", "output": {"sent": 1}},
-                    ],
-                    "edges": [],
-                    "current_module_id": "",
-                    "completed": True,
-                },
-            },
-            artifacts=[JobArtifact(label="Ảnh 1", url="https://example.com/img.jpg", mime_type="image/jpeg")],
-        )
-        await self.store.add_job(job)
-
-        with patch.object(self.service, "_archive_trello_artifacts", AsyncMock()) as archive:
-            approval = await self.service._apply_telegram_approval(
-                job.id,
-                0,
-                "rejected",
-                {"id": "late-callback", "from": {"first_name": "Reviewer"}},
-            )
-
-        saved = self.store.get_job(job.id)
-        self.assertEqual("approved", approval["status"])
-        self.assertEqual("approved", saved.result["telegram_approvals"]["0"]["status"])
-        self.assertEqual(1, saved.result["telegram_approval_summary"]["approved"])
-        self.assertEqual(0, saved.result["telegram_approval_summary"]["rejected"])
-        self.assertEqual("completed", saved.result["automation_execution"]["nodes"][1]["status"])
-        self.assertEqual(1, saved.result["trello"]["sent"])
-        archive.assert_not_called()
-        self.assertIn("Bỏ qua phản hồi Telegram", saved.logs[-1].message)
+        self.assertEqual(1, saved.result["dashboard_approval_summary"]["approved"])
+        self.assertEqual("card-1", saved.result["erp"]["task_id"])
 
     async def test_custom_module_runs_user_configured_webhook(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
@@ -6613,7 +9123,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         def fake_webhook(method, url, headers, body, timeout_s):
@@ -6660,8 +9170,6 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 type="image",
                 prompt="",
                 count=1,
-                telegram_enabled=True,
-                telegram_chat_id="1234567890",
                 automation_graph={
                     "modules": [
                         {"id": "source-1", "type": "source", "title": "Prompt Source", "settings": {"sourceType": "sheets"}},
@@ -6713,14 +9221,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             {
                 "prompt": "first card",
                 "product": "First",
-                "trello_card_id": "card-1",
+                "erp_task_id": "card-1",
                 "flow_agent_instruction": True,
                 "flow_agent_image_count": 8,
             },
             {
                 "prompt": "second card",
                 "product": "Second",
-                "trello_card_id": "card-2",
+                "erp_task_id": "card-2",
                 "flow_agent_instruction": True,
                 "flow_agent_image_count": 8,
             },
@@ -6747,21 +9255,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(["first card", "second card"], seen_prompts)
         pause.assert_awaited_once_with(batch.id, 2, 2)
 
-    async def test_auto_trello_batch_stops_after_successful_trello_upload(self) -> None:
+    async def test_auto_erp_batch_stops_after_successful_erp_upload(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        base = CreateJobRequest(type="image", prompt="", count=12, flow_agent_enabled=True, trello_enabled=True)
+        base = CreateJobRequest(type="image", prompt="", count=12, flow_agent_enabled=True, erp_enabled=True)
         items = [
             {
                 "prompt": "first card",
                 "product": "First",
-                "trello_card_id": "card-1",
+                "erp_task_id": "card-1",
                 "flow_agent_instruction": True,
                 "flow_agent_image_count": 12,
             },
             {
                 "prompt": "second card",
                 "product": "Second",
-                "trello_card_id": "card-2",
+                "erp_task_id": "card-2",
                 "flow_agent_instruction": True,
                 "flow_agent_image_count": 12,
             },
@@ -6770,8 +9278,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             type="batch_image",
             status="queued",
             title="batch",
-            input={"trello_source_hint": {"mode": "auto_trello"}, "batch_key": "auto"},
-            result={"trello_source_hint": {"mode": "auto_trello"}, "batch_key": "auto"},
+            input={"erp_source_hint": {"mode": "auto_erp"}, "batch_key": "auto"},
+            result={"erp_source_hint": {"mode": "auto_erp"}, "batch_key": "auto"},
         )
         await self.store.add_job(batch)
         seen_prompts: list[str] = []
@@ -6781,8 +9289,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             nonlocal live_scan_calls
             live_scan_calls += 1
             if live_scan_calls > 1:
-                raise AssertionError("Auto Trello scanned for another card after Trello upload completed")
-            return base_request, items[0], {"mode": "auto_trello"}
+                raise AssertionError("Auto ERP scanned for another card after ERP upload completed")
+            return base_request, items[0], {"mode": "auto_erp"}
 
         async def fake_run_flow_job(job_id, child_request):
             seen_prompts.append(child_request.prompt)
@@ -6792,13 +9300,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 result={
                     "count": 12,
                     "mode": "image",
-                    "trello": {"configured": True, "sent": 12, "failed": 0},
+                    "erp": {"configured": True, "sent": 12, "failed": 0},
                 },
             )
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_next_live_auto_trello_prompt_item",
+            "_next_live_auto_erp_prompt_item",
             side_effect=fake_next_live_item,
         ), patch.object(
             self.service,
@@ -6822,7 +9330,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(1, len(saved.result["child_job_ids"]))
         pause.assert_not_awaited()
 
-    async def test_trello_prompt_batch_runs_one_matching_prompt_and_dedupes_active_batch(self) -> None:
+    async def test_erp_prompt_batch_runs_one_matching_prompt_and_dedupes_active_batch(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -6832,10 +9340,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloCard": "https://trello.com/c/card123/wedding-hoop"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpTask": "https://erp.com/c/card123/wedding-hoop"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
@@ -6859,16 +9367,16 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
 
         source_hint = {
-            "card_id": "card123",
-            "card_name": "wedding_hoop",
-            "card_url": "https://trello.com/c/card123/wedding-hoop",
-            "list_id": "list-ready",
+            "task_id": "card123",
+            "task_name": "wedding_hoop",
+            "task_url": "https://erp.com/c/card123/wedding-hoop",
+            "status": "list-ready",
             "list_name": "Ready for AI",
         }
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_trello_source_card_hint",
+            "_erp_source_task_hint",
             return_value=source_hint,
         ), patch.object(
             self.service,
@@ -6886,11 +9394,11 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
         self.assertEqual(1, saved.result["total"])
-        self.assertEqual("card123", saved.result["trello_source_hint"]["card_id"])
+        self.assertEqual("card123", saved.result["erp_source_hint"]["task_id"])
         child_job = self.store.get_job(saved.result["child_job_ids"][0])
-        self.assertEqual("card123", child_job.input["trello_card_id"])
+        self.assertEqual("card123", child_job.input["erp_task_id"])
 
-    async def test_trello_prompt_batch_finds_matching_card_in_ready_list(self) -> None:
+    async def test_erp_prompt_batch_finds_matching_card_in_ready_list(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -6900,12 +9408,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
                             "settings": {
-                                "trelloBoard": "https://trello.com/b/board123/demo-board",
-                                "trelloList": "empty-ready-list",
+                                "erpProject": "https://erp.com/b/board123/demo-board",
+                                "erpStatus": "empty-ready-list",
                             },
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
@@ -6920,10 +9428,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         seen_prompts: list[str] = []
         matched_hint = {
-            "card_id": "matched-card",
-            "card_name": "gau_bong",
-            "card_url": "https://trello.com/c/matched/gau-bong",
-            "list_id": "ready-list",
+            "task_id": "matched-card",
+            "task_name": "gau_bong",
+            "task_url": "https://erp.com/c/matched/gau-bong",
+            "status": "ready-list",
             "list_name": "Ready for AI",
         }
 
@@ -6933,11 +9441,11 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_trello_source_card_hint",
+            "_erp_source_task_hint",
             return_value={},
         ), patch.object(
             self.service,
-            "_trello_matching_image_card_hint",
+            "_erp_matching_image_card_hint",
             return_value=matched_hint,
         ), patch.object(
             self.service,
@@ -6951,33 +9459,33 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("completed", saved.status)
         self.assertEqual(["bear prompt"], seen_prompts)
         self.assertEqual(1, saved.result["total"])
-        self.assertEqual("matched-card", saved.result["trello_source_hint"]["card_id"])
+        self.assertEqual("matched-card", saved.result["erp_source_hint"]["task_id"])
         child_job = self.store.get_job(saved.result["child_job_ids"][0])
-        self.assertEqual("matched-card", child_job.input["trello_card_id"])
-        self.assertEqual("ready-list", child_job.input["trello_list_id"])
+        self.assertEqual("matched-card", child_job.input["erp_task_id"])
+        self.assertEqual("ready-list", child_job.input["erp_status_id"])
 
-    async def test_auto_trello_prompt_batch_discovers_multiple_image_cards(self) -> None:
+    async def test_auto_erp_prompt_batch_discovers_multiple_image_cards(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="",
                 count=1,
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[
                 {"row": 2, "prompt": "bear prompt", "product_key": "gau_bong", "product": "Gấu bông", "index": "1", "active": True},
                 {"row": 3, "prompt": "hoop prompt", "product_key": "wedding_hoop", "product": "Wedding Hoop", "index": "1", "active": True},
@@ -6985,29 +9493,29 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         seen: list[tuple[str, str]] = []
         cards = [
-            {"id": "card-bear", "name": "gau_bong", "shortLink": "bear", "url": "https://trello.com/c/bear", "idList": "ready-list"},
-            {"id": "card-hoop", "name": "wedding_hoop", "shortLink": "hoop", "url": "https://trello.com/c/hoop", "idList": "ready-list"},
+            {"id": "card-bear", "name": "gau_bong", "shortLink": "bear", "url": "https://erp.com/c/bear", "idList": "ready-list"},
+            {"id": "card-hoop", "name": "wedding_hoop", "shortLink": "hoop", "url": "https://erp.com/c/hoop", "idList": "ready-list"},
         ]
 
         async def fake_run_flow_job(job_id, child_request):
-            seen.append((child_request.prompt, child_request.trello_card_id))
+            seen.append((child_request.prompt, child_request.erp_task_id))
             await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ) as image_cards, patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7018,7 +9526,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             await self.service._tasks[batch.id]
 
         self.assertEqual(
-            [("key", "token", "board123", "ready-list")] * 3,
+            [("key", "token", "PROJ-0013", "ready-list")] * 3,
             [call.args for call in image_cards.call_args_list],
         )
         self.assertEqual([("bear prompt", "card-bear"), ("hoop prompt", "card-hoop")], seen)
@@ -7026,34 +9534,34 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("completed", saved.status)
         self.assertEqual(2, saved.result["total"])
         self.assertEqual(2, saved.result["completed"])
-        self.assertEqual("auto_trello", saved.result["trello_source_hint"]["mode"])
-        self.assertEqual("ready-list", saved.result["trello_source_hint"]["list_id"])
+        self.assertEqual("auto_erp", saved.result["erp_source_hint"]["mode"])
+        self.assertEqual("ready-list", saved.result["erp_source_hint"]["status"])
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
-        self.assertEqual(["card-bear", "card-hoop"], [job.input["trello_card_id"] for job in child_jobs])
+        self.assertEqual(["card-bear", "card-hoop"], [job.input["erp_task_id"] for job in child_jobs])
 
-    async def test_auto_trello_run_until_empty_processes_all_ready_cards(self) -> None:
+    async def test_auto_erp_run_until_empty_processes_all_ready_cards(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="",
                 count=1,
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                        {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                     ]
                 },
             ),
             limit=0,
-            auto_trello=True,
+            auto_erp=True,
             run_until_empty=True,
         )
         cards = [
@@ -7061,7 +9569,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": f"card-{index}",
                 "name": f"Ready baby_pillowcase product {index}",
                 "shortLink": f"short-{index}",
-                "url": f"https://trello.com/c/card-{index}",
+                "url": f"https://erp.com/c/card-{index}",
                 "idList": "ready-list",
                 "_image_attachments": [{"id": f"att-{index}", "name": f"baby_pillowcase-{index}.jpg", "mimeType": "image/jpeg"}],
             }
@@ -7070,14 +9578,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         seen_cards: list[str] = []
 
         async def fake_run_flow_job(job_id, child_request):
-            seen_cards.append(child_request.trello_card_id)
+            seen_cards.append(child_request.erp_task_id)
             await self.store.patch_job(
                 job_id,
                 status="completed",
                 result={
                     "count": child_request.count,
                     "mode": "image",
-                    "trello": {"configured": True, "sent": child_request.count, "failed": 0},
+                    "erp": {"configured": True, "sent": child_request.count, "failed": 0},
                 },
             )
 
@@ -7087,19 +9595,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7118,36 +9626,36 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(45, saved.result["completed"])
         self.assertEqual([f"card-{index}" for index in range(45)], seen_cards)
 
-    async def test_auto_trello_flow_agent_rescans_ready_before_each_card(self) -> None:
+    async def test_auto_erp_flow_agent_rescans_ready_before_each_card(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="",
                 count=1,
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                        {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                     ]
                 },
             ),
             limit=2,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         stale_card = {
             "id": "stale-card",
             "name": "Moved baby_pillowcase product",
             "shortLink": "stale",
-            "url": "https://trello.com/c/stale",
+            "url": "https://erp.com/c/stale",
             "idList": "ready-list",
             "_image_attachments": [{"id": "stale-att", "name": "stale_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["stale-att"],
@@ -7156,7 +9664,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             "id": "live-card",
             "name": "Live baby_pillowcase product",
             "shortLink": "live",
-            "url": "https://trello.com/c/live",
+            "url": "https://erp.com/c/live",
             "idList": "ready-list",
             "_image_attachments": [{"id": "live-att", "name": "live_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
             "_selected_attachment_ids": ["live-att"],
@@ -7168,7 +9676,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return scans.pop(0) if scans else []
 
         async def fake_run_flow_job(job_id, child_request):
-            seen.append((child_request.trello_card_id, list(child_request.trello_source_attachment_ids)))
+            seen.append((child_request.erp_task_id, list(child_request.erp_source_attachment_ids)))
             await self.store.patch_job(job_id, status="completed", result={"count": child_request.count, "mode": "image"})
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
@@ -7177,19 +9685,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             side_effect=fake_image_cards,
         ) as image_cards, patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7202,39 +9710,39 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertGreaterEqual(image_cards.call_count, 3)
         self.assertEqual([("live-card", ["live-att"])], seen)
         saved = self.store.get_job(batch.id)
-        self.assertEqual("completed", saved.status)
+        self.assertEqual("completed", saved.status, saved.error)
         self.assertEqual(1, saved.result["total"])
         self.assertEqual(1, saved.result["completed"])
         self.assertEqual(0, saved.result["failed"])
         self.assertEqual(["live-card"], saved.result["seen_card_ids"])
         child_job = self.store.get_job(saved.result["child_job_ids"][0])
-        self.assertEqual("live-card", child_job.input["trello_card_id"])
-        self.assertEqual("live-card", child_job.input["trello_source_card_id"])
-        self.assertEqual(["live-att"], child_job.input["trello_source_attachment_ids"])
+        self.assertEqual("live-card", child_job.input["erp_task_id"])
+        self.assertEqual("live-card", child_job.input["erp_source_task_id"])
+        self.assertEqual(["live-att"], child_job.input["erp_source_attachment_ids"])
 
-    async def test_continuous_auto_trello_waits_until_user_stops(self) -> None:
+    async def test_continuous_auto_erp_waits_until_user_stops(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="",
                 count=1,
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                        {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                     ]
                 },
             ),
             limit=0,
-            auto_trello=True,
+            auto_erp=True,
             run_until_empty=True,
             continuous=True,
             poll_interval_s=1,
@@ -7246,19 +9754,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=[],
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ):
             batch = await self.service.enqueue_prompt_batch(request)
@@ -7276,29 +9784,29 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(0, saved.result["completed"])
         self.assertEqual(0, saved.result["failed"])
 
-    async def test_continuous_auto_trello_does_not_retry_same_card_in_one_session(self) -> None:
+    async def test_continuous_auto_erp_does_not_retry_same_card_in_one_session(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="",
                 count=1,
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
-                        {"id": "trello-1", "type": "trello", "title": "Trello Archive"},
+                        {"id": "erp-1", "type": "erp", "title": "ERP Archive"},
                     ]
                 },
             ),
             limit=0,
-            auto_trello=True,
+            auto_erp=True,
             run_until_empty=True,
             continuous=True,
             poll_interval_s=1,
@@ -7308,7 +9816,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "repeat-card",
                 "name": "Repeat baby_pillowcase product",
                 "shortLink": "repeat",
-                "url": "https://trello.com/c/repeat",
+                "url": "https://erp.com/c/repeat",
                 "idList": "ready-list",
                 "_image_attachments": [{"id": "repeat-att", "name": "repeat_baby_pillowcase.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["repeat-att"],
@@ -7318,7 +9826,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         sleep_calls = 0
 
         async def fake_run_flow_job(job_id, child_request):
-            seen_cards.append(child_request.trello_card_id)
+            seen_cards.append(child_request.erp_task_id)
             await self.store.patch_job(job_id, status="completed", result={"count": child_request.count, "mode": "image"})
 
         async def fake_sleep(batch_id, poll_interval_s):
@@ -7333,19 +9841,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7353,7 +9861,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             side_effect=fake_run_flow_job,
         ), patch.object(
             self.service,
-            "_sleep_continuous_auto_trello",
+            "_sleep_continuous_auto_erp",
             side_effect=fake_sleep,
         ):
             batch = await self.service.enqueue_prompt_batch(request)
@@ -7366,27 +9874,27 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(1, saved.result["completed"])
         self.assertEqual(2, sleep_calls)
 
-    async def test_continuous_auto_trello_forces_configured_ready_list_over_stale_graph(self) -> None:
-        await self.store.replace_trello_config(
-            TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list")
+    async def test_continuous_auto_erp_forces_configured_ready_list_over_stale_graph(self) -> None:
+        await self.store.replace_erp_config(
+            ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
         )
         request = CreateJobRequest(
             type="image",
             prompt="",
-            trello_board_id="board123",
-            trello_card_id="shirt-card",
-            trello_list_id="shirt-list",
-            trello_attachment_ids=["old-att"],
+            erp_project_id="PROJ-0049",
+            erp_task_id="shirt-card",
+            erp_status_id="shirt-list",
+            erp_attachment_ids=["old-att"],
             automation_graph={
                 "modules": [
                     {
-                        "id": "trello-source",
-                        "type": "trello_source",
+                        "id": "erp-source",
+                        "type": "erp_source",
                         "settings": {
-                            "trelloBoard": "board123",
-                            "trelloCard": "shirt-card",
-                            "trelloList": "shirt-list",
-                            "trelloAttachmentIds": ["old-att"],
+                            "erpProject": "board123",
+                            "erpTask": "shirt-card",
+                            "erpStatus": "shirt-list",
+                            "erpAttachmentIds": ["old-att"],
                         },
                     },
                     {
@@ -7400,54 +9908,54 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                         },
                     },
                     {
-                        "id": "trello-log",
-                        "type": "trello",
+                        "id": "erp-log",
+                        "type": "erp",
                         "settings": {
-                            "trelloBoard": "board123",
-                            "trelloCard": "shirt-card",
-                            "trelloList": "shirt-list",
-                            "trelloAttachmentIds": ["old-att"],
+                            "erpProject": "board123",
+                            "erpTask": "shirt-card",
+                            "erpStatus": "shirt-list",
+                            "erpAttachmentIds": ["old-att"],
                         },
                     },
                 ]
             },
         )
 
-        with patch.object(self.service, "_trello_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ) as resolve_list, patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ):
-            base, hint = await self.service._continuous_auto_trello_base_request(request)
+            base, hint = await self.service._continuous_auto_erp_base_request(request)
 
-        resolve_list.assert_called_once_with("key", "token", "board123", "ready-list")
-        self.assertEqual("ready-list", hint["list_id"])
+        resolve_list.assert_called_once_with("key", "token", "PROJ-0049", "ready-list")
+        self.assertEqual("ready-list", hint["status"])
         self.assertEqual("Ready for AI", hint["list_name"])
-        self.assertEqual("ready-list", base.trello_list_id)
-        self.assertEqual("", base.trello_card_id)
-        self.assertEqual([], base.trello_attachment_ids)
+        self.assertEqual("ready-list", base.erp_status_id)
+        self.assertEqual("", base.erp_task_id)
+        self.assertEqual([], base.erp_attachment_ids)
         self.assertEqual("square", base.aspect)
         self.assertEqual(12, base.count)
         self.assertTrue(base.flow_agent_enabled)
         self.assertTrue(base.flow_agent_auto_approve)
         graph = base.automation_graph.model_dump(mode="json")
-        trello_modules = [module for module in graph["modules"] if module["type"] in {"trello_source", "trello"}]
-        self.assertEqual(2, len(trello_modules))
-        for module in trello_modules:
-            self.assertEqual("ready-list", module["settings"]["trelloList"])
-            self.assertEqual("", module["settings"]["trelloCard"])
-            self.assertEqual([], module["settings"]["trelloAttachmentIds"])
+        erp_modules = [module for module in graph["modules"] if module["type"] in {"erp_source", "erp"}]
+        self.assertEqual(2, len(erp_modules))
+        for module in erp_modules:
+            self.assertEqual("ready-list", module["settings"]["erpStatus"])
+            self.assertEqual("", module["settings"]["erpTask"])
+            self.assertEqual([], module["settings"]["erpAttachmentIds"])
         flow_module = next(module for module in graph["modules"] if module["type"] == "flow")
         self.assertEqual("square", flow_module["settings"]["imageAspect"])
         self.assertEqual(12, flow_module["settings"]["imageCount"])
         self.assertTrue(flow_module["settings"]["flowAgentEnabled"])
         self.assertTrue(flow_module["settings"]["flowAgentAutoApprove"])
 
-    async def test_auto_trello_uses_flow_agent_instruction_without_sheet_items(self) -> None:
+    async def test_auto_erp_uses_flow_agent_instruction_without_sheet_items(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -7459,14 +9967,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 flow_agent_auto_approve=False,
                 prompt_product="gấu bông",
                 prompt_product_key="gấu bông",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {
                             "id": "flow-1",
@@ -7483,7 +9991,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         seen: list[tuple[str, str, str, int, bool, bool]] = []
@@ -7492,7 +10000,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-bear",
                 "name": "Gấu bông dễ thương",
                 "shortLink": "bear",
-                "url": "https://trello.com/c/bear",
+                "url": "https://erp.com/c/bear",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
             }
@@ -7502,7 +10010,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             seen.append(
                 (
                     child_request.prompt,
-                    child_request.trello_card_id,
+                    child_request.erp_task_id,
                     child_request.aspect,
                     child_request.count,
                     child_request.flow_agent_enabled,
@@ -7517,19 +10025,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7541,9 +10049,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
-        self.assertEqual("flow_agent", saved.result["trello_source_hint"]["prompt_mode"])
+        self.assertEqual("flow_agent", saved.result["erp_source_hint"]["prompt_mode"])
         self.assertEqual(1, saved.result["total"])
-        self.assertEqual("card-bear", saved.input["items"][0]["trello_card_id"])
+        self.assertEqual("card-bear", saved.input["items"][0]["erp_task_id"])
         self.assertTrue(saved.input["items"][0]["flow_agent_instruction"])
         self.assertTrue(saved.input["items"][0]["generated_by_flow_agent"])
         self.assertFalse(saved.input["items"][0]["generated_by_ai"])
@@ -7573,7 +10081,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("Google Flow Agent", seen[0][0])
         self.assertIn("generate exactly 12", seen[0][0])
         self.assertIn("clean clear white neutral daylight", seen[0][0])
-        self.assertIn("selected Trello attachment", seen[0][0])
+        self.assertIn("selected ERP attachment", seen[0][0])
         self.assertIn("sticker", seen[0][0])
         self.assertIn("price tag", seen[0][0])
         self.assertIn("barcode", seen[0][0])
@@ -7583,39 +10091,39 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("no tag, card, or label may touch, cover, hang from", seen[0][0])
         self.assertNotIn("name tag", seen[0][0])
 
-    async def test_auto_trello_rejects_explicit_card_outside_ready(self) -> None:
+    async def test_auto_erp_rejects_explicit_card_outside_ready(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        await self.store.replace_trello_config(TrelloConfig(api_key="key", token="token", board_id="board123", list_id="ready-list"))
+        await self.store.replace_erp_config(ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list"))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
                 prompt="làm một bộ ảnh sản phẩm này",
                 count=1,
-                trello_board_id="https://trello.com/b/board123/demo-board",
-                trello_list_id="ideas-list",
-                trello_card_id="outside-card",
-                trello_attachment_ids=["att-1"],
+                erp_project_id="https://erp.com/b/board123/demo-board",
+                erp_status_id="ideas-list",
+                erp_task_id="outside-card",
+                erp_attachment_ids=["att-1"],
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board", "trelloList": "ideas-list"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board", "erpStatus": "ideas-list"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         selected_card = {
             "id": "outside-card",
             "name": "Apron outside ready",
             "shortLink": "outside",
-            "url": "https://trello.com/c/outside",
+            "url": "https://erp.com/c/outside",
             "idList": "ideas-list",
             "_image_attachments": [
                 {"id": "att-1", "name": "chosen-apron.png", "mimeType": "image/png"},
@@ -7628,23 +10136,23 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_card_by_id",
+            "_erp_image_card_by_id",
             return_value=selected_card,
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=[],
         ) as image_cards, patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ideas",
         ):
             with self.assertRaises(HTTPException) as ctx:
@@ -7652,9 +10160,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         image_cards.assert_not_called()
         self.assertEqual(400, ctx.exception.status_code)
-        self.assertIn("Ready for AI", str(ctx.exception.detail))
+        self.assertIn("Open", str(ctx.exception.detail))
 
-    async def test_auto_trello_ai_suite_for_apron_includes_hand_embroidery_shot(self) -> None:
+    async def test_auto_erp_ai_suite_for_apron_includes_hand_embroidery_shot(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -7663,21 +10171,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="tạp dề thêu tay",
                 prompt_product_key="tạp dề thêu tay",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         seen_prompts: list[str] = []
@@ -7686,7 +10194,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-apron",
                 "name": "Hand-Embroidered Baking Apron",
                 "shortLink": "apron",
-                "url": "https://trello.com/c/apron",
+                "url": "https://erp.com/c/apron",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "white-ruffled-apron-embroidery.png", "mimeType": "image/png"}],
             }
@@ -7702,19 +10210,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7753,7 +10261,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(all("Before creating images, carefully analyze" in prompt for prompt in seen_prompts))
         self.assertIn("apron silhouette", saved.input["items"][0]["design_analysis"])
 
-    async def test_auto_trello_flow_agent_uses_learned_product_prompt_style_for_pillowcase(self) -> None:
+    async def test_auto_erp_flow_agent_uses_learned_product_prompt_style_for_pillowcase(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -7762,21 +10270,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="vỏ gối em bé thêu tay",
                 prompt_product_key="vỏ gối em bé thêu tay",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         cards = [
@@ -7784,7 +10292,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-pillow",
                 "name": "Embroidered Baby Pillow Collection",
                 "shortLink": "pillow",
-                "url": "https://trello.com/c/pillow",
+                "url": "https://erp.com/c/pillow",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "baby_pillowcase_fox_bunny_embroidery.png", "mimeType": "image/png"}],
             }
@@ -7801,19 +10309,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7850,7 +10358,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("never make a collage", prompt)
         self.assertIn("fabric texture", prompt)
 
-    async def test_auto_trello_ai_suite_does_not_reuse_apron_template_for_doll_query(self) -> None:
+    async def test_auto_erp_ai_suite_does_not_reuse_apron_template_for_doll_query(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -7859,34 +10367,34 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="búp bê",
                 prompt_product_key="búp bê",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
                             "settings": {
-                                "trelloBoard": "https://trello.com/b/board123/demo-board",
-                                "trelloCard": "BDA_05",
-                                "trelloAttachmentIds": ["att-doll"],
+                                "erpProject": "https://erp.com/b/board123/demo-board",
+                                "erpTask": "BDA_05",
+                                "erpAttachmentIds": ["att-doll"],
                             },
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
-                trello_card_id="BDA_05",
-                trello_attachment_ids=["att-doll"],
+                erp_task_id="BDA_05",
+                erp_attachment_ids=["att-doll"],
             ),
             limit=6,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         card = {
             "id": "card-doll",
             "name": "BDA_05",
             "shortLink": "BDA_05",
-            "url": "https://trello.com/c/BDA05",
+            "url": "https://erp.com/c/BDA05",
             "idList": "ready-list",
             "_image_attachments": [{"id": "att-doll", "name": "baby-doll-reference.png", "mimeType": "image/png"}],
         }
@@ -7902,19 +10410,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_card_by_id",
+            "_erp_image_card_by_id",
             return_value=card,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -7951,7 +10459,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertNotIn("apron silhouette", combined)
         self.assertNotIn("selected apron", combined)
 
-    async def test_auto_trello_does_not_match_short_alias_inside_attachment_urls(self) -> None:
+    async def test_auto_erp_does_not_match_short_alias_inside_attachment_urls(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -7960,21 +10468,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="búp bê",
                 prompt_product_key="búp bê",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=6,
-            auto_trello=True,
+            auto_erp=True,
             items=[],
         )
         cards = [
@@ -7982,13 +10490,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "wrong-card",
                 "name": "WHA_11",
                 "shortLink": "wrong",
-                "url": "https://trello.com/c/wrong",
+                "url": "https://erp.com/c/wrong",
                 "idList": "ready-list",
                 "_image_attachments": [
                     {
                         "id": "att-wrong",
                         "name": "Generated Image May 08.jpg",
-                        "url": "https://trello.local/random-bda-token.png",
+                        "url": "https://erp.local/random-bda-token.png",
                         "mimeType": "image/png",
                     }
                 ],
@@ -7997,7 +10505,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-doll",
                 "name": "BDA_05",
                 "shortLink": "doll",
-                "url": "https://trello.com/c/doll",
+                "url": "https://erp.com/c/doll",
                 "idList": "ready-list",
                 "_image_attachments": [{"id": "att-doll", "name": "front.jpg", "mimeType": "image/png"}],
             },
@@ -8005,7 +10513,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         seen_cards: list[str] = []
 
         async def fake_run_flow_job(job_id, child_request):
-            seen_cards.append(child_request.trello_card_id)
+            seen_cards.append(child_request.erp_task_id)
             await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
 
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False), patch.object(
@@ -8014,19 +10522,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             return_value=AuthStatus(authenticated=True),
         ), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -8039,9 +10547,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
         self.assertTrue(seen_cards)
-        self.assertTrue(all(card_id == "card-doll" for card_id in seen_cards))
+        self.assertTrue(all(task_id == "card-doll" for task_id in seen_cards))
 
-    async def test_auto_trello_prompt_batch_can_search_card_by_user_keyword(self) -> None:
+    async def test_auto_erp_prompt_batch_can_search_card_by_user_keyword(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -8050,21 +10558,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="gấu",
                 prompt_product_key="gấu",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[
                 {"row": 2, "prompt": "bear plush product prompt", "product_key": "gau_bong", "product": "Gấu bông", "index": "1", "active": True},
             ],
@@ -8075,31 +10583,31 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-bear",
                 "name": "Bear plush product card",
                 "shortLink": "bear",
-                "url": "https://trello.com/c/bear",
+                "url": "https://erp.com/c/bear",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
             }
         ]
 
         async def fake_run_flow_job(job_id, child_request):
-            seen.append((child_request.prompt, child_request.trello_card_id))
+            seen.append((child_request.prompt, child_request.erp_task_id))
             await self.store.patch_job(job_id, status="completed", result={"count": 1, "mode": "image"})
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ), patch.object(
             self.service,
-            "_trello_list_name",
+            "_erp_status_name",
             return_value="Ready for AI",
         ), patch.object(
             self.service,
@@ -8112,12 +10620,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual([("bear plush product prompt", "card-bear")], seen)
         saved = self.store.get_job(batch.id)
         self.assertEqual("completed", saved.status)
-        self.assertEqual("keyword", saved.result["trello_source_hint"]["match_mode"])
-        self.assertEqual("gấu", saved.input["items"][0]["trello_search_query"])
+        self.assertEqual("keyword", saved.result["erp_source_hint"]["match_mode"])
+        self.assertEqual("gấu", saved.input["items"][0]["erp_search_query"])
         child_jobs = [self.store.get_job(job_id) for job_id in saved.result["child_job_ids"]]
-        self.assertEqual(["card-bear"], [job.input["trello_card_id"] for job in child_jobs])
+        self.assertEqual(["card-bear"], [job.input["erp_task_id"] for job in child_jobs])
 
-    async def test_auto_trello_keyword_search_does_not_use_unrelated_prompt(self) -> None:
+    async def test_auto_erp_keyword_search_does_not_use_unrelated_prompt(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -8126,21 +10634,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="gấu",
                 prompt_product_key="gấu",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[
                 {"row": 2, "prompt": "unrelated toy prompt", "product_key": "toy", "product": "Toy", "index": "1", "active": True},
             ],
@@ -8150,7 +10658,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-bear",
                 "name": "Gấu bông dễ thương",
                 "shortLink": "bear",
-                "url": "https://trello.com/c/bear",
+                "url": "https://erp.com/c/bear",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "gau-bong.png", "mimeType": "image/png"}],
             }
@@ -8158,15 +10666,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ):
             with self.assertRaises(HTTPException) as ctx:
@@ -8175,7 +10683,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(400, ctx.exception.status_code)
         self.assertIn("chưa tìm thấy prompt Active khớp", str(ctx.exception.detail))
 
-    async def test_auto_trello_keyword_search_rejects_ambiguous_cards(self) -> None:
+    async def test_auto_erp_keyword_search_rejects_ambiguous_cards(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = PromptBatchRequest(
             job=CreateJobRequest(
@@ -8184,21 +10692,21 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 count=1,
                 prompt_product="gấu",
                 prompt_product_key="gấu",
-                trello_board_id="https://trello.com/b/board123/demo-board",
+                erp_project_id="https://erp.com/b/board123/demo-board",
                 automation_graph={
                     "modules": [
                         {
-                            "id": "trello-source-1",
-                            "type": "trello_source",
-                            "title": "Trello Image Source",
-                            "settings": {"trelloBoard": "https://trello.com/b/board123/demo-board"},
+                            "id": "erp-source-1",
+                            "type": "erp_source",
+                            "title": "ERP Image Source",
+                            "settings": {"erpProject": "https://erp.com/b/board123/demo-board"},
                         },
                         {"id": "flow-1", "type": "flow", "title": "Google Flow"},
                     ]
                 },
             ),
             limit=10,
-            auto_trello=True,
+            auto_erp=True,
             items=[
                 {"row": 2, "prompt": "bear plush product prompt", "product_key": "gau_bong", "product": "Gấu bông", "index": "1", "active": True},
             ],
@@ -8208,7 +10716,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-bear-1",
                 "name": "Cream plush product card",
                 "shortLink": "bear1",
-                "url": "https://trello.com/c/bear1",
+                "url": "https://erp.com/c/bear1",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "gau-1.png", "mimeType": "image/png"}],
             },
@@ -8216,7 +10724,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 "id": "card-bear-2",
                 "name": "Brown plush product card",
                 "shortLink": "bear2",
-                "url": "https://trello.com/c/bear2",
+                "url": "https://erp.com/c/bear2",
                 "idList": "ready-list",
                 "_image_attachments": [{"name": "gau-2.png", "mimeType": "image/png"}],
             },
@@ -8224,15 +10732,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         with patch.object(self.service, "get_auth_status", return_value=AuthStatus(authenticated=True)), patch.object(
             self.service,
-            "_trello_credentials",
+            "_erp_credentials",
             return_value=("key", "token"),
         ), patch.object(
             self.service,
-            "_trello_resolve_board_list_id",
+            "_erp_resolve_board_list_id",
             return_value="ready-list",
         ), patch.object(
             self.service,
-            "_trello_image_cards_on_board",
+            "_erp_image_cards_on_board",
             return_value=cards,
         ):
             with self.assertRaises(HTTPException) as ctx:
@@ -8282,13 +10790,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         reload_project.assert_awaited_once_with(fake_client)
         generate_via_ui.assert_awaited_once_with(fake_client, request, [], job_id=job.id)
 
-    async def test_generate_images_with_retry_uses_flow_agent_ui_for_trello_reference(self) -> None:
+    async def test_generate_images_with_retry_uses_flow_agent_ui_for_erp_reference(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(
             type="image",
             prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
             count=4,
-            trello_card_id="card-123",
+            erp_task_id="card-123",
             flow_agent_enabled=True,
         )
         job = JobRecord(
@@ -8312,15 +10820,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         generate_once.assert_not_awaited()
         generate_via_ui.assert_awaited_once_with(fake_client, request, ["source-media"], job_id=job.id)
 
-    async def test_generate_images_with_retry_uses_flow_agent_ui_for_local_trello_source(self) -> None:
+    async def test_generate_images_with_retry_uses_flow_agent_ui_for_local_erp_source(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        source = self.uploads_dir / "trello-source.jpg"
+        source = self.uploads_dir / "erp-source.jpg"
         source.write_bytes(b"source")
         request = CreateJobRequest(
             type="image",
             prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
             count=4,
-            trello_card_id="card-123",
+            erp_task_id="card-123",
             flow_agent_enabled=True,
             reference_image_paths=[str(source)],
         )
@@ -8385,7 +10893,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("/tmp/source.jpg", single_ref.await_args.kwargs["reference_image_path"])
 
     async def test_generate_images_via_ui_uses_local_source_when_reference_media_missing(self) -> None:
-        source = self.uploads_dir / "trello-source.jpg"
+        source = self.uploads_dir / "erp-source.jpg"
         source.write_bytes(b"source")
         request = CreateJobRequest(
             type="image",
@@ -8959,7 +11467,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         attach_file.assert_not_awaited()
         send.assert_not_awaited()
 
-    async def test_single_reference_ui_requires_project_media_baseline_for_trello_source(self) -> None:
+    async def test_single_reference_ui_requires_project_media_baseline_for_erp_source(self) -> None:
         events: list[str] = []
 
         class FakePage:
@@ -9077,7 +11585,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         class FakePage:
             context_checks = 0
 
-            async def evaluate(self, script: str) -> dict:
+            async def evaluate(self, script: str, *_args: object) -> dict:
                 if "has_prior_context" in script:
                     self.context_checks += 1
                     events.append(f"context-{self.context_checks}")
@@ -9086,6 +11594,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                         "has_prior_context": self.context_checks == 1,
                         "detail": "old Flow Agent conversation text is visible" if self.context_checks == 1 else "agent panel looks fresh",
                     }
+                if "no start-new-session button" in script:
+                    return {"ok": False, "detail": "no start-new-session button"}
                 if "agent panel not found for reset" in script:
                     events.append("menu")
                     return {"ok": True, "detail": "agent menu button"}
@@ -9096,16 +11606,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertTrue(ok)
         self.assertIn("reset old Agent context", detail)
-        self.assertEqual(["context-1", "menu", "new-chat", "context-2"], events)
+        self.assertEqual(["context-1", "menu", "new-chat", "context-2"], events[:4])
+        self.assertTrue(all(event.startswith("context-") for event in events[4:]))
 
     async def test_ensure_fresh_flow_agent_panel_blocks_when_old_context_cannot_reset(self) -> None:
         events: list[str] = []
 
         class FakePage:
-            async def evaluate(self, script: str) -> dict:
+            async def evaluate(self, script: str, *_args: object) -> dict:
                 if "has_prior_context" in script:
                     events.append("context")
                     return {"visible": True, "has_prior_context": True, "detail": "old Flow Agent conversation text is visible"}
+                if "no start-new-session button" in script:
+                    return {"ok": False, "detail": "no start-new-session button"}
                 events.append("reset")
                 return {"ok": False, "detail": "no new chat/session item"}
 
@@ -9114,6 +11627,35 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(ok)
         self.assertIn("old context visible", detail)
         self.assertEqual(["context", "reset"], events)
+
+    async def test_ensure_fresh_flow_agent_panel_starts_new_session_when_button_exists(self) -> None:
+        events: list[str] = []
+
+        class FakeMouse:
+            async def click(self, x: float, y: float) -> None:
+                events.append(f"click-{int(x)}-{int(y)}")
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str, *_args: object) -> object:
+                if "has_prior_context" in script:
+                    events.append("context")
+                    return {"visible": True, "has_prior_context": False, "detail": "agent panel looks fresh"}
+                if "no start-new-session button" in script:
+                    events.append("new-session-lookup")
+                    return {"ok": True, "x": 1361.0, "y": 100.0, "label": "edit_square Start new session"}
+                if "elementFromPoint" in script:
+                    return "edit_square Start new session"
+                raise AssertionError(f"unexpected script: {script[:60]}")
+
+        ok, detail = await self.service._ensure_fresh_flow_agent_panel(FakePage())
+
+        self.assertTrue(ok)
+        self.assertIn("start-new-session", detail)
+        self.assertIn("click-1361-100", events)
+        self.assertEqual("context", events[0])
+        self.assertIn("new-session-lookup", events)
 
     async def test_acquire_isolated_flow_agent_page_opens_new_project_tab(self) -> None:
         events: list[str] = []
@@ -9182,10 +11724,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("dialogFallbackButtons", page.script)
         self.assertIn("approvalDialogRoots", page.script)
         self.assertIn("approvalTextRoots", page.script)
+        self.assertIn("bodyMentionsApproval", page.script)
+        self.assertNotIn("const waiting = approvalTextPattern.test(bodyText)", page.script)
         self.assertIn("isApprovalActionLabel", page.script)
-        self.assertIn("Create|Generate|Submit|Send|Go", page.script)
-        self.assertIn("delete_forever", page.script)
-        self.assertNotIn("document.body.getBoundingClientRect", page.script)
 
     async def test_open_flow_agent_panel_clicks_unlabeled_bottom_right_arrow(self) -> None:
         events: list[tuple[str, float, float]] = []
@@ -9213,6 +11754,140 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(ok)
         self.assertIn("Phiên", detail)
         self.assertEqual([("click", 612, 760)], events)
+
+    async def test_flow_agent_panel_state_excludes_composer_text_from_submitted_prompt(self) -> None:
+        class FakePage:
+            async def evaluate(self, script: str, _payload: dict) -> dict:
+                self.script = script
+                return {
+                    "visible": True,
+                    "has_textbox": True,
+                    "has_prompt": False,
+                    "has_prompt_in_textbox": True,
+                    "detail": "agent panel visible",
+                }
+
+        page = FakePage()
+        state = await self.service._flow_agent_panel_state(page, "a sufficiently long prompt probe")
+
+        self.assertFalse(state["has_prompt"])
+        self.assertTrue(state["has_prompt_in_textbox"])
+        self.assertIn("cloneNode", page.script)
+        self.assertIn("has_prompt_in_textbox", page.script)
+
+    async def test_ensure_flow_agent_panel_submitted_reclicks_prompt_left_in_composer(self) -> None:
+        states = [
+            {
+                "visible": True,
+                "has_textbox": True,
+                "has_prompt": False,
+                "has_prompt_in_textbox": True,
+                "detail": "agent panel visible",
+            },
+            {
+                "visible": True,
+                "has_textbox": True,
+                "has_prompt": True,
+                "has_prompt_in_textbox": False,
+                "detail": "agent panel visible",
+            },
+        ]
+        with patch.object(
+            self.service,
+            "_flow_agent_panel_state",
+            AsyncMock(side_effect=states),
+        ), patch.object(
+            self.service,
+            "_click_flow_agent_panel_send",
+            AsyncMock(return_value=(True, "send arrow")),
+        ) as send:
+            ok, detail, needs_prompt = await self.service._ensure_flow_agent_panel_submitted(
+                object(),
+                "a sufficiently long prompt probe",
+                submit_if_needed=False,
+            )
+
+        self.assertTrue(ok)
+        self.assertFalse(needs_prompt)
+        self.assertIn("send arrow", detail)
+        send.assert_awaited_once()
+
+    async def test_flow_agent_send_selector_targets_composer_bottom_right_and_excludes_controls(self) -> None:
+        events: list[tuple[float, float]] = []
+
+        class FakeMouse:
+            async def click(self, x: float, y: float) -> None:
+                events.append((x, y))
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str) -> dict:
+                self.script = script
+                return {"ok": True, "x": 1736, "y": 1165, "detail": "arrow_forward"}
+
+        page = FakePage()
+        ok, detail = await self.service._click_flow_agent_panel_send(page)
+
+        self.assertTrue(ok)
+        self.assertIn("arrow_forward", detail)
+        self.assertEqual([(1736, 1165)], events)
+        self.assertIn("nearComposerBottom", page.script)
+        self.assertIn("rightZone", page.script)
+        self.assertIn("explicitSendButtons", page.script)
+        self.assertIn("settings|tune|menu", page.script)
+
+    async def test_wait_for_flow_agent_upload_ready_requires_completed_upload_response(self) -> None:
+        interceptor = SimpleNamespace(
+            _calls=[
+                SimpleNamespace(
+                    tail="uploadImage",
+                    resp={"media": {"name": "uploaded-source"}},
+                    status=200,
+                )
+            ]
+        )
+
+        ok, detail = await self.service._wait_for_flow_agent_upload_ready(interceptor, 0, timeout_s=2)
+
+        self.assertTrue(ok)
+        self.assertIn("uploadImage completed [200]", detail)
+
+    async def test_wait_for_flow_agent_upload_ready_rejects_failed_upload_response(self) -> None:
+        interceptor = SimpleNamespace(
+            _calls=[
+                SimpleNamespace(
+                    tail="uploadImage",
+                    resp={"error": {"message": "upload failed"}},
+                    status=500,
+                )
+            ]
+        )
+
+        ok, detail = await self.service._wait_for_flow_agent_upload_ready(interceptor, 0, timeout_s=2)
+
+        self.assertFalse(ok)
+        self.assertIn("uploadImage failed [500]", detail)
+
+    async def test_wait_for_flow_agent_upload_ready_names_the_calls_it_saw(self) -> None:
+        """Hết giờ thì phải khai ra đã thấy những lời gọi nào.
+
+        Flow đổi tên endpoint là hỏng cả ngày mà câu lỗi chỉ nói "không thấy
+        uploadImage" — không đủ để biết tên mới là gì.  Kể tên những lời gọi
+        đã đi qua trong lúc chờ thì lần sau đọc log là ra ngay.
+        """
+        interceptor = SimpleNamespace(
+            _calls=[
+                SimpleNamespace(tail="batchAsyncGenerateImage", resp={}, status=200),
+                SimpleNamespace(tail="resumableUploadStart", resp={}, status=200),
+            ]
+        )
+
+        ok, detail = await self.service._wait_for_flow_agent_upload_ready(interceptor, 0, timeout_s=2)
+
+        self.assertFalse(ok)
+        self.assertIn("batchAsyncGenerateImage", detail)
+        self.assertIn("resumableUploadStart", detail)
 
     async def test_select_flow_edit_target_image_drags_source_into_prompt(self) -> None:
         events: list[tuple[str, float | None, float | None]] = []
@@ -9333,7 +12008,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
     async def test_resolve_image_reference_media_allows_flow_agent_local_fallback_when_upload_fails(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        source = self.uploads_dir / "trello-source.jpg"
+        source = self.uploads_dir / "erp-source.jpg"
         source.write_bytes(b"source")
         job = JobRecord(type="image", status="queued", title="test")
         await self.store.add_job(job)
@@ -9342,7 +12017,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             type="image",
             prompt="Use Google Flow Agent as the prompt writer and image-generation operator.",
             count=4,
-            trello_card_id="card-123",
+            erp_task_id="card-123",
             flow_agent_enabled=True,
             reference_image_paths=[str(source)],
         )
@@ -9383,6 +12058,1082 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ):
             with self.assertRaises(RuntimeError):
                 await self.service._resolve_image_reference_media(fake_client, job.id, request)
+
+
+class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCase):
+
+    def setUp(self) -> None:
+        self.start_temp_paths()
+        # The processor location must come from the test, never from a stray
+        # shell export on the developer machine.
+        self._env = patch.dict(os.environ, {"REMOVE_LOGO_URL": "", "REMOVE_LOGO_ENABLED": ""}, clear=False)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        self.store = StateStore()
+        self.service = FlowWebService(self.store)
+
+    def _artifact(self, name: str = "flow-image.jpg", mime_type: str = "image/jpeg") -> JobArtifact:
+        source = self.downloads_dir / name
+        source.write_bytes(b"original-bytes")
+        return JobArtifact(
+            label="Ảnh 1",
+            media_name=name,
+            url="https://example.com/flow-image.jpg",
+            local_path=str(source),
+            mime_type=mime_type,
+        )
+
+    def _cookie_store(
+        self, profile: Path, rows: list[tuple[str, int, int]], host: str = "labs.google"
+    ) -> Path:
+        import sqlite3
+
+        path = profile / "Default" / "Cookies"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(str(path))
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS cookies "
+            "(host_key TEXT, name TEXT, expires_utc INTEGER, has_expires INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO cookies (host_key, name, expires_utc, has_expires) VALUES (?, ?, ?, ?)",
+            [(host, name, expires, has_expires) for name, expires, has_expires in rows],
+        )
+        connection.commit()
+        connection.close()
+        return profile
+
+    def _chrome_stamp(self, offset_s: float) -> int:
+        return int((time.time() + offset_s + self.service._CHROME_EPOCH_OFFSET_S) * 1_000_000)
+
+    def test_a_live_flow_session_cookie_counts_as_signed_in(self) -> None:
+        profile = self._cookie_store(
+            self.downloads_dir / "live-profile",
+            [("__Secure-next-auth.session-token", self._chrome_stamp(30 * 86400), 1)],
+        )
+
+        self.assertFalse(self.service._flow_session_cookie_expired(profile))
+
+    def test_an_expired_flow_session_cookie_stops_counting_as_signed_in(self) -> None:
+        # The whole point: the cookie store exists and is non-empty, which is
+        # all the old check ever asked, yet the session is long dead.
+        profile = self._cookie_store(
+            self.downloads_dir / "stale-profile",
+            [("__Secure-next-auth.session-token", self._chrome_stamp(-86400), 1)],
+        )
+
+        self.assertTrue(self.service._flow_session_cookie_expired(profile))
+
+    def test_a_profile_with_only_analytics_cookies_is_not_signed_in(self) -> None:
+        profile = self._cookie_store(
+            self.downloads_dir / "analytics-profile",
+            [("_ga", self._chrome_stamp(365 * 86400), 1)],
+        )
+
+        self.assertTrue(self.service._flow_session_cookie_expired(profile))
+
+    def test_a_live_google_account_still_counts_as_signed_in(self) -> None:
+        # Hồ sơ thật chạy Flow suốt nhiều giờ mà trên đĩa không hề có dòng
+        # next-auth nào: phiên ấy dựng lại từ cookie tài khoản Google mỗi lần
+        # mở trang. Lấy sự vắng mặt của next-auth làm bằng chứng hết hạn là
+        # chặn đứng một phiên còn sống.
+        profile = self.downloads_dir / "google-profile"
+        self._cookie_store(profile, [("_ga", self._chrome_stamp(365 * 86400), 1)])
+        self._cookie_store(
+            profile,
+            [("SID", self._chrome_stamp(400 * 86400), 1)],
+            host=".google.com",
+        )
+
+        self.assertFalse(self.service._flow_session_cookie_expired(profile))
+
+    def test_a_dead_google_account_reports_a_dead_session(self) -> None:
+        profile = self.downloads_dir / "dead-google-profile"
+        self._cookie_store(
+            profile,
+            [("SID", self._chrome_stamp(-86400), 1)],
+            host=".google.com",
+        )
+
+        self.assertTrue(self.service._flow_session_cookie_expired(profile))
+
+    def test_an_unreadable_profile_never_reports_a_dead_session(self) -> None:
+        # Doubt must not log the owner out: no store, nothing to conclude.
+        self.assertFalse(self.service._flow_session_cookie_expired(self.downloads_dir / "missing"))
+
+    def test_playwright_cache_path_follows_the_platform(self) -> None:
+        # Getting this wrong is invisible until it bites: the app decides
+        # Chromium is missing and re-downloads it on every single run.
+        with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": ""}, clear=False):
+            home = PurePosixPath("/home/demo")
+            with patch.object(os, "name", "posix"), patch.object(
+                Path, "home", return_value=home
+            ), patch("flow_web.service.sys.platform", "darwin"):
+                self.assertEqual(
+                    home / "Library" / "Caches" / "ms-playwright",
+                    self.service._default_playwright_browsers_path(),
+                )
+            with patch.object(os, "name", "posix"), patch.object(
+                Path, "home", return_value=home
+            ), patch("flow_web.service.sys.platform", "linux"):
+                self.assertEqual(
+                    home / ".cache" / "ms-playwright",
+                    self.service._default_playwright_browsers_path(),
+                )
+
+    def test_removelogo_base_url_prefers_state_then_env(self) -> None:
+        self.assertEqual(self.service.REMOVE_LOGO_BASE_URL, self.service._removelogo_base_url())
+
+        with patch.dict(os.environ, {"REMOVE_LOGO_URL": "http://127.0.0.1:9999/"}, clear=False):
+            self.assertEqual("http://127.0.0.1:9999", self.service._removelogo_base_url())
+
+            config = self.store.snapshot().integration_config.model_copy(
+                update={"removelogo_url": "http://localhost:7000"}
+            )
+            asyncio.run(self.store.replace_integration_config(config))
+            self.assertEqual("http://localhost:7000", self.service._removelogo_base_url())
+
+    def test_removelogo_url_must_be_http(self) -> None:
+        self.assertEqual("http://127.0.0.1:8788", self.service._sanitize_removelogo_url("http://127.0.0.1:8788/"))
+        self.assertEqual("", self.service._sanitize_removelogo_url("  "))
+        with self.assertRaises(HTTPException):
+            self.service._sanitize_removelogo_url("127.0.0.1:8788")
+
+    def test_removelogo_input_mime_falls_back_to_file_name(self) -> None:
+        self.assertEqual("image/jpeg", self.service._removelogo_input_mime("image/jpeg", "a.bin"))
+        self.assertEqual("image/png", self.service._removelogo_input_mime("", "a.png"))
+        self.assertEqual("", self.service._removelogo_input_mime("video/mp4", "a.mp4"))
+
+    async def test_watermark_pass_replaces_local_file_with_cleaned_png(self) -> None:
+        artifact = self._artifact()
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(self.service, "_removelogo_health", return_value={"ok": True}), patch.object(
+            self.service,
+            "_removelogo_process_bytes",
+            return_value=b"cleaned-png-bytes",
+        ) as process:
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        process.assert_called_once()
+        self.assertEqual("image/jpeg", process.call_args.args[2])
+        self.assertEqual({"configured": True, "cleaned": 1, "skipped": 0, "failed": 0}, {
+            "configured": result["configured"],
+            "cleaned": result["cleaned"],
+            "skipped": result["skipped"],
+            "failed": result["failed"],
+        })
+        self.assertEqual("cleaned", artifact.watermark_status)
+        self.assertEqual("image/png", artifact.mime_type)
+        self.assertTrue(artifact.local_path.endswith("flow-image-clean.png"))
+        self.assertEqual(b"cleaned-png-bytes", Path(artifact.local_path).read_bytes())
+        self.assertEqual("/files/downloads/flow-image-clean.png", artifact.public_url)
+        self.assertEqual("cleaned", self.store.get_job(job.id).artifacts[0].watermark_status)
+
+    def _png_bytes(self, size: tuple[int, int] = (32, 32), dot: tuple[int, int, int] | None = None) -> bytes:
+        from PIL import Image
+
+        image = Image.new("RGB", size, (120, 130, 140))
+        if dot is not None:
+            image.putpixel((size[0] - 1, size[1] - 1), dot)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    async def test_a_pixel_identical_result_is_not_reported_as_a_cleaned_watermark(self) -> None:
+        # removelogo answers 200 with the metadata-only file when its visible
+        # pass finds nothing to repair, so identical pixels must not be sold to
+        # the user as a removed watermark.
+        source_bytes = self._png_bytes()
+        artifact = self._artifact(name="flow-image.png", mime_type="image/png")
+        Path(artifact.local_path).write_bytes(source_bytes)
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(self.service, "_removelogo_health", return_value={"ok": True}), patch.object(
+            self.service, "_removelogo_process_bytes", return_value=source_bytes
+        ):
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        self.assertEqual(0, result["cleaned"])
+        self.assertEqual(1, result["metadata_only"])
+        self.assertEqual("metadata_only", artifact.watermark_status)
+        self.assertIn("metadata", artifact.watermark_error)
+        # The metadata-stripped file is still the one ERP should receive.
+        self.assertTrue(artifact.local_path.endswith("flow-image-clean.png"))
+        logs = self.store.get_job(job.id).logs
+        self.assertTrue(any("chỉ gỡ được metadata" in entry.message for entry in logs))
+
+    async def test_a_repaired_pixel_still_counts_as_a_cleaned_watermark(self) -> None:
+        artifact = self._artifact(name="flow-image.png", mime_type="image/png")
+        Path(artifact.local_path).write_bytes(self._png_bytes())
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(self.service, "_removelogo_health", return_value={"ok": True}), patch.object(
+            self.service, "_removelogo_process_bytes", return_value=self._png_bytes(dot=(10, 20, 30))
+        ):
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        self.assertEqual(1, result["cleaned"])
+        self.assertEqual(0, result["metadata_only"])
+        self.assertEqual("cleaned", artifact.watermark_status)
+
+    async def test_watermark_failure_keeps_original_image_and_logs(self) -> None:
+        artifact = self._artifact()
+        original_path = artifact.local_path
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(self.service, "_removelogo_health", return_value={"ok": True}), patch.object(
+            self.service,
+            "_removelogo_process_bytes",
+            side_effect=RuntimeError("Bộ xử lý removelogo trả lỗi 500: boom"),
+        ):
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        self.assertEqual(0, result["cleaned"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("failed", artifact.watermark_status)
+        self.assertIn("boom", artifact.watermark_error)
+        self.assertEqual(original_path, artifact.local_path)
+        self.assertEqual(b"original-bytes", Path(original_path).read_bytes())
+        saved = self.store.get_job(job.id)
+        self.assertTrue(any("giữ nguyên bản gốc" in item.message for item in saved.logs))
+
+    async def test_an_image_without_a_gemini_watermark_counts_as_skipped_not_failed(self) -> None:
+        artifact = self._artifact()
+        original_path = artifact.local_path
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(self.service, "_removelogo_health", return_value={"ok": True}), patch.object(
+            self.service,
+            "_removelogo_process_bytes",
+            side_effect=RemoveLogoNoWatermarkError("No supported visible Gemini watermark was detected"),
+        ):
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        # Nothing to remove is a normal outcome, so it must not read as a failure.
+        self.assertEqual(0, result["failed"])
+        self.assertEqual(1, result["skipped"])
+        self.assertEqual("skipped", artifact.watermark_status)
+        self.assertEqual(b"original-bytes", Path(original_path).read_bytes())
+
+    async def test_watermark_pass_marks_every_artifact_when_processor_is_down(self) -> None:
+        artifacts = [self._artifact("a.jpg"), self._artifact("b.jpg")]
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(
+            self.service,
+            "_removelogo_health",
+            side_effect=RuntimeError("Bộ xử lý removelogo tại http://127.0.0.1:8788 chưa sẵn sàng"),
+        ), patch.object(self.service, "_removelogo_process_bytes") as process:
+            result = await self.service._remove_flow_watermarks(job.id, request, artifacts)
+
+        process.assert_not_called()
+        self.assertEqual(2, result["failed"])
+        self.assertEqual(0, result["cleaned"])
+        self.assertTrue(all(artifact.watermark_status == "failed" for artifact in artifacts))
+
+    async def test_watermark_pass_skips_unsupported_mime_type(self) -> None:
+        artifact = self._artifact("clip.mp4", mime_type="video/mp4")
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.object(self.service, "_removelogo_health", return_value={"ok": True}), patch.object(
+            self.service, "_removelogo_process_bytes"
+        ) as process:
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        process.assert_not_called()
+        self.assertEqual(1, result["skipped"])
+        self.assertEqual("skipped", artifact.watermark_status)
+
+    async def test_watermark_pass_is_skipped_when_disabled(self) -> None:
+        artifact = self._artifact()
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat")
+
+        with patch.dict(os.environ, {"REMOVE_LOGO_ENABLED": "false"}, clear=False), patch.object(
+            self.service, "_removelogo_health"
+        ) as health:
+            result = await self.service._remove_flow_watermarks(job.id, request, [artifact])
+
+        health.assert_not_called()
+        self.assertEqual({"configured": False, "reason": "disabled"}, result)
+        self.assertEqual("", artifact.watermark_status)
+
+    def test_image_graph_no_longer_gets_a_watermark_node(self) -> None:
+        # 10/9: người dùng bỏ hẳn bước xoá watermark. Job ảnh đi thẳng từ Flow
+        # sang duyệt, không chèn thêm nút "Remove Logo" nào nữa.
+        request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True, erp_task_id="abc123")
+
+        payload = self.service._automation_graph_payload(request)
+        types = [module["type"] for module in payload["modules"]]
+
+        self.assertNotIn("watermark", types)
+        self.assertLess(types.index("flow"), types.index("approval"))
+        self.assertLess(types.index("approval"), types.index("erp"))
+
+    def test_a_saved_graph_that_still_has_a_watermark_node_drops_it(self) -> None:
+        # Graph lưu từ trước vẫn mang nút này; không được để nó chạy lại.
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            erp_enabled=True,
+            erp_task_id="abc123",
+            automation_graph={
+                "modules": [
+                    {"id": "flow", "type": "flow"},
+                    {"id": "watermark", "type": "watermark"},
+                    {"id": "approval", "type": "approval"},
+                    {"id": "erp", "type": "erp"},
+                ]
+            },
+        )
+
+        payload = self.service._automation_graph_payload(request)
+        types = [module["type"] for module in payload["modules"]]
+
+        self.assertNotIn("watermark", types)
+        self.assertEqual(["flow", "approval", "erp"], types)
+
+    async def test_erp_upload_sends_the_2k_bytes_without_a_watermark_pass(self) -> None:
+        # 10/9: bỏ cả bước vá watermark ở cửa upload ERP. Job bd00be83 còn đo
+        # và vá từng ảnh sau khi nâng 2K; nay byte nào ra thì đi thẳng lên thẻ.
+        artifact = self._artifact()
+        job = JobRecord(type="image", status="running", title="2k")
+        await self.store.add_job(job)
+        door = AsyncMock(side_effect=AssertionError("không được qua bước watermark nữa"))
+        with patch.object(
+            self.service, "_erp_artifact_file_bytes", AsyncMock(return_value=(b"goc", "image/jpeg"))
+        ), patch.object(self.service, "_erp_unmarked_bytes", door), patch(
+            "flow_web.service.watermark_repair.repair_image_bytes",
+            side_effect=AssertionError("không được vá watermark nữa"),
+        ):
+            upscaled = await self.service._erp_outgoing_file_bytes(
+                job.id, artifact, 0, artifact.url,
+                upscaled=ImageUpscaleResult(bytes=b"anh-2k", mime_type="image/png", source="flow"),
+            )
+            failed = await self.service._erp_outgoing_file_bytes(
+                job.id, artifact, 1, artifact.url,
+                upscaled=ImageUpscaleResult(failure_reason="Flow returned original bytes"),
+            )
+
+        self.assertEqual((b"anh-2k", "image/png"), upscaled)
+        self.assertEqual((b"goc", "image/jpeg"), failed)
+        door.assert_not_called()
+
+    def test_dashboard_graph_editor_no_longer_requires_a_watermark_node(self) -> None:
+        app_js = (Path(__file__).resolve().parent.parent / "flow_web" / "static" / "app.js").read_text(encoding="utf-8")
+        order_line = next(line for line in app_js.splitlines() if line.startswith("const AUTOMATION_STEP_ORDER"))
+
+        self.assertNotIn("watermark", order_line, "UI tự thêm lại nút Remove Logo nếu nó còn trong danh sách bắt buộc")
+        self.assertIn('module.type !== "watermark"', app_js, "graph cũ còn nút này phải bị lọc như telegram")
+
+    def test_erp_idea_batch_ui_reports_refusal_reason(self) -> None:
+        app_js = (Path(__file__).resolve().parent.parent / "flow_web" / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("response.reason", app_js, "Nút tạo ảnh tay phải đọc reason từ server khi thẻ không đủ điều kiện")
+        self.assertIn("Không tạo được ảnh:", app_js, "Nút tạo ảnh tay phải thông báo rõ lý do vì sao không chạy")
+
+    def test_video_graph_has_no_watermark_node(self) -> None:
+        request = CreateJobRequest(type="video", prompt="cat")
+
+        payload = self.service._automation_graph_payload(request)
+
+        self.assertNotIn("watermark", [module["type"] for module in payload["modules"]])
+
+    def test_erp_attachment_name_follows_the_cleaned_png_on_disk(self) -> None:
+        artifact = JobArtifact(label="Ảnh 1", media_name="flow-image.jpg", local_path="/tmp/flow-image-clean.png")
+
+        self.assertEqual("flow-abc12345-1.png", self.service._erp_attachment_name("abc12345def", artifact, 0))
+
+    async def test_erp_archive_uploads_cleaned_local_bytes_instead_of_flow_url(self) -> None:
+        artifact = self._artifact()
+        cleaned = self.downloads_dir / "flow-image-clean.png"
+        cleaned.write_bytes(b"cleaned-png-bytes")
+        artifact.local_path = str(cleaned)
+        artifact.mime_type = "image/png"
+        artifact.watermark_status = "cleaned"
+
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        await self.store.patch_job(job.id, result={"dashboard_approvals": {"0": {"status": "approved"}}})
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            erp_enabled=True,
+            erp_task_id="abc123",
+            erp_project_id="pid",
+        )
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service, "_erp_required_project_id", return_value="pid"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service,
+            "_erp_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-image-clean.png"},
+        ) as attach_bytes, patch.object(
+            self.service, "_erp_attach_url"
+        ) as attach_url:
+            result = await self.service._archive_erp_artifacts(job.id, request, [artifact])
+
+        attach_url.assert_not_called()
+        attach_bytes.assert_called_once()
+        self.assertEqual(b"cleaned-png-bytes", attach_bytes.call_args.args[3])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(1, result["uploaded_files"])
+
+    async def test_erp_archive_falls_back_to_url_when_erp_refuses_file_upload(self) -> None:
+        # The company ERP credential has no upload right, so the file branch
+        # raises. The approved artifact must still reach the Task.
+        artifact = self._artifact()
+        cleaned = self.downloads_dir / "flow-image-clean.png"
+        cleaned.write_bytes(b"cleaned-png-bytes")
+        artifact.local_path = str(cleaned)
+        artifact.mime_type = "image/png"
+        artifact.watermark_status = "cleaned"
+
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        await self.store.patch_job(job.id, result={"dashboard_approvals": {"0": {"status": "approved"}}})
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            erp_enabled=True,
+            erp_task_id="abc123",
+            erp_project_id="pid",
+        )
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service, "_erp_required_project_id", return_value="pid"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service,
+            "_erp_attach_file_bytes",
+            side_effect=RuntimeError("ERP GraphQL không hỗ trợ upload file"),
+        ), patch.object(
+            self.service,
+            "_erp_attach_url",
+            return_value={"id": "att-1", "name": "flow-image.jpg"},
+        ) as attach_url:
+            result = await self.service._archive_erp_artifacts(job.id, request, [artifact])
+
+        attach_url.assert_called_once()
+        self.assertEqual("https://example.com/flow-image.jpg", attach_url.call_args.args[3])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["failed"])
+        self.assertEqual(0, result["uploaded_files"])
+        saved = self.store.get_job(job.id)
+        self.assertTrue(any("vẫn còn watermark Gemini" in item.message for item in saved.logs))
+
+    async def test_erp_archive_reports_failure_when_upload_and_url_both_unavailable(self) -> None:
+        artifact = self._artifact()
+        artifact.url = ""
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        await self.store.patch_job(job.id, result={"dashboard_approvals": {"0": {"status": "approved"}}})
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            erp_enabled=True,
+            erp_task_id="abc123",
+            erp_project_id="pid",
+        )
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service, "_erp_required_project_id", return_value="pid"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service, "_erp_attach_file_bytes", side_effect=RuntimeError("no upload right")
+        ), patch.object(self.service, "_erp_attach_url") as attach_url:
+            result = await self.service._archive_erp_artifacts(job.id, request, [artifact])
+
+        attach_url.assert_not_called()
+        self.assertEqual(0, result["sent"])
+        self.assertEqual(1, result["failed"])
+
+    def test_erp_upload_file_parks_the_file_on_the_task_for_the_next_comment(self) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+            {"message": {"name": "abc123", "file_url": "/private/files/sach.png", "is_private": 1}}
+        ).encode()
+        response.__enter__ = lambda self_: self_
+        response.__exit__ = lambda *_: False
+
+        with patch("flow_web.service.urlopen", return_value=response) as opener:
+            url = self.service._erp_upload_file(
+                "key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png"
+            )
+
+        # Relative, because that is the form addTaskComment matches on.
+        self.assertEqual("/private/files/sach.png", url)
+        request = opener.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/api/method/upload_file"))
+        # The exact field set the ERP web UI posts; the fieldname sentinel is
+        # what lets the next addTaskComment adopt the file as an attachment.
+        for expected in (
+            b'name="is_private"\r\n\r\n1',
+            b'name="doctype"\r\n\r\nTask',
+            b'name="docname"\r\n\r\nTASK-1',
+            b'name="fieldname"\r\n\r\ncomment',
+        ):
+            self.assertIn(expected, request.data)
+
+    def test_erp_upload_file_rejects_missing_file_url(self) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps({"message": {"name": "abc123"}}).encode()
+        response.__enter__ = lambda self_: self_
+        response.__exit__ = lambda *_: False
+
+        with patch("flow_web.service.urlopen", return_value=response):
+            with self.assertRaises(RuntimeError):
+                self.service._erp_upload_file(
+                    "key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png"
+                )
+
+    def test_erp_upload_file_rejects_a_file_url_on_another_host(self) -> None:
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+            {"message": {"file_url": "https://evil.example.com/files/sach.png"}}
+        ).encode()
+        response.__enter__ = lambda self_: self_
+        response.__exit__ = lambda *_: False
+
+        with patch("flow_web.service.urlopen", return_value=response):
+            with self.assertRaises(RuntimeError):
+                self.service._erp_upload_file(
+                    "key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png"
+                )
+
+    def test_erp_attach_file_bytes_uploads_then_links_it_as_a_real_attachment(self) -> None:
+        hosted_path = "/private/files/sach.png"
+        graphql_calls: List[Dict[str, Any]] = []
+
+        def fake_graphql(query, variables, operation, *, key, token):
+            graphql_calls.append(variables)
+            return {"addTaskComment": {"ok": True, "linked": 1}}
+
+        with patch.object(self.service, "_erp_upload_file", return_value=hosted_path) as upload, patch.object(
+            self.service, "_erp_assert_task_in_project"
+        ), patch.object(self.service, "_erp_graphql", side_effect=fake_graphql), patch.object(
+            self.service, "_erp_comment"
+        ) as fallback:
+            result = self.service._erp_attach_file_bytes(
+                "key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png", False
+            )
+
+        upload.assert_called_once_with("key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png")
+        self.assertEqual([hosted_path], graphql_calls[0]["attachments"])
+        # A linked attachment renders on its own, so the body carries no URL -
+        # and no words either: the artefact marker rides in ``meta`` so the
+        # card shows the picture alone.
+        self.assertEqual("\u200b", graphql_calls[0]["content"])
+        self.assertEqual("[FLOW_V2_ARTIFACT] sach.png", graphql_calls[0]["meta"])
+        fallback.assert_not_called()
+        self.assertTrue(result["hosted"])
+        self.assertTrue(result["linked"])
+        self.assertEqual("https://erp.havigroup.llc/private/files/sach.png", result["url"])
+        self.assertEqual("image/png", result["mimeType"])
+
+    def test_a_silent_attachment_puts_neither_words_nor_marker_on_the_card(self) -> None:
+        # The idea picture is only carried across to the child card. It is not
+        # a Flow output, so it must not pick up the artefact marker - a child
+        # card wearing that marker reads as "already run" and never runs.
+        graphql_calls: List[Dict[str, Any]] = []
+
+        with patch.object(
+            self.service, "_erp_upload_file", return_value="/private/files/idea.png"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service,
+            "_erp_graphql",
+            side_effect=lambda q, v, o, *, key, token: (
+                graphql_calls.append(v) or {"addTaskComment": {"ok": True, "linked": 1}}
+            ),
+        ):
+            self.service._erp_attach_file_bytes(
+                "key", "secret", "TASK-1", b"png-bytes", "image/png", "idea.png", False,
+                silent_comment=True,
+            )
+
+        self.assertEqual("\u200b", graphql_calls[0]["content"])
+        self.assertEqual("", graphql_calls[0]["meta"])
+
+    def test_erp_attach_file_bytes_posts_into_the_source_comment_thread(self) -> None:
+        hosted_path = "/private/files/sach.png"
+        replies: List[Dict[str, Any]] = []
+
+        def fake_reply(key, token, task_id, content, *, parent_comment, attachments=None, meta=""):
+            replies.append(
+                {
+                    "task_id": task_id,
+                    "content": content,
+                    "meta": meta,
+                    "parent": parent_comment,
+                    "attachments": list(attachments or []),
+                }
+            )
+            return {"ok": True, "linked": 1}
+
+        with patch.object(self.service, "_erp_upload_file", return_value=hosted_path), patch.object(
+            self.service, "_erp_assert_task_in_project"
+        ), patch.object(self.service, "_erp_graphql") as graphql, patch.object(
+            self.service, "_erp_reply_comment", side_effect=fake_reply
+        ):
+            result = self.service._erp_attach_file_bytes(
+                "key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png", False, "cmt-nguon"
+            )
+
+        # A reply has no GraphQL mutation, so the whitelisted method is the
+        # only path that may run here.
+        graphql.assert_not_called()
+        self.assertEqual(
+            [
+                {
+                    "task_id": "TASK-1",
+                    "content": "\u200b",
+                    "meta": "[FLOW_V2_ARTIFACT] sach.png",
+                    "parent": "cmt-nguon",
+                    "attachments": [hosted_path],
+                }
+            ],
+            replies,
+        )
+        self.assertTrue(result["linked"])
+
+    def test_erp_source_comment_id_picks_the_comment_holding_the_source_image(self) -> None:
+        detail = {
+            "comments": [
+                {"name": "cmt-text", "content": "ghi chú", "attachments": []},
+                {
+                    "name": "cmt-nguon",
+                    "content": "Ảnh nguồn cho AI",
+                    "attachments": [{"file_url": "/private/files/nguon.jpg"}],
+                },
+                {
+                    "name": "cmt-output",
+                    "content": "[FLOW_V2_ARTIFACT] flow-1.png",
+                    "attachments": [{"file_url": "/private/files/flow-1.png"}],
+                },
+            ]
+        }
+        with patch.object(self.service, "_erp_task_detail", return_value=detail):
+            matched = self.service._erp_source_comment_id(
+                "key", "secret", "TASK-1", ["https://erp.havigroup.llc/private/files/nguon.jpg"]
+            )
+            # Without a recorded attachment the oldest image comment still wins,
+            # and a Flow output must never become the thread parent.
+            fallback = self.service._erp_source_comment_id("key", "secret", "TASK-1", [])
+        self.assertEqual("cmt-nguon", matched)
+        self.assertEqual("cmt-nguon", fallback)
+
+    def test_erp_attach_file_bytes_falls_back_to_a_url_comment_when_nothing_links(self) -> None:
+        with patch.object(
+            self.service, "_erp_upload_file", return_value="/private/files/sach.png"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service, "_erp_graphql", return_value={"addTaskComment": {"ok": True, "linked": 0}}
+        ), patch.object(self.service, "_erp_comment") as fallback:
+            result = self.service._erp_attach_file_bytes(
+                "key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png", False
+            )
+
+        self.assertFalse(result["linked"])
+        # Without the fallback the Task would show a comment and no image.
+        fallback.assert_called_once()
+        self.assertIn("https://erp.havigroup.llc/private/files/sach.png", fallback.call_args.args[3])
+
+    def test_extract_attachments_recovers_erp_hosted_url_from_comment_body(self) -> None:
+        hosted = "https://erp.havigroup.llc/files/flow-out-1.png"
+        detail = {
+            "comments": [
+                {
+                    "name": "cmt-9",
+                    "content": f"[FLOW_V2_ARTIFACT] flow-out-1.png\n\n![flow-out-1.png]({hosted})",
+                    "attachments": [],
+                }
+            ]
+        }
+
+        found = self.service._erp_extract_task_attachments(detail)
+
+        self.assertEqual(1, len(found))
+        # The comment's own id must not become the file name, or the
+        # image-extension check drops the attachment.
+        self.assertEqual("flow-out-1.png", found[0]["name"])
+        self.assertEqual(hosted, found[0]["url"])
+        _sources, outputs = self.service._erp_source_and_flow_output_attachments(found)
+        self.assertEqual(1, len(outputs))
+
+    def test_extract_attachments_reads_a_native_comment_attachment(self) -> None:
+        detail = {
+            "comments": [
+                {
+                    "name": "cmt-1",
+                    "content": "anh nguon cho AI",
+                    "attachments": [{"file_name": "nguon.png", "file_url": "/private/files/nguon.png"}],
+                },
+                {
+                    "name": "cmt-2",
+                    "content": "[FLOW_V2_ARTIFACT] flow-out-1.png",
+                    "attachments": [{"file_name": "flow-out-1.png", "file_url": "/private/files/flow-out-1.png"}],
+                },
+            ]
+        }
+
+        found = self.service._erp_extract_task_attachments(detail)
+
+        self.assertEqual(
+            [
+                "https://erp.havigroup.llc/private/files/nguon.png",
+                "https://erp.havigroup.llc/private/files/flow-out-1.png",
+            ],
+            [item["url"] for item in found],
+        )
+        sources, outputs = self.service._erp_source_and_flow_output_attachments(found)
+        self.assertEqual(["nguon.png"], [item["name"] for item in sources])
+        self.assertEqual(1, len(outputs))
+
+    def test_extract_attachments_prefers_the_real_file_name_over_the_erp_id(self) -> None:
+        # On the real ERP a comment attachment names itself with a random File
+        # id and keeps "flow-<run>-<n>.png" in file_name, while the comment
+        # body is only a zero-width space.  Reading "name" first made every
+        # image Flow posted fail the image-extension check and disappear, so
+        # the card looked empty to both halves of the agent.
+        detail = {
+            "comments": [
+                {
+                    "name": "cmt-1",
+                    "content": "anh nguon cho AI",
+                    "attachments": [
+                        {
+                            "name": "1f0a2b3c4d",
+                            "file_name": "nguon.png",
+                            "file_url": "/private/files/nguon.png",
+                        }
+                    ],
+                },
+                {
+                    "name": "cmt-2",
+                    "content": "\u200b",
+                    "attachments": [
+                        {
+                            "name": "8c1f2a4d9e",
+                            "file_name": "flow-run7-1.png",
+                            "file_url": "/private/files/flow-run7-1.png",
+                        },
+                        {
+                            "name": "5b7e0d6a2f",
+                            "file_name": "flow-run7-2.jpg",
+                            "file_url": "/private/files/flow-run7-2.jpg",
+                        },
+                    ],
+                },
+            ]
+        }
+
+        found = self.service._erp_extract_task_attachments(detail)
+
+        self.assertEqual(
+            ["nguon.png", "flow-run7-1.png", "flow-run7-2.jpg"],
+            [item["name"] for item in found],
+        )
+        self.assertEqual(["image/png", "image/png", "image/jpeg"], [item["mimeType"] for item in found])
+        sources, outputs = self.service._erp_source_and_flow_output_attachments(found)
+        self.assertEqual(["nguon.png"], [item["name"] for item in sources])
+        self.assertEqual(2, len(outputs))
+
+    def test_task_metadata_typed_by_a_person_cannot_mark_images_as_flow_output(self) -> None:
+        # Only the comments Flow posts carry "meta"; a Task's own metadata is
+        # typed by a person.  Reading the marker there would brand the source
+        # image the reviewer uploaded as a Flow output, and the reset endpoint
+        # deletes Flow outputs.
+        detail = {
+            "meta": "action_1: listing FLOW_V2_ARTIFACT",
+            "comments": [
+                {
+                    "name": "cmt-1",
+                    "content": "anh nguon cho AI",
+                    "attachments": [
+                        {
+                            "name": "1f0a2b3c4d",
+                            "file_name": "nguon.png",
+                            "file_url": "/private/files/nguon.png",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        found = self.service._erp_extract_task_attachments(detail)
+
+        self.assertEqual(["nguon.png"], [item["name"] for item in found])
+        sources, outputs = self.service._erp_source_and_flow_output_attachments(found)
+        self.assertEqual(["nguon.png"], [item["name"] for item in sources])
+        self.assertEqual([], outputs)
+
+    def test_extract_attachments_ignores_links_to_other_hosts(self) -> None:
+        detail = {
+            "comments": [
+                {"name": "cmt-9", "content": "tham khảo https://example.com/anh.png nhé", "attachments": []}
+            ]
+        }
+
+        self.assertEqual([], self.service._erp_extract_task_attachments(detail))
+
+    def test_private_erp_files_are_fetched_through_the_authenticated_endpoint(self) -> None:
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "secret")):
+            request = self.service._erp_private_file_request(
+                "https://erp.havigroup.llc/private/files/nguon.png"
+            )
+            self.assertIsNotNone(request)
+            self.assertIn("frappe.core.doctype.file.file.download_file", request.full_url)
+            self.assertIn("file_url=%2Fprivate%2Ffiles%2Fnguon.png", request.full_url)
+            self.assertEqual("token key:secret", request.headers["Authorization"])
+
+            # Public ERP files and foreign hosts keep the plain anonymous GET.
+            self.assertIsNone(self.service._erp_private_file_request("https://erp.havigroup.llc/files/x.png"))
+            self.assertIsNone(self.service._erp_private_file_request("https://example.com/private/files/x.png"))
+
+    def test_erp_source_downloads_a_private_card_image_with_credentials(self) -> None:
+        # An image a human drops on a Task lands under /private/files/, which
+        # answers 403 to an anonymous GET.  ERP Source has to go through the
+        # authenticated download endpoint or the card is unreadable.
+        captured: Dict[str, Any] = {}
+
+        class _Response:
+            headers = None
+
+            def read(self) -> bytes:
+                return b"anh-goc"
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *exc: Any) -> None:
+                return None
+
+        def fake_urlopen(request: Any, timeout: float = 0) -> Any:
+            captured["url"] = request.full_url
+            captured["auth"] = request.headers.get("Authorization")
+            return _Response()
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "secret")), patch.object(
+            self.service, "_erp_base_url", return_value="https://erp.havigroup.llc"
+        ), patch("flow_web.service.urlopen", side_effect=fake_urlopen):
+            payload, _ = self.service._erp_download_attachment_bytes(
+                "key",
+                "secret",
+                "TASK-1",
+                {"name": "nguon.png", "url": "/private/files/nguon.png"},
+            )
+
+        self.assertEqual(b"anh-goc", payload)
+        self.assertIn("frappe.core.doctype.file.file.download_file", captured["url"])
+        self.assertEqual("token key:secret", captured["auth"])
+
+    def test_erp_source_never_sends_credentials_to_another_host(self) -> None:
+        captured: Dict[str, Any] = {}
+
+        class _Response:
+            headers = None
+
+            def read(self) -> bytes:
+                return b"anh-ngoai"
+
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *exc: Any) -> None:
+                return None
+
+        def fake_urlopen(request: Any, timeout: float = 0) -> Any:
+            captured["url"] = request.full_url
+            captured["auth"] = request.headers.get("Authorization")
+            return _Response()
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "secret")), patch.object(
+            self.service, "_erp_base_url", return_value="https://erp.havigroup.llc"
+        ), patch("flow_web.service.urlopen", side_effect=fake_urlopen):
+            self.service._erp_download_attachment_bytes(
+                "key",
+                "secret",
+                "TASK-1",
+                {"name": "nguon.png", "url": "https://example.com/private/files/nguon.png"},
+            )
+
+        self.assertEqual("https://example.com/private/files/nguon.png", captured["url"])
+        self.assertIsNone(captured["auth"])
+
+    async def test_job_failure_is_written_to_the_job_log_not_to_the_card(self) -> None:
+        # The card is for images. A failure the reviewers cannot act on used to
+        # sit there as "[FLOW_V2_ERROR] ..." forever, because nobody deletes a
+        # robot's comment; the run's own log is where the reason belongs.
+        job = JobRecord(type="image", status="failed", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True, erp_task_id="TASK-1")
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service, "_erp_assert_task_in_project"
+        ), patch.object(self.service, "_erp_source_comment_id", return_value="cmt-nguon"), patch.object(
+            self.service, "_erp_graphql"
+        ) as graphql, patch.object(self.service, "_erp_reply_comment") as reply, patch.object(
+            self.service, "_erp_comment"
+        ) as comment:
+            await self.service._report_erp_job_failure(job.id, request, "Flow  hết\n hạn mức tạo ảnh.")
+
+        graphql.assert_not_called()
+        reply.assert_not_called()
+        comment.assert_not_called()
+        saved = self.store.get_job(job.id)
+        self.assertTrue(
+            any(
+                "Không tạo được ảnh cho ERP Task TASK-1: Flow hết hạn mức tạo ảnh." in item.message
+                for item in saved.logs
+            )
+        )
+
+    async def test_job_failure_comment_is_skipped_without_erp_task(self) -> None:
+        job = JobRecord(type="image", status="failed", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True)
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service, "_erp_graphql"
+        ) as graphql:
+            await self.service._report_erp_job_failure(job.id, request, "boom")
+
+        graphql.assert_not_called()
+
+    async def test_job_failure_report_needs_no_erp_call_to_survive(self) -> None:
+        # Reporting a failure must never fail in turn. It no longer touches the
+        # ERP at all, so a card this app cannot even reach still gets its
+        # reason recorded.
+        job = JobRecord(type="image", status="failed", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True, erp_task_id="TASK-1")
+
+        with patch.object(self.service, "_erp_credentials", return_value=("", "")), patch.object(
+            self.service, "_erp_assert_task_in_project", side_effect=RuntimeError("Task không thuộc Project")
+        ):
+            await self.service._report_erp_job_failure(job.id, request, "boom")
+
+        saved = self.store.get_job(job.id)
+        self.assertTrue(
+            any("Không tạo được ảnh cho ERP Task TASK-1: boom" in item.message for item in saved.logs)
+        )
+
+    async def test_erp_archive_still_attaches_url_when_no_local_file_exists(self) -> None:
+        artifact = JobArtifact(
+            label="Ảnh 1",
+            media_name="flow-image.jpg",
+            url="https://example.com/flow-image.jpg",
+            mime_type="image/jpeg",
+        )
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+        await self.store.patch_job(job.id, result={"dashboard_approvals": {"0": {"status": "approved"}}})
+        request = CreateJobRequest(
+            type="image",
+            prompt="cat",
+            erp_enabled=True,
+            erp_task_id="abc123",
+            erp_project_id="pid",
+        )
+
+        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+            self.service, "_erp_required_project_id", return_value="pid"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service,
+            "_erp_attach_url",
+            return_value={"id": "att-1", "name": "flow-image.jpg"},
+        ) as attach_url:
+            result = await self.service._archive_erp_artifacts(job.id, request, [artifact])
+
+        attach_url.assert_called_once()
+        self.assertEqual("https://example.com/flow-image.jpg", attach_url.call_args.args[3])
+        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["uploaded_files"])
+
+
+class JobHistoryTrimTests(unittest.TestCase):
+    """Lịch sử lượt chạy có hạn, nhưng không được nuốt ảnh chưa lên thẻ."""
+
+    def _job(self, *, task_id: str = "", images: int = 0, result: dict | None = None) -> JobRecord:
+        return JobRecord(
+            type="image",
+            status="completed",
+            input={"erp_output_task_id": task_id} if task_id else {},
+            artifacts=[JobArtifact(media_name=f"a{index}.jpg") for index in range(images)],
+            result=result or {},
+        )
+
+    def test_history_keeps_the_newest_runs(self) -> None:
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT + 10)]
+
+        kept = trim_job_history(jobs)
+
+        self.assertEqual(jobs[:JOB_HISTORY_LIMIT], kept)
+
+    def test_a_run_whose_images_never_reached_its_card_survives_the_trim(self) -> None:
+        # Cutting it loose strands twelve finished images: only this record
+        # knows where they are, so the card could never be filled again.
+        owing = self._job(task_id="TASK-2026-01009", images=12)
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + [owing]
+
+        kept = trim_job_history(jobs)
+
+        self.assertIn(owing, kept)
+        self.assertEqual(JOB_HISTORY_LIMIT + 1, len(kept))
+
+    def test_a_run_still_queued_or_running_never_falls_out_of_the_history(self) -> None:
+        # 10/9: xếp 39 thẻ con cùng lúc đẩy 24 lượt PN đang chờ ra khỏi cửa sổ
+        # 50. Mất hồ sơ thì lượt đó không bao giờ chạy, thẻ trắng mà không ai
+        # biết — cửa sổ chỉ được cắt lượt đã kết thúc.
+        live = [
+            JobRecord(type="image", status=status, input={"erp_output_task_id": f"TASK-2026-0539{index}"})
+            for index, status in enumerate(["queued", "running", "polling", "queued"])
+        ]
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + live
+
+        kept = [job.id for job in trim_job_history(jobs)]
+
+        for job in live:
+            self.assertIn(job.id, kept, f"lượt {job.status} bị cắt khỏi lịch sử")
+        self.assertEqual(JOB_HISTORY_LIMIT + len(live), len(kept))
+
+    def test_a_run_whose_images_are_all_on_the_card_is_dropped_as_usual(self) -> None:
+        settled = self._job(
+            task_id="TASK-2026-01009",
+            images=2,
+            result={"erp_review": {"items": {"0": {"comment": "c0"}, "1": {"comment": "c1"}}}},
+        )
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + [settled]
+
+        self.assertNotIn(settled, trim_job_history(jobs))
+
+    def test_a_run_whose_images_were_all_judged_is_dropped_as_usual(self) -> None:
+        judged = self._job(
+            task_id="TASK-2026-01009",
+            images=2,
+            result={"dashboard_approvals": {"0": {"status": "approved"}, "1": {"status": "rejected"}}},
+        )
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + [judged]
+
+        self.assertNotIn(judged, trim_job_history(jobs))
+
+    def test_the_history_still_has_a_ceiling(self) -> None:
+        jobs = [self._job(task_id="TASK-2026-01009", images=1) for _ in range(JOB_HISTORY_CEILING + 20)]
+
+        self.assertEqual(JOB_HISTORY_CEILING, len(trim_job_history(jobs)))
 
 
 if __name__ == "__main__":

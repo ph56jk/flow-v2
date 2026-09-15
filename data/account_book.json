@@ -1,0 +1,16 @@
+{
+  "entries": {
+    "acc32": {
+      "account_id": "acc32",
+      "shop": "Havi Home",
+      "machine": "etsy-vn32",
+      "note": "shop chính"
+    },
+    "acc16": {
+      "account_id": "acc16",
+      "shop": "",
+      "machine": "etsy-vn16",
+      "note": ""
+    }
+  }
+}

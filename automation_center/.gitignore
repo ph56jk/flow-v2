@@ -1,0 +1,8 @@
+.wrangler/
+.dev.vars
+# wrangler còn đọc .dev.vars.<môi-trường>; dòng trên là khớp đúng tên nên
+# không phủ được chúng.
+.dev.vars.*
+.env
+runner/*.env
+mcp/.venv/
