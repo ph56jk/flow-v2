@@ -106,6 +106,8 @@ class NoiDuBaDuongGhiQuaHTTP(unittest.TestCase):
         self.goi.append((f"{base}{path}", payload))
         if path.endswith("/account/book"):
             return {"entries": {"acc32": {"shop": "Havi Home", "machine": "etsy-vn32"}}}
+        if path.endswith("/review/delete-disliked"):
+            return {"deleted": True}
         return {"ok": True}
 
     def _chay(self, argv: list[str], sau=None, goi=None) -> Dict[str, Any]:
@@ -235,8 +237,22 @@ class NoiDuBaDuongGhiQuaHTTP(unittest.TestCase):
         self.assertIsNone(ghi_lai.get("pipeline_hook"))
         self.assertIsNone(ghi_lai.get("edit_hook"))
         self.assertIsNone(ghi_lai.get("sku_hook"))
+        self.assertIsNone(ghi_lai.get("delete_review_hook"))
         self.assertIsNone(ghi_lai.get("book"))
         self.assertEqual([], self.goi)
+
+    def test_go_anh_review_cua_app_di_qua_http_chu_khong_dung_token_bot(self) -> None:
+        def sau(ghi_lai):
+            hook = ghi_lai.get("delete_review_hook")
+            self.assertIsNotNone(hook, "thiếu hook gỡ ảnh: bản chạy rời sẽ để ảnh 👎 kẹt lại")
+            self.assertTrue(hook("TASK-1", "cmt-2"))
+
+        self._voi_url(sau)
+        self.assertIn(
+            ("http://127.0.0.1:8000/api/erp/review/delete-disliked",
+             {"task_id": "TASK-1", "comment_id": "cmt-2"}),
+            self.goi,
+        )
 
     def test_co_state_rieng_thi_bot_khong_de_len_file_nho_mac_dinh(self) -> None:
         # File nhớ mặc định bị **ghi đè** chứ không gộp: chạy thử một bot khác
@@ -249,7 +265,7 @@ class NoiDuBaDuongGhiQuaHTTP(unittest.TestCase):
         self.assertIsNone(self._chay(["--once", "--dry-run"]).get("state_path"))
 
     def test_moi_duong_script_goi_deu_la_route_that_cua_app(self) -> None:
-        """Năm địa chỉ script gõ vào phải tồn tại bên app.
+        """Sáu địa chỉ script gõ vào phải tồn tại bên app.
 
         Không có test này thì một đường ghi mới trông như đã nối xong: hook có
         mặt, log không kêu, và mỗi lần bot gọi là một cái 404 lặng lẽ nằm trong
@@ -263,6 +279,7 @@ class NoiDuBaDuongGhiQuaHTTP(unittest.TestCase):
             asyncio.run(ghi_lai["pipeline_hook"]("TASK-1"))
             ghi_lai["edit_hook"]("TASK-1", (("acc", "acc32"),))
             ghi_lai["sku_hook"]("TASK-1", False)
+            ghi_lai["delete_review_hook"]("TASK-1", "cmt-2")
 
         self._voi_url(sau)
         da_goi = {url.split("http://127.0.0.1:8000", 1)[-1] for url, _ in self.goi}
@@ -273,6 +290,7 @@ class NoiDuBaDuongGhiQuaHTTP(unittest.TestCase):
                 "/api/erp/pipeline/advance",
                 "/api/erp/sku/sync",
                 "/api/erp/task/meta-edit",
+                "/api/erp/review/delete-disliked",
             },
             da_goi,
         )

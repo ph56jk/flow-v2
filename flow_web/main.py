@@ -24,6 +24,7 @@ from .schemas import (
     DownloadRequest,
     ERPConfigUpdateRequest,
     ERPIdeaBatchRequest,
+    ERPReviewDeleteRequest,
     FlowOperatorRequest,
     IntegrationConfigUpdateRequest,
     PipelineAdvanceRequest,
@@ -245,6 +246,29 @@ async def edit_erp_task_meta(request: Request, payload: TaskMetaEditRequest) -> 
         raise HTTPException(status_code=400, detail="Thiếu ERP Task ID của thẻ cần sửa thuộc tính.")
     edits = [(str(field), str(value)) for field, value in (payload.edits or [])]
     return await asyncio.to_thread(service(request).edit_task_meta, task_id, edits)
+
+
+@app.post("/api/erp/review/delete-disliked")
+async def delete_disliked_erp_review_image(
+    request: Request,
+    payload: ERPReviewDeleteRequest,
+) -> Dict[str, Any]:
+    """Let a remote agent ask the app to safely delete one review image.
+
+    The app re-reads ERP and independently checks the marker, image attachment
+    and current vote before it writes. A stale request receives ``deleted:
+    false`` rather than turning an old bot snapshot into a deletion.
+    """
+    task_id = (payload.task_id or "").strip()
+    comment_id = (payload.comment_id or "").strip()
+    if not task_id or not comment_id:
+        raise HTTPException(status_code=400, detail="Thiếu ERP Task ID hoặc comment ID cần kiểm tra để gỡ ảnh.")
+    deleted = await asyncio.to_thread(
+        service(request).delete_disliked_erp_review_image_for_agent,
+        task_id,
+        comment_id,
+    )
+    return {"deleted": deleted}
 
 
 def _sku_task_id(payload: SkuSyncRequest) -> str:

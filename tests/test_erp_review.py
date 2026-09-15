@@ -1003,6 +1003,69 @@ class ErpReviewFlowTests(unittest.TestCase):
         self.assertEqual("", items["1"]["comment"])
         self.assertTrue(items["1"]["deleted_at"])
 
+    def test_bot_request_reloads_the_card_then_app_key_deletes_only_the_same_disliked_review_image(self) -> None:
+        self._job()
+        self._publish()
+        self._vote(1, dislike=2)
+
+        with patch.object(self.service, "_erp_assert_task_in_project") as in_project, patch.object(
+            self.service, "_erp_task_detail", side_effect=self._detail
+        ) as reread:
+            deleted = self.service.delete_disliked_erp_review_image_for_agent(self.TASK, "cmt-1")
+
+        self.assertTrue(deleted)
+        in_project.assert_called_once_with("test-key", "test-secret", self.TASK)
+        reread.assert_called_once_with("test-key", "test-secret", self.TASK)
+        self.service._erp_delete_task_comment.assert_called_once_with(
+            "test-key", "test-secret", self.TASK, "cmt-1"
+        )
+        self.assertEqual(["cmt-1"], self.deleted)
+
+    def test_bot_request_does_not_delete_when_the_fresh_vote_is_no_longer_dislike(self) -> None:
+        self._job()
+        self._publish()
+        # The bot's old tree may have seen 👎. The only fact that matters is
+        # the card the app reads immediately before the destructive call.
+        self._vote(1, like=3, dislike=2)
+
+        with patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service, "_erp_task_detail", side_effect=self._detail
+        ):
+            deleted = self.service.delete_disliked_erp_review_image_for_agent(self.TASK, "cmt-1")
+
+        self.assertFalse(deleted)
+        self.assertEqual([], self.deleted)
+        self.assertEqual(3, len(self.comments))
+
+    def test_bot_request_does_not_delete_an_unmarked_image_even_when_people_dislike_it(self) -> None:
+        self._job()
+        self._publish()
+        self.comments[1]["meta"] = ""
+        self.comments[1]["content"] = "Ảnh người dùng tự thêm"
+        self._vote(1, dislike=3)
+
+        with patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service, "_erp_task_detail", side_effect=self._detail
+        ):
+            deleted = self.service.delete_disliked_erp_review_image_for_agent(self.TASK, "cmt-1")
+
+        self.assertFalse(deleted)
+        self.assertEqual([], self.deleted)
+
+    def test_bot_request_does_not_treat_a_review_result_note_as_a_deletable_review_image(self) -> None:
+        self._job()
+        self._publish()
+        self.comments[1]["meta"] = "[FLOW_V2_REVIEW_RESULT] ảnh đã xử lý"
+        self._vote(1, dislike=3)
+
+        with patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service, "_erp_task_detail", side_effect=self._detail
+        ):
+            deleted = self.service.delete_disliked_erp_review_image_for_agent(self.TASK, "cmt-1")
+
+        self.assertFalse(deleted)
+        self.assertEqual([], self.deleted)
+
     def test_the_log_does_not_stutter_when_the_button_is_the_reviewer(self) -> None:
         # A vote has no name to credit, so the reviewer string is the button
         # itself and the line must not read "vì 👎 trên thẻ ERP không thích".

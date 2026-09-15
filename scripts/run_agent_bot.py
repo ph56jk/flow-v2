@@ -6,18 +6,19 @@ trong lifespan). Script này dành cho hai việc mà app không làm được:
 
 * **Kiểm tra nhanh** một lượt quét rồi thoát — ``--once``, và nên đi kèm
   ``--dry-run`` ở lần đầu cắm bot vào một dự án lạ.
-* **Chạy bot ở một máy khác** với máy chạy Flow. Lúc đó phần dọn phiếu
-  (👍 giữ / 👎 xoá) chỉ cần token ERP nên chạy được ngay, còn mọi việc phải
-  *ghi* lên ERP bằng danh nghĩa app — tạo ảnh, đẩy cột, sửa thuộc tính theo
-  lời người dùng — đều chuyển tiếp qua HTTP tới máy có Flow
+* **Chạy bot ở một máy khác** với máy chạy Flow. Bot vẫn giữ ảnh của chính nó
+  bằng token ERP; còn ảnh review do app đăng và mọi việc phải *ghi* lên ERP
+  bằng danh nghĩa app — gỡ ảnh 👎, tạo ảnh, đẩy cột, sửa thuộc tính — đều
+  chuyển tiếp qua HTTP tới máy có Flow
   (``--flow-web-url``).
 
-Sáu thứ bot làm được, bốn trong số đó cần ``--flow-web-url``:
+Bảy thứ bot làm được, năm trong số đó cần ``--flow-web-url``:
 
 ===============================  ==================================  ==========
 Việc                             Đường đi                            Cần URL?
 ===============================  ==================================  ==========
-Dọn phiếu 👍/👎                   token ERP của chính bot             không
+Dọn ảnh do bot đăng 👍/👎          token ERP của chính bot             không
+Gỡ ảnh review do app đăng 👎      ``POST /api/erp/review/delete-disliked`` có
 Trả lời / sửa thẻ khi được gọi   ``POST /api/erp/task/meta-edit``    có (để ghi)
 Tạo ảnh cho thẻ Idea             ``POST /api/erp/idea-batch``        có
 Đẩy thẻ sang cột kế              ``POST /api/erp/pipeline/advance``  có
@@ -150,6 +151,28 @@ def _forward_pipeline(flow_web_url: str, timeout_s: int = 60):
     return hook
 
 
+def _forward_review_delete(flow_web_url: str, timeout_s: int = 30):
+    """Ask the app to re-check and delete one disliked review image.
+
+    The remote bot's ERP token cannot delete a comment the app posted. It
+    passes only stable ids to the app; ``deleted: false`` deliberately keeps
+    the bot ledger open so a fresh scan can see a changed vote or card.
+    """
+    base = flow_web_url.rstrip("/")
+
+    def hook(task_id: str, comment_id: str) -> bool:
+        result = _call_flow_web(
+            base,
+            "/api/erp/review/delete-disliked",
+            {"task_id": task_id, "comment_id": comment_id},
+            timeout_s=timeout_s,
+            what=f"gỡ ảnh review {comment_id} trên {task_id}",
+        )
+        return bool(result.get("deleted"))
+
+    return hook
+
+
 def _forward_edit(flow_web_url: str, timeout_s: int = 30):
     """Hook sửa thẻ: người dùng nói ``@bot acc: acc32``, app ghi xuống.
 
@@ -237,8 +260,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--flow-web-url",
         default="",
-        help="Địa chỉ Flow v2 để chuyển tiếp việc ghi (tạo ảnh, đẩy cột, sửa thẻ). "
-        "Bỏ trống là chỉ dọn phiếu và trả lời.",
+        help="Địa chỉ Flow v2 để chuyển tiếp việc ghi (gỡ ảnh review, tạo ảnh, đẩy cột, sửa thẻ). "
+        "Bỏ trống thì chỉ dọn được ảnh do chính bot đăng và trả lời.",
     )
     parser.add_argument(
         "--poll-seconds",
@@ -297,11 +320,12 @@ async def main(argv: list[str] | None = None) -> int:
         # không bao giờ được xác nhận, luật cột không bao giờ mở cổng sang
         # Hoàn thành — và không có dòng log nào kêu.
         listing_confirm_hook=build_listing_confirm_hook(listing),
-        # Bốn hook dưới đây phải có mặt ở bản chạy rời đúng như ở bản trong app.
+        # Năm hook dưới đây phải có mặt ở bản chạy rời đúng như ở bản trong app.
         # Thiếu chúng thì bot trông vẫn sống — vẫn quét, vẫn dọn phiếu — mà thẻ
         # thì đứng nguyên một cột mãi mãi và mọi câu "sửa hộ tôi" đều nhận lời
         # từ chối. Đó là kiểu hỏng khó thấy nhất, nên nối sẵn ở đây.
         pipeline_hook=_forward_pipeline(args.flow_web_url) if args.flow_web_url else None,
+        delete_review_hook=_forward_review_delete(args.flow_web_url) if args.flow_web_url else None,
         book=book,
         edit_hook=_forward_edit(args.flow_web_url) if args.flow_web_url else None,
         sku_hook=_forward_sku(args.flow_web_url) if args.flow_web_url else None,

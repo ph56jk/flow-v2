@@ -967,17 +967,13 @@ class JanitorTests(unittest.TestCase):
         self.assertEqual([("TASK-2", "c2")], client.deleted)
 
 
-class DeleteBranchIsDormantTests(unittest.TestCase):
-    """"👎 là xoá" chưa chạy được lần nào, và điều đó phải nói ra thành tiếng.
+class AppKeyReviewDeletionTests(unittest.TestCase):
+    """Ảnh review của app bị 👎 thì bot nhờ chính app gỡ an toàn.
 
-    ERP chỉ cho xoá bình luận của chính mình, nên bot chỉ dọn được ảnh do
-    **chính bot** đăng (``mine == 1``). Nhưng ảnh hôm nay do ``service.py`` đăng
-    dưới danh tính người thật, còn ``AgentBotClient.publish_image`` — hàm đăng
-    ảnh dưới danh tính bot — chưa được nối vào đâu cả. Kết quả: mỗi lượt quét
-    đi qua một thẻ đầy ảnh bị 👎 và không làm gì, im như thể chẳng có việc gì.
-
-    Giữ nguyên trạng ấy là một lựa chọn có chủ ý. Nhưng nó phải *lộ ra*: một
-    nhánh chết lặng lẽ trông y hệt một nhánh không có việc.
+    App là tác giả của ảnh review nên chỉ API key của app mới xoá được. Bot chỉ
+    chuyển mã thẻ và mã comment; app phải đọc lại ERP và tự chốt đúng ảnh review
+    vẫn đang nghiêng 👎 trước khi ghi. Đừng biến nhánh này thành xoá thẳng bằng
+    token bot, và cũng đừng mở rộng nó sang ảnh người dùng tự đính kèm.
     """
 
     def setUp(self) -> None:
@@ -988,21 +984,27 @@ class DeleteBranchIsDormantTests(unittest.TestCase):
     def _foreign(self, name: str, **kwargs: Any) -> Dict[str, Any]:
         return comment(name, mine=0, owner="phong.hothanh@havigroup.llc", **kwargs)
 
-    def test_anh_cua_nguoi_khac_bi_ghet_thi_bot_keu_len_chu_khong_im(self) -> None:
+    def test_anh_review_cua_app_bi_ghet_thi_bot_nho_app_go_bang_khoa_app(self) -> None:
         client = FakeClient([], {}, {})
         bot = build_bot(client, self.tmp)
+        requests: List[tuple[str, str]] = []
+
+        def app_delete(task_id: str, comment_id: str) -> bool:
+            requests.append((task_id, comment_id))
+            return True
+
+        bot.delete_review_hook = app_delete
         tree = {"root": task_node("TASK-1", agents=[BOT],
                                   comments=[self._foreign("c1", dislike=3),
                                             self._foreign("c2", dislike=2)])}
-        with self.assertLogs("flow_web.agent_bot", level="WARNING") as ghi:
+        with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
             applied = bot.janitor_pass(tree)
 
-        self.assertEqual([], applied)
-        self.assertEqual([], client.deleted, "bot không có quyền xoá bình luận của người khác")
-        loi = "\n".join(ghi.output)
-        self.assertIn("TASK-1", loi)
-        self.assertIn("2", loi, "phải nói rõ có bao nhiêu ảnh đang mắc kẹt")
-        self.assertIn("publish_image", loi, "phải chỉ ra chỗ còn thiếu, không chỉ than là không làm được")
+        self.assertEqual([("TASK-1", "c1"), ("TASK-1", "c2")], requests)
+        self.assertEqual([], client.deleted, "token bot không được xoá ảnh do app đăng")
+        self.assertEqual([DECISION_DELETE, DECISION_DELETE], [item["decision"] for item in applied])
+        self.assertTrue(bot.state.already_handled("c1"))
+        self.assertTrue(bot.state.already_handled("c2"))
 
     def test_the_khong_co_anh_la_thi_khong_canh_bao_gi(self) -> None:
         # Cảnh báo nào cũng kêu thì không còn là cảnh báo. Ảnh của chính bot,
@@ -1014,14 +1016,14 @@ class DeleteBranchIsDormantTests(unittest.TestCase):
         with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
             bot.janitor_pass(tree)
 
-    def test_anh_cua_nguoi_khac_chua_ai_bo_phieu_thi_chua_phai_viec_mac_ket(self) -> None:
+    def test_anh_cua_app_chua_ai_bo_phieu_thi_khong_go(self) -> None:
         client = FakeClient([], {}, {})
         bot = build_bot(client, self.tmp)
         tree = {"root": task_node("TASK-1", agents=[BOT], comments=[self._foreign("c1")])}
         with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
             bot.janitor_pass(tree)
 
-    def test_anh_cua_nguoi_khac_duoc_giu_lai_thi_khong_co_gi_de_keu(self) -> None:
+    def test_anh_cua_app_duoc_giu_lai_thi_khong_go(self) -> None:
         # 👍 nghĩa là giữ, mà giữ thì bot chẳng phải làm gì — ảnh của người
         # khác được duyệt giữ **không** phải việc mắc kẹt. Kêu ở đây là kêu vô
         # cớ, và vì thẻ ấy nằm lại mãi nên nó kêu mỗi lượt quét cho tới hết
@@ -1034,11 +1036,48 @@ class DeleteBranchIsDormantTests(unittest.TestCase):
         with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
             bot.janitor_pass(tree)
 
-    def test_publish_image_van_chua_duoc_noi_va_tai_lieu_van_noi_dung_the(self) -> None:
-        # Khoá đúng điều kiện làm nhánh xoá nằm im. Ngày ai đó nối
-        # ``publish_image`` vào luồng đăng ảnh, test này đỏ — và việc phải làm
-        # kèm là sửa lại README cùng dòng cảnh báo ở trên, chứ không phải xoá
-        # test này đi.
+    def test_app_tu_choi_thi_bot_khong_ghi_so_de_luot_sau_thu_lai(self) -> None:
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        calls: List[tuple[str, str]] = []
+
+        def app_refuses(task_id: str, comment_id: str) -> bool:
+            calls.append((task_id, comment_id))
+            return False
+
+        bot.delete_review_hook = app_refuses
+        tree = {"root": task_node("TASK-1", agents=[BOT], comments=[self._foreign("c1", dislike=2)])}
+
+        self.assertEqual([], bot.janitor_pass(tree))
+        self.assertEqual([("TASK-1", "c1")], calls)
+        self.assertFalse(bot.state.already_handled("c1"))
+
+    def test_anh_nguoi_dung_tu_dinh_kem_du_bi_ghet_cung_khong_duoc_chuyen_cho_app_xoa(self) -> None:
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        calls: List[tuple[str, str]] = []
+        bot.delete_review_hook = lambda task_id, comment_id: calls.append((task_id, comment_id)) or True
+        personal_photo = self._foreign("photo", dislike=2, content="Ảnh mẫu khách vừa thêm")
+
+        self.assertEqual([], bot.janitor_pass({"root": task_node("TASK-1", comments=[personal_photo])}))
+        self.assertEqual([], calls)
+        self.assertFalse(bot.state.already_handled("photo"))
+
+    def test_note_ket_qua_khong_duoc_gui_cho_app_xoa_du_co_anh_va_bi_ghet(self) -> None:
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        calls: List[tuple[str, str]] = []
+        bot.delete_review_hook = lambda task_id, comment_id: calls.append((task_id, comment_id)) or True
+        result_note = self._foreign("result", dislike=2, content="")
+        result_note["meta"] = "[FLOW_V2_REVIEW_RESULT] ảnh đã xử lý"
+
+        self.assertEqual([], bot.janitor_pass({"root": task_node("TASK-1", comments=[result_note])}))
+        self.assertEqual([], calls)
+        self.assertFalse(bot.state.already_handled("result"))
+
+    def test_publish_image_van_chua_duoc_noi_nhung_app_da_co_duong_go_an_toan(self) -> None:
+        # Đường đăng bot vẫn chưa dùng; thay vì đổi tác giả của mọi ảnh review,
+        # bot gọi app là chủ comment. Tài liệu phải nói đúng đường đang sống.
         root = Path(__file__).resolve().parents[1]
         goi = []
         for path in sorted(root.glob("flow_web/*.py")) + sorted(root.glob("scripts/*.py")):
@@ -1052,8 +1091,8 @@ class DeleteBranchIsDormantTests(unittest.TestCase):
             "cảnh báo 'chưa nối' trong janitor_pass cho khớp thực tế")
 
         readme = (root / "README.md").read_text(encoding="utf-8")
-        self.assertIn("publish_image", readme,
-                      "README phải nói rõ nhánh '👎 là xoá' hiện chưa chạy được và vì sao")
+        self.assertIn("khoá của app", readme,
+                      "README phải nói rõ app là bên gỡ ảnh review của chính mình")
 
 
 class ScopeTests(unittest.TestCase):

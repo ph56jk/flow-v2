@@ -44,6 +44,7 @@ from .agent_bot import (
     build_agent_bot,
     build_sku_fast_lane,
     card_stage,
+    has_image_attachment,
 )
 from .agent_brain import BrainConfig, build_brain_hook
 from .agent_chat import EDITABLE_FIELDS
@@ -23017,6 +23018,10 @@ exit 1
             # Chép Thuộc tính của thẻ cha xuống thẻ con cũng đi qua app, cùng
             # lý do với lệnh sửa: đọc lại thẻ trước khi ghi, và hàng rào dự án.
             meta_inherit_hook=self.inherit_task_meta,
+            # Ảnh review do app đăng bằng ERP_API_KEY/API_SECRET, nên chỉ app
+            # mới xoá được. Bot chỉ chuyển hai id; hàm dưới đọc lại thẻ và tự
+            # kiểm tra phiếu trước một ghi xoá không hoàn tác được.
+            delete_review_hook=self.delete_disliked_erp_review_image_for_agent,
         )
         self._agent_bot = bot
         return bot
@@ -23138,6 +23143,64 @@ exit 1
             await bot.run_forever()
             return
         await asyncio.gather(bot.run_forever(), lane.run_forever())
+
+    def delete_disliked_erp_review_image_for_agent(self, task_id: str, comment_id: str) -> bool:
+        """Delete one app-owned review image after an agent bot asks.
+
+        The bot's ``taskFull`` snapshot is only a hint: a reviewer can change
+        a vote or remove a comment between its read and this request. Reload
+        the task with the app credentials immediately before the destructive
+        call. Deletion is allowed only when the very same top-level comment is
+        still a marked Flow review image and its 👎 count still exceeds 👍.
+
+        This method is synchronous because :meth:`AgentBot.janitor_pass` runs
+        in ``asyncio.to_thread``. It deliberately returns ``False`` for any
+        stale/invalid request so the bot leaves its ledger open for a fresh
+        scan rather than claiming success.
+        """
+        key, token = self._erp_credentials()
+        if not key or not token:
+            raise RuntimeError("Chưa thiết lập ERP API key/API secret.")
+        target = self._normalize_erp_task_id(task_id)
+        wanted_comment = str(comment_id or "").strip()
+        if not target or not wanted_comment:
+            return False
+
+        # Check scope before reading the task, then ask ERP for the current
+        # card. `_erp_delete_task_comment` checks scope again at the write.
+        self._erp_assert_task_in_project(key, token, target)
+        detail = self._erp_task_detail(key, token, target)
+        comment = next(
+            (
+                item
+                for item in (detail.get("comments") or [])
+                if isinstance(item, dict) and str(item.get("name") or "").strip() == wanted_comment
+            ),
+            None,
+        )
+        if not self._is_current_disliked_erp_review_image(comment):
+            return False
+        self._erp_delete_task_comment(key, token, target, wanted_comment)
+        return True
+
+    def _is_current_disliked_erp_review_image(self, comment: Any) -> bool:
+        """Whether a freshly-read ERP comment is safe for the agent path to delete."""
+        if not isinstance(comment, dict):
+            return False
+        # A marker alone is insufficient: a note, a PDF, or a text-only relic
+        # must never become deletable merely because it carries an old tag.
+        markers = self._erp_comment_markers(comment)
+        review_tag = re.compile(
+            rf"\[{re.escape(self.ERP_REVIEW_PREFIX)}\s+[^\]#\s]+#\d+\]"
+        )
+        if review_tag.search(markers) is None:
+            return False
+        if not comment.get("attachments") or not has_image_attachment(comment):
+            return False
+        try:
+            return int(comment.get("dislike_count") or 0) > int(comment.get("like_count") or 0)
+        except (TypeError, ValueError):
+            return False
 
     def _erp_reply_decision(self, comment: Dict[str, Any]) -> tuple[str, str]:
         """The first decisive human reply under a review comment.

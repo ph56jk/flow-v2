@@ -396,6 +396,13 @@ class TaskMetaEditRequest(BaseModel):
     edits: List[Tuple[str, str]] = Field(default_factory=list)
 
 
+class ERPReviewDeleteRequest(BaseModel):
+    """A bot's request for the app to reconsider one rejected review image."""
+
+    task_id: str = ""
+    comment_id: str = ""
+
+
 class ResetReadyERPRequest(BaseModel):
     erp_project_id: str = "PROJ-0013"
     erp_status_id: str = ""

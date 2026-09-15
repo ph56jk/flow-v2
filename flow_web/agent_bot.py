@@ -822,6 +822,21 @@ def is_foreign_review_post(node: Dict[str, Any]) -> bool:
     return REVIEW_PREFIX in node_markers(node)
 
 
+def is_app_review_post(node: Dict[str, Any]) -> bool:
+    """An app-owned review *image*, eligible to ask the app to remove.
+
+    ``is_foreign_review_post`` is deliberately broad because it feeds the
+    read-only card counters: an image a person has posted is still an image
+    waiting for a decision. Deleting is different. The app deletion hook may
+    only receive a comment that carries the Flow review marker **and** an
+    image attachment; a downvoted photo that a person attached themselves is
+    never a deletion request.
+    """
+    if int(node.get("mine") or 0) == 1 or is_bot_note(node):
+        return False
+    return bool(node.get("attachments")) and has_image_attachment(node) and REVIEW_PREFIX in node_markers(node)
+
+
 def iter_foreign_review_posts(task_node: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     """Như ``iter_review_posts`` nhưng cho phía bot không với tới được."""
     for comment in task_node.get("comments") or []:
@@ -832,6 +847,15 @@ def iter_foreign_review_posts(task_node: Dict[str, Any]) -> Iterator[Dict[str, A
         for reply in comment.get("replies") or []:
             if isinstance(reply, dict) and is_foreign_review_post(reply):
                 yield reply
+
+
+def iter_app_review_posts(task_node: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """App-owned review images that the bot may ask the app to reconsider."""
+    for comment in task_node.get("comments") or []:
+        if not isinstance(comment, dict):
+            continue
+        if is_app_review_post(comment):
+            yield comment
 
 
 def iter_review_posts(task_node: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -1528,6 +1552,11 @@ SkuHook = Callable[[str, bool], Dict[str, Any]]
 # vì ``meta_inherit_pass`` chạy trong ``asyncio.to_thread``.
 MetaInheritHook = Callable[[str, Dict[str, str]], Dict[str, Any]]
 
+# The app owns review comments it publishes with ERP_API_KEY/API_SECRET. The
+# bot only supplies the two stable ids; the app reloads the card and decides
+# whether that exact comment may still be deleted.
+ReviewDeleteHook = Callable[[str, str], bool]
+
 #: Câu bảng từ khoá không hiểu → phán quyết của Claude, hoặc ``None`` nếu
 #: không dùng được (tắt, hỏng, hết giờ).  Nhận thẳng ``CardBrief`` chứ không
 #: nhận một dict: bên kia cần biết ô nào **đang** là gì mới hiểu nổi câu "đổi
@@ -1608,6 +1637,7 @@ class AgentBot:
         brain_max_calls_per_hour: int = 30,
         brain_max_calls_per_day: int = 150,
         meta_inherit_hook: MetaInheritHook | None = None,
+        delete_review_hook: ReviewDeleteHook | None = None,
         sku_book: Callable[[], Any] | None = None,
     ) -> None:
         self.config = config
@@ -1631,6 +1661,10 @@ class AgentBot:
         # (``inherit``), chỉ là không ghi xuống — Review Lister thì đọc đúng
         # khối của thẻ con nên vẫn thấy thiếu.
         self.meta_inherit_hook = meta_inherit_hook
+        # Ảnh review hiện do app đăng dưới danh tính API key của app, không
+        # phải token bot. Hook này là đường duy nhất để bot yêu cầu xoá chúng;
+        # app đọc lại thẻ trước khi dùng khoá của chính nó để xoá.
+        self.delete_review_hook = delete_review_hook
         # Đọc bảng mã trên đĩa cho bảng SKU, để gỡ lời nhắc "bảng SKU chưa có
         # dòng" đã cũ. Không có thì bảng giữ lời nhắc như cũ.
         self.sku_book_loader = sku_book
@@ -1974,7 +2008,12 @@ class AgentBot:
     # ── dọn theo phiếu ─────────────────────────────────────────────────
 
     def janitor_pass(self, tree: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Áp 👍 giữ / 👎 xoá lên mọi ảnh bot đã đăng trong cây task này."""
+        """Áp 👍 giữ / 👎 xoá lên ảnh review trong cây task này.
+
+        Ảnh do bot đăng được token bot tự dọn như cũ. Ảnh do app đăng là của
+        app: bot chỉ gọi hook, còn app phải đọc lại ERP và tự quyết có được xoá
+        không. Không có đường nào cho token bot xoá comment của app.
+        """
         applied: List[Dict[str, Any]] = []
         if tree.get("truncated"):
             # Hai trần độc lập (số node, ngân sách hàng) có thể cắt cây; im
@@ -2002,32 +2041,97 @@ class AgentBot:
                 outcome = self._apply_decision(task_id, post, decision)
                 if outcome is not None:
                     applied.append(outcome)
+            for post in iter_app_review_posts(node):
+                comment_id = str(post.get("name") or "").strip()
+                if not comment_id or self.state.already_handled(comment_id):
+                    continue
+                decision = vote_decision(post)
+                if decision == DECISION_PENDING:
+                    continue
+                outcome = self._apply_app_review_decision(task_id, post, decision)
+                if outcome is not None:
+                    applied.append(outcome)
         return applied
 
     def _warn_about_foreign_posts(self, task_id: str, node: Dict[str, Any]) -> int:
         """Nói ra khi có việc bot nhìn thấy mà không với tới được.
 
-        Nhánh "👎 là xoá" chỉ chạy trên ảnh do chính bot đăng, mà hôm nay ảnh
-        do ``service.py`` đăng dưới danh tính người thật. Một nhánh chết lặng
-        lẽ trông y hệt một nhánh không có việc, nên chỗ này phải kêu: có bao
+        Nếu bot được dựng độc lập, không có app hook để gọi bằng khoá của app,
+        ảnh review app đăng không thể bị token bot xoá. Một nhánh chết lặng lẽ
+        trông y hệt một nhánh không có việc, nên chỗ này phải kêu: có bao
         nhiêu ảnh **đáng lẽ đã bị gỡ** mà vẫn nằm nguyên, và thiếu cái gì.
 
         Chỉ đếm phiếu 👎. Ảnh được 👍 giữ thì chẳng có việc gì phải làm, kêu
         lên là kêu vô cớ — mà một cảnh báo lặp lại mỗi lượt quét trên thẻ đã
         duyệt xong thì chính nó dạy người đọc bỏ qua dòng này.
         """
-        stuck = [post for post in iter_foreign_review_posts(node)
+        if self.delete_review_hook is not None:
+            return 0
+        stuck = [post for post in iter_app_review_posts(node)
                  if vote_decision(post) == DECISION_DELETE]
         if not stuck:
             return 0
         log.warning(
-            "%s: %s ảnh bị 👎 nhưng bot không gỡ được vì không phải "
-            "bot đăng (mine=0). Nhánh “👎 là xoá” còn nằm im cho tới khi ảnh được "
-            "đăng qua AgentBotClient.publish_image.",
+            "%s: %s ảnh review của app bị 👎 nhưng bản chạy rời không nối app "
+            "để gỡ bằng khoá của app.",
             task_id,
             len(stuck),
         )
         return len(stuck)
+
+    def _apply_app_review_decision(
+        self,
+        task_id: str,
+        post: Dict[str, Any],
+        decision: str,
+    ) -> Dict[str, Any] | None:
+        """Record a decision for an app-owned review comment.
+
+        The scan's copy of a card is stale by definition once the next network
+        operation starts. For 👎, hand only ids to the app hook. A false answer
+        means the fresh card no longer proves this exact comment is a rejected
+        review image, so leave the ledger untouched and retry from a new scan.
+        """
+        comment_id = str(post.get("name") or "").strip()
+        label = self._post_label(post)
+        record = {
+            "task": task_id,
+            "comment": comment_id,
+            "decision": decision,
+            "label": label,
+            "like": int(post.get("like_count") or 0),
+            "dislike": int(post.get("dislike_count") or 0),
+        }
+        if self.config.dry_run:
+            record["dry_run"] = True
+            log.info("[chạy khô] %s %s trên %s (%s)", decision, label, task_id, comment_id)
+            return record
+        if decision == DECISION_DELETE:
+            if self.delete_review_hook is None:
+                return None
+            try:
+                if not self.delete_review_hook(task_id, comment_id):
+                    return None
+            except Exception as exc:
+                log.warning("App không gỡ được %s khỏi %s: %s", label, task_id, exc)
+                return None
+            log.info(
+                "App đã gỡ %s khỏi %s theo phiếu %s 👎 / %s 👍.",
+                label,
+                task_id,
+                record["dislike"],
+                record["like"],
+            )
+        else:
+            log.info(
+                "Giữ %s trên %s theo phiếu %s 👍 / %s 👎.",
+                label,
+                task_id,
+                record["like"],
+                record["dislike"],
+            )
+        self.state.record(comment_id, task_id, decision)
+        return record
 
     def _apply_decision(self, task_id: str, post: Dict[str, Any], decision: str) -> Dict[str, Any] | None:
         comment_id = str(post.get("name") or "")
@@ -3535,6 +3639,7 @@ def build_agent_bot(
     brain_max_calls_per_hour: int = 30,
     brain_max_calls_per_day: int = 150,
     meta_inherit_hook: MetaInheritHook | None = None,
+    delete_review_hook: ReviewDeleteHook | None = None,
     sku_book: Callable[[], Any] | None = None,
 ) -> AgentBot | None:
     """Dựng bot, hoặc ``None`` khi chưa cấu hình token."""
@@ -3564,6 +3669,7 @@ def build_agent_bot(
         brain_max_calls_per_hour=brain_max_calls_per_hour,
         brain_max_calls_per_day=brain_max_calls_per_day,
         meta_inherit_hook=meta_inherit_hook,
+        delete_review_hook=delete_review_hook,
         # Bot thật đọc bảng mã trên đĩa cho bảng SKU; bot dựng trong test thì không.
         sku_book=sku_book if sku_book is not None else sku_board.load_disk_book,
     )
