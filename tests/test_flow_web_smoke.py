@@ -1824,19 +1824,19 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         item = items[0]
         self.assertEqual(12, len(shots))
         self.assertEqual(12, item["flow_agent_image_count"])
-        self.assertIn("PN Ornament category", item["design_analysis"])
-        self.assertIn("HAVI product shot rule lock: PN Ornament", item["prompt"])
+        self.assertIn("PN Shape Ornament category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: PN Shape Ornament", item["prompt"])
         self.assertEqual(
-            "PN Ornament image 1 Punch Needle ornament on white wood table with pine branch",
+            "PN Shape Ornament image 1 Punch Needle ornament on white wood table with pine branch",
             item["shot_labels"][0],
         )
         self.assertEqual(
-            "PN Ornament image 12 Punch Needle loops linen frame and metal clasp close-ups",
+            "PN Shape Ornament image 12 Punch Needle loops weave backing and cord close-ups",
             item["shot_labels"][-1],
         )
         self.assertIn("thick raised punch-needle loop-pile texture", item["prompt"])
         self.assertIn("large wooden-handled punch needle", item["prompt"])
-        self.assertIn("Only images 8 and 14 may be four-panel collages", item["prompt"])
+        self.assertIn("Only images 7 and 12 may be four-panel collages", item["prompt"])
         self.assertNotIn("HAVI product shot rule lock: Ornament Round", item["prompt"])
 
     def test_auto_trello_uses_advent_calendar_shot_rules(self) -> None:

@@ -332,32 +332,43 @@ def _ornament_round_brief(scene: str) -> str:
 
 _PN_ORNAMENT_LOCK = (
     "Keep the original handmade Punch Needle Christmas ornament 100% unchanged: same small ornament silhouette and "
-    "proportions, same wooden hoop or frame and metal clasp or fastener when visible, same linen material and exact base "
-    "color, same hanging cord or ribbon, same natural fabric tension and wrinkles, and the exact source motif. Preserve "
-    "every motif element, readable personalized name when present, placement, scale, spacing, outline, wool-yarn color, "
-    "and thick raised punch-needle loop-pile texture. The embroidery must visibly consist of dense tactile handmade wool "
-    "loops and fibers, never flat floss stitches, machine embroidery, print, paint, applique, or tufted carpet. Never "
-    "redesign, redraw, simplify, move, resize, recolor, replace, mirror, or cover the motif; never alter the frame, clasp, "
-    "hanging construction, linen, or product scale; and never turn the ornament into a large wall hoop, pillow, bag, "
-    "banner, coaster, plaque, stocking, plush, or another product."
+    "proportions, same base fabric material and exact base color, same felt or fabric backing, same edge finish, same "
+    "hanging cord or ribbon and its attachment point, same natural fabric tension and wrinkles, and the exact source "
+    "motif. Preserve every motif element, readable personalized name when present, placement, scale, spacing, outline, "
+    "wool-yarn color, and thick raised punch-needle loop-pile texture. Reproduce a wooden hoop, frame, metal clasp, or "
+    "fastener only when one is visible in the reference; when the reference has none, never invent or add one. The "
+    "embroidery must visibly consist of dense tactile handmade wool loops and fibers, never flat floss stitches, "
+    "machine embroidery, print, paint, applique, or tufted carpet. Never redesign, redraw, simplify, move, resize, "
+    "recolor, replace, mirror, or cover the motif; never alter the backing, hanging construction, base fabric, or "
+    "product scale; and never turn the ornament into a large wall hoop, pillow, bag, banner, coaster, plaque, "
+    "stocking, plush, or another product. "
+    "Any lettering embroidered on the ornament must be rendered in FULL UPPERCASE block letters, every character a "
+    "capital, even when the reference shows lowercase, mixed case, script, or cursive: keep the same lettering "
+    "position, scale, baseline, yarn color, and punch-needle loop treatment, but never output lowercase or cursive "
+    "letters on the product; when the reference has no lettering, add none."
     "Never show the ornament standing upright or balanced on its edge on a table, shelf, or any surface, and never lean it against props: it must hang from its cord or loop, lie completely flat, sit inside a box, or be held in a hand. "
 )
 
 _PN_ORNAMENT_STYLE = (
     "Overall style for every output: one separate true square 1:1 realistic premium Etsy handmade Christmas photograph, "
     "bright clear airy white-balanced natural daylight, clean whites, soft natural shadows, refined sparse Christmas "
-    "decor, sharp product focus, visible linen weave, and unmistakable thick raised handmade punch-needle wool loops with "
-    "individual yarn fibers. Keep the ornament realistically small. No yellow or dark cast, harsh studio glare, clutter, "
-    "flat embroidery floss, printed or machine-made motif, distorted hands, extra fingers, impossible needle position, "
-    "misspelled names, random text, text overlay, logo, watermark, or AI defects. Only images 8 and 14 may be four-panel "
-    "collages; every other output must be one standalone scene. The only permitted added prop wording is Merry "
-    "Christmas on the separate greeting card in image 5; never add wording to the ornament itself."
+    "decor, sharp product focus, visible fabric weave, and unmistakable thick raised handmade punch-needle wool loops "
+    "with individual yarn fibers. Keep the ornament realistically small. This is a general-audience keepsake ornament "
+    "for adults and families, never a baby product: no nursery, baby shower, or newborn styling, no baby clothes, "
+    "socks, hats, bibs, rattles, or cribs, and no babies or toddlers anywhere in the set. No yellow or dark cast, "
+    "harsh studio glare, clutter, flat embroidery floss, printed or machine-made motif, distorted hands, extra "
+    "fingers, impossible needle position, misspelled names, lowercase or cursive lettering on the ornament, random "
+    "text, text overlay, logo, watermark, or AI defects. Only images 7 and 12 may be four-panel collages; every other "
+    "output must be one standalone scene, and a collage is a plain photo grid that must never carry panel captions, "
+    "titles, labels, headings, numbering, arrows, or annotation of any kind. The only permitted added prop wording is "
+    "Merry Christmas on the separate greeting card in image 4; never add wording to the ornament itself beyond an "
+    "uppercase personalized name, and never use baby or milestone wording such as First Christmas anywhere."
 )
 
 
 def _pn_ornament_brief(scene: str) -> str:
     return (
-        "Use the uploaded PN Ornament reference image as the exact product. Create one separate square 1:1 high-end "
+        "Use the uploaded PN Shape Ornament reference image as the exact product. Create one separate square 1:1 high-end "
         f"handmade Etsy Christmas product photo: {scene} {_PN_ORNAMENT_LOCK} {_PN_ORNAMENT_STYLE}"
     )
 
@@ -7490,8 +7501,12 @@ PRODUCT_SHOT_RULES["christmas_banner"] = {
 
 
 PRODUCT_SHOT_RULES["pn_ornament"] = {
-    "display_name": "PN Ornament",
+    "display_name": "PN Shape Ornament",
     "aliases": (
+        "PN Shape Ornament",
+        "PN Shape Ornaments",
+        "Punch Needle Shape Ornament",
+        "Shape Ornament Punch Needle",
         "PN Ornament",
         "PN Ornaments",
         "Punch Needle Ornament",
@@ -7566,24 +7581,25 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             ),
         ),
         (
-            "Baby clothing shelf",
-            "Punch Needle ornament beside folded baby outfits near window",
+            "Cozy home shelf",
+            "Punch Needle ornament beside folded knitwear near window",
             _pn_ornament_brief(
-                "lay the exact ornament completely flat on a white wood-grain shelf or tabletop beside several neatly folded baby "
-                "outfits near a bright window. Shoot top-down or at 45 degrees in soft clear white daylight. Use a softly "
-                "blurred Christmas background with one small gnome teddy, a Christmas stocking, and a tiny reindeer figure. "
-                "Keep the ornament small relative to the clothes and preserve its tactile punch-needle motif."
+                "lay the exact ornament completely flat on a white wood-grain shelf or console near a bright window, beside "
+                "one neatly folded adult wool scarf, a pair of knitted mittens in neutral tones, one plain ceramic mug, and "
+                "two small pinecones. Shoot top-down or at 45 degrees in soft clear white daylight with a softly blurred "
+                "Christmas interior behind. Include absolutely no baby or children's items. Keep the ornament small "
+                "relative to the folded knitwear and preserve its tactile punch-needle motif."
             ),
         ),
         (
             "Punch Needle process",
             "Woman punch-needling exact ornament motif in round hoop",
             _pn_ornament_brief(
-                "show a woman seated at a clean handmade craft table, carefully creating the exact source motif on linen "
+                "show a woman seated at a clean handmade craft table, carefully creating the exact source motif on fabric "
                 "matching the ornament color inside a round wooden embroidery hoop. One anatomically natural hand supports "
                 "the hoop and the other holds a realistic large wooden-handled punch needle at the true stitch position, "
                 "with matching wool yarn correctly threaded through the tool and trailing from its rear. Place the finished "
-                "source ornament, matching yarn, scissors, and folded linen nearby. Focus on the hands, hoop, fibers, and "
+                "source ornament, matching yarn, scissors, and folded fabric nearby. Focus on the hands, hoop, fibers, and "
                 "dense raised punch-needle loops in soft white window daylight."
             ),
         ),
@@ -7591,12 +7607,15 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             "Four-panel making process",
             "Fabric selection sketch Punch Needle stitching and finished ornament",
             _pn_ornament_brief(
-                "create one square 1:1 four-panel process collage. Panel 1: a hand selects linen matching the exact source "
+                "create one square 1:1 four-panel process collage arranged as a clean 2x2 grid of pure photographs with "
+                "no captions, titles, labels, headings, numbering, arrows, or any text of any kind inside, over, or "
+                "between the panels. Panel 1: a hand selects fabric matching the exact source "
                 "color from several fabric rolls. Panel 2: the exact motif is lightly sketched but not stitched on a larger "
-                "linen piece. Panel 3: the motif is being built in color with a correctly threaded punch needle inside a "
+                "fabric piece. Panel 3: the motif is being built in color with a correctly threaded punch needle inside a "
                 "round hoop, one hand holding the hoop and the other working at a realistic contact point, with matching "
                 "wool yarn nearby. Panel 4: the completed ornament matches the exact source silhouette, frame, clasp, cord, "
-                "linen, motif, placement, scale, colors, and thick loop-pile texture. Use soft clean light and Christmas mood."
+                "base fabric, motif, placement, scale, colors, and thick loop-pile texture. Use soft clean light and "
+                "Christmas mood."
             ),
         ),
         (
@@ -7605,8 +7624,11 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             _pn_ornament_brief(
                 "arrange three to five ornaments of the exact same physical style in a horizontal row or gentle fan on a "
                 "white wood-grain tabletop. If the source visibly contains a personalized name, use a different plausible "
-                "name on each while preserving the exact lettering position, scale, punch-needle treatment, motif, frame, "
-                "clasp, cord, and colors; if the source has no name, invent no wording. Shoot top-down at 90 degrees or from "
+                "adult or family first name on each, every one punch-needled in FULL UPPERCASE block letters such as EMMA, "
+                "DANIEL, OLIVIA, or MICHAEL, while preserving the exact lettering position, scale, punch-needle treatment, "
+                "motif, backing, cord, and colors; if the source has no name, invent no wording. Never use lowercase or "
+                "cursive letters and never use baby or milestone wording such as First Christmas, Baby's First, or a year "
+                "stamp. Shoot top-down at 90 degrees or from "
                 "a light 60-degree angle in very even white daylight. Add one thin pine sprig, dried orange slices, holly, "
                 "and a softly blurred Christmas background."
             ),
@@ -7632,13 +7654,14 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             ),
         ),
         (
-            "Baby Christmas lifestyle",
-            "One-year-old baby holding small Punch Needle ornament",
+            "Hanging the ornament",
+            "Adult hands hanging Punch Needle ornament on tree branch",
             _pn_ornament_brief(
-                "show a roughly one-year-old baby wearing a Christmas outfit and Santa hat, seated beside a decorated tree "
-                "and smiling naturally while holding the exact ornament. Use soft white-balanced daylight. Keep the ornament "
-                "genuinely small relative to the baby's hand and body, never enlarged, with its embroidered face turned "
-                "toward the camera and unobstructed. Keep hands anatomically natural and the raised wool loops sharp."
+                "show an adult woman's hands in a cream cable-knit sweater sleeve hanging the exact ornament onto a branch "
+                "of a decorated Christmas tree. Shoot at ornament height from a 30-45 degree angle in soft white-balanced "
+                "daylight, with her face out of frame or softly blurred. Keep the ornament and the cord being placed as the "
+                "sharp focal point, fingers anatomically natural and never covering the motif, softly blurred baubles and "
+                "fairy lights behind, and no baby or child anywhere in the frame."
             ),
         ),
         (
@@ -7653,13 +7676,15 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
         ),
         (
             "Four-panel macro proof",
-            "Punch Needle loops linen frame and metal clasp close-ups",
+            "Punch Needle loops weave backing and cord close-ups",
             _pn_ornament_brief(
-                "create one square 1:1 collage containing exactly four macro close-up photographs of the same source "
-                "ornament: panel 1 shows dense raised punch-needle wool loops and individual fibers; panel 2 shows linen "
-                "weave and the transition between loop pile and fabric; panel 3 shows the wooden hoop or frame material and "
-                "edge finish; panel 4 shows the metal clasp or fastener and hanging-cord attachment. Every panel must match "
-                "the original product exactly and prove genuine handmade Punch Needle work."
+                "create one square 1:1 collage arranged as a clean 2x2 grid containing exactly four macro close-up "
+                "photographs of the same source ornament, separated only by thin plain white gaps, with no captions, "
+                "titles, labels, headings, numbering, arrows, or any text of any kind inside, over, or between the panels: "
+                "panel 1 shows dense raised punch-needle wool loops and individual fibers; panel 2 shows the base fabric "
+                "weave and the transition between loop pile and fabric; panel 3 shows the edge finish and backing material; "
+                "panel 4 shows the hanging-cord attachment, including the metal clasp or fastener only when the reference "
+                "has one. Every panel must match the original product exactly and prove genuine handmade Punch Needle work."
             ),
         ),
     ),
